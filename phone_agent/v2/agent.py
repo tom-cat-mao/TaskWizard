@@ -23,7 +23,7 @@ import time
 from typing import Any, Callable, Mapping
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from phone_agent.v2.capabilities import (
     CapabilityAssemblyContext,
@@ -32,7 +32,17 @@ from phone_agent.v2.capabilities import (
     assemble_capabilities,
     build_capability_registry,
 )
-from phone_agent.v2.events import RUN_END, RUN_START, EventBus
+from phone_agent.v2.events import (
+    AGENT_AFTER,
+    MODEL_POST_REQUEST,
+    MODEL_PRE_REQUEST,
+    MODEL_REQUEST,
+    REJECT,
+    RUN_END,
+    RUN_START,
+    TOOL_EXECUTE,
+    EventBus,
+)
 
 
 @dataclass
@@ -188,7 +198,7 @@ class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
     def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
         messages = state.get("messages") or []
         result = self._event_bus.waterfall(
-            "model/pre_request", messages, terminal=lambda x: x
+            MODEL_PRE_REQUEST, messages, terminal=lambda x: x
         )
         if result is messages:
             return None
@@ -196,6 +206,145 @@ class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
 
     async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
         return self.before_model(state, runtime)
+
+
+class _ToolExecuteBridgeMiddleware(AgentMiddleware):
+    """Bridge ``tool/execute`` event listeners into the middleware stack.
+
+    The waterfall terminal is the real tool handler. When a listener returns
+    ``REJECT`` the bridge produces a generic warning ``ToolMessage`` so the
+    actor sees the call was blocked without executing any device action.
+    """
+
+    def __init__(self, event_bus: EventBus) -> None:
+        super().__init__()
+        self._event_bus = event_bus
+
+    @staticmethod
+    def _tool_call_id(request: Any) -> str:
+        tool_call = getattr(request, "tool_call", None) or {}
+        if isinstance(tool_call, dict):
+            return str(tool_call.get("id") or "")
+        return str(getattr(tool_call, "id", "") or "")
+
+    @staticmethod
+    def _tool_name(request: Any) -> str:
+        tool_call = getattr(request, "tool_call", None) or {}
+        if isinstance(tool_call, dict):
+            return str(tool_call.get("name") or "")
+        return str(getattr(tool_call, "name", "") or "")
+
+    def _reject_message(self, request: Any) -> ToolMessage:
+        name = self._tool_name(request)
+        return ToolMessage(
+            content=f"⚠️ 已拦截（未执行）：{name}\n工具调用被策略事件拒绝。",
+            tool_call_id=self._tool_call_id(request),
+            name=name,
+            status="error",
+        )
+
+    def wrap_tool_call(self, request, handler):  # noqa: ANN001
+        decision = self._event_bus.waterfall(
+            TOOL_EXECUTE, request, terminal=handler
+        )
+        if decision is REJECT:
+            return self._reject_message(request)
+        return decision
+
+    async def awrap_tool_call(self, request, handler):  # noqa: ANN001
+        decision = self._event_bus.waterfall(
+            TOOL_EXECUTE, request, terminal=handler
+        )
+        if decision is REJECT:
+            return self._reject_message(request)
+        return decision
+
+
+class _WrapModelBridgeMiddleware(AgentMiddleware):
+    """Bridge ``model/request`` event listeners into the middleware stack.
+
+    The waterfall terminal is the real model call. When no listener changes
+    the payload this middleware is a no-op.
+    """
+
+    def __init__(self, event_bus: EventBus) -> None:
+        super().__init__()
+        self._event_bus = event_bus
+
+    def wrap_model_call(self, request, handler):  # noqa: ANN001
+        return self._event_bus.waterfall(
+            MODEL_REQUEST, request, terminal=handler
+        )
+
+    async def awrap_model_call(self, request, handler):  # noqa: ANN001
+        return self._event_bus.waterfall(
+            MODEL_REQUEST, request, terminal=handler
+        )
+
+
+def _state_summary(
+    state: Any,
+    runtime: Any,
+    *,
+    run_id: str | None = None,
+    goal: str | None = None,
+) -> dict[str, Any]:
+    """Build a small state summary for emit-style events."""
+
+    messages = state.get("messages") if isinstance(state, dict) else None
+    return {
+        "run_id": run_id,
+        "goal": goal,
+        "messages": messages,
+        "runtime": runtime,
+    }
+
+
+class _PostRequestBridgeMiddleware(AgentMiddleware):
+    """Bridge ``model/post_request`` event listeners into the middleware stack.
+
+    Fired from the ``after_model`` hook with a state summary. Listener failures
+    are logged and swallowed by the event bus, so this bridge is fail-open.
+    """
+
+    def __init__(self, event_bus: EventBus, run_id: str) -> None:
+        super().__init__()
+        self._event_bus = event_bus
+        self._run_id = run_id
+
+    def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        self._event_bus.emit(
+            MODEL_POST_REQUEST,
+            _state_summary(state, runtime, run_id=self._run_id),
+        )
+        return None
+
+    async def aafter_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        return self.after_model(state, runtime)
+
+
+class _AgentAfterBridgeMiddleware(AgentMiddleware):
+    """Bridge ``agent/after`` event listeners into the middleware stack.
+
+    Fired from the ``after_agent`` hook with a terminal state summary.
+    Listener failures are logged and swallowed by the event bus, so this
+    bridge is fail-open.
+    """
+
+    def __init__(self, event_bus: EventBus, run_id: str) -> None:
+        super().__init__()
+        self._event_bus = event_bus
+        self._run_id = run_id
+
+    def after_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        self._event_bus.emit(
+            AGENT_AFTER,
+            _state_summary(state, runtime, run_id=self._run_id),
+        )
+        return None
+
+    async def aafter_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        return self.after_agent(state, runtime)
 
 
 class ThinPhoneAgent:
@@ -411,12 +560,28 @@ class ThinPhoneAgent:
             replace_key="control_hitl",
         )
         self._capability_ctx.register_core_middleware(
+            _ToolExecuteBridgeMiddleware(self.event_bus),
+            order=1,
+        )
+        self._capability_ctx.register_core_middleware(
             build_context_pruning_middleware(pruner=context_pruner),
             order=30,
         )
         self._capability_ctx.register_core_middleware(
             _ModelPreRequestBridgeMiddleware(self.event_bus),
             order=45,
+        )
+        self._capability_ctx.register_core_middleware(
+            _WrapModelBridgeMiddleware(self.event_bus),
+            order=46,
+        )
+        self._capability_ctx.register_core_middleware(
+            _PostRequestBridgeMiddleware(self.event_bus, self.run_id),
+            order=47,
+        )
+        self._capability_ctx.register_core_middleware(
+            _AgentAfterBridgeMiddleware(self.event_bus, self.run_id),
+            order=48,
         )
         self._capability_ctx.register_core_middleware(self._trace, order=50)
         self._capability_ctx.register_core_middleware(
