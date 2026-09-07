@@ -31,6 +31,7 @@ from langchain.agents.middleware.types import hook_config
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 
 from phone_agent.v2.middleware._tokens import estimate_message_tokens, usage_tokens
+from phone_agent.v2.pins import TASKDOC_ID_PREFIX
 
 if TYPE_CHECKING:
     from phone_agent.v2.usage import UsageLedger
@@ -265,7 +266,7 @@ def _first_diff_block(
 
 def _is_taskdoc(message: Any) -> bool:
     message_id = str(getattr(message, "id", None) or "")
-    if message_id.startswith("__taskdoc__"):
+    if message_id.startswith(TASKDOC_ID_PREFIX):
         return True
     content = getattr(message, "content", "")
     return isinstance(content, str) and content.startswith("[TASK_DOC]")

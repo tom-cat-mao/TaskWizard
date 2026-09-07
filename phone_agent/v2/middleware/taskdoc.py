@@ -32,10 +32,7 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import RemoveMessage, SystemMessage
 
-# Stable prefix for the pinned task-board id so the block is easy to spot in a
-# transcript; the suffix is per-injection unique so add_messages re-appends the
-# refreshed copy at the tail instead of replacing it in place.
-_TASKDOC_ID_PREFIX = "__taskdoc__"
+from phone_agent.v2.pins import TASKDOC_ID_PREFIX
 
 # How many trailing flow-line entries to render (design: 最近 8 条).
 MAX_FLOW_ITEMS = 8
@@ -228,7 +225,7 @@ class TaskDocMiddleware(AgentMiddleware):
         if flow:
             block = block + "\n\n" + flow
 
-        new_id = f"{_TASKDOC_ID_PREFIX}{uuid.uuid4().hex}"
+        new_id = f"{TASKDOC_ID_PREFIX}{uuid.uuid4().hex}"
         out: list[Any] = []
         if self._injected_id is not None:
             # Drop the previous pinned copy so exactly one block exists, refreshed

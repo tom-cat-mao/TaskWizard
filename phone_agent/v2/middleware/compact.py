@@ -49,11 +49,7 @@ from phone_agent.v2.middleware._tokens import (
     estimate_context_tokens,
     estimate_message_tokens,
 )
-
-# Pinned-block id prefixes the fold must preserve verbatim (never summarise): the
-# TaskDoc board (taskdoc middleware) and this module's own prior summary.
-_TASKDOC_ID_PREFIX = "__taskdoc__"
-_COMPACT_ID_PREFIX = "__compact__"
+from phone_agent.v2.pins import COMPACT_ID_PREFIX, TASKDOC_ID_PREFIX
 
 # Default context window when the model name carries no size hint (design: 256k).
 _DEFAULT_WINDOW = 256_000
@@ -149,7 +145,7 @@ def _is_cn(lang: str) -> bool:
 
 def _pinned_id(message: Any) -> bool:
     mid = getattr(message, "id", None) or ""
-    return mid.startswith(_TASKDOC_ID_PREFIX) or mid.startswith(_COMPACT_ID_PREFIX)
+    return mid.startswith(TASKDOC_ID_PREFIX) or mid.startswith(COMPACT_ID_PREFIX)
 
 
 def _text_of(message: Any) -> str:
@@ -355,13 +351,13 @@ class CompactMiddleware(AgentMiddleware):
         prior_summary: str | None = None
         for msg in messages[idx:]:
             mid = getattr(msg, "id", None) or ""
-            if mid.startswith(_COMPACT_ID_PREFIX):
+            if mid.startswith(COMPACT_ID_PREFIX):
                 # Iterative: feed the prior summary text back in, drop the message.
                 prior_summary = _strip_memory_state_section(
                     _strip_marker(_text_of(msg))
                 )
                 continue
-            if mid.startswith(_TASKDOC_ID_PREFIX):
+            if mid.startswith(TASKDOC_ID_PREFIX):
                 pinned.append(msg)
                 continue
             conversation.append(msg)
@@ -591,7 +587,7 @@ def _stable_json(value: Any) -> str:
 def _new_compact_id() -> str:
     import uuid
 
-    return f"{_COMPACT_ID_PREFIX}{uuid.uuid4().hex}"
+    return f"{COMPACT_ID_PREFIX}{uuid.uuid4().hex}"
 
 
 def build_compact_middleware(
