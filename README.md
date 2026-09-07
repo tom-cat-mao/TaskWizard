@@ -103,6 +103,8 @@ dream 会对账：证据被折叠后不再够格的 approved 与 auto_approved �
 
 exemplar（成功先例回注）通道尚未上线，其离线评估用 `python -m phone_agent.v2.replay`：它按时间序在内存 `VecIndex` 里重放 `memory/experience/events.jsonl`，模拟每次 run 开局只能看到先于它结束的 episode，输出 coverage/relevance/steps-delta 三道闸的 JSON 指标；全程 observe-only，不触碰生产索引。
 
+过程卡通道（WP-WF2b）用 `python -m phone_agent.v2.replay --channel procedure [--sweep]` 离线评估：lesson 事件日志先被重放成「时间戳 → 当时可注入过程卡集合」的时间线（后批准的卡、已撤销/降级的卡对之前的 episode 不可见），每个 episode 先硬过滤（卡的 `app_scope` 必须属于它自己成功 launch 过的包名，取不到回执的 episode 走 `general` 卡池）再按 goal 与「卡 title+steps」的 cosine 取 top-1。覆盖 = 有命中的 episode 占比，相关 = 命中里 app 落地的占比（**只是代理**：语义是否真对齐要等线上数据，见模块 docstring），steps-delta 无法离线反事实、记 N/A 且不参与判定；`--sweep` 扫 `min_score` 0.30→0.70（步进 0.05）并给出「relevance ≥ 0.6 里 coverage 最高」的拐点阈值。卡池为空时输出 `candidate pool empty` 并正常退出。
+
 ## 插件与扩展
 
 策略层全事件化（栈上只剋桥接器），插件与内建能力共用同一装配层，可挂事件监听器、工具、提示块、run hooks、CLI 命令。
