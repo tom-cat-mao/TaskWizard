@@ -35,9 +35,11 @@ Design (``outputs/design-council/ROUND2-D1.md`` §1, extended by A5):
   :mod:`phone_agent.v2.middleware._redact`.
 * **Default OFF, zero-cost when off** (``V2Config.diagnostic_evidence``). Enabled
   only by the live-diagnosis skill.
-* Mounted **last** in the middleware list so ``before_model`` observes the
-  post-image-prune + post-TaskDoc context, ``wrap_model_call`` sees the model's
-  own turn, and ``wrap_tool_call`` is innermost (the raw tool return).
+* Mounted at order 70, outside the safety wrapper at order 90, so
+  ``before_model`` observes the post-image-prune + post-TaskDoc context,
+  ``wrap_model_call`` sees the model's own turn, and ``wrap_tool_call`` records
+  the result returned by safety — including warning ToolMessages when a flagged
+  execution call is short-circuited, not the raw tool execution result.
 
 Emits one JSONL line per event to ``<evidence_dir>/<run_id>.evidence.jsonl``.
 ``hitl_decision`` events are written by the driver layer (the skill's logging
@@ -264,11 +266,8 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
         self._started = False
         self._opening_captured = False
         self._path: str | None = None
-        # doc-change dedupe + stagnation mirror.
+        # doc-change dedupe.
         self._last_doc_hash: str | None = None
-        self._max_seen = 0
-        self._stagnant = 0
-        self._last_nudged = False
         if self.enabled:
             os.makedirs(self.evidence_dir, exist_ok=True)
             self._path = os.path.join(self.evidence_dir, f"{run_id}.evidence.jsonl")
@@ -408,7 +407,7 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
     async def abefore_agent(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
         return self.before_agent(state, runtime)
 
-    # -- before_model: model_request + taskdoc_snapshot + stagnation -------
+    # -- before_model: model_request + taskdoc_snapshot -------------------
     def before_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
         if not self.enabled:
             return None
@@ -422,7 +421,6 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
             self._capture_opening_screens(messages)
             self._emit_model_request(messages)
             self._emit_taskdoc_snapshot()
-            self._emit_stagnation_if_nudged()
         except Exception:  # noqa: BLE001 - observability must never crash the loop
             pass
         return None
@@ -516,28 +514,6 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
                 "open_item_count": open_count,
             }
         )
-
-    def _emit_stagnation_if_nudged(self) -> None:
-        # Mirror the TaskDoc middleware's stagnation counter so the recorded
-        # stagnant_steps matches; TaskDoc runs before us and may have already
-        # flipped session.nudged this turn.
-        seen = getattr(self.session, "seen_states", None)
-        count = len(seen) if seen is not None else 0
-        if count > self._max_seen:
-            self._max_seen = count
-            self._stagnant = 0
-        else:
-            self._stagnant += 1
-        nudged = bool(getattr(self.session, "nudged", False))
-        if nudged and not self._last_nudged:
-            self._write(
-                {
-                    "event": "stagnation_nudge",
-                    "step": self._step,
-                    "stagnant_steps": self._stagnant,
-                }
-            )
-        self._last_nudged = nudged
 
     # -- wrap_model_call: model_response (thinking + tool calls + usage) ----
     def _emit_model_response(self, response: Any) -> None:
