@@ -7,7 +7,9 @@
 TaskWizard is a **thin-loop (v2)** Android phone agent: an LLM drives a real device through
 tools — one model call per step, on LangChain `create_agent`. The harness only supplies tools,
 enforces safety boundaries, keeps context hygienic, and records traces plus fixed-schema
-experience episodes. It does **not** route a
+experience episodes. All policy behavior (safety, image hygiene, budget, compaction, trace,
+diagnostics) is implemented as event-bus listeners; the compiled `create_agent` middleware stack
+is reduced to bridge middleware plus optional `extra_middleware` observers. It does **not** route a
 workflow. The v1 LangGraph node architecture was deleted; `adb/`, `grounding/`, and
 `config/{policy,app_registry,redact}` are retained as libraries used by `phone_agent/v2/`.
 The optional `phone_agent/web/` NiceGUI frontend launches `python -m phone_agent.runner` and
@@ -69,7 +71,7 @@ skill before running or monitoring a device task.
 | `phone_agent/v2/{runner,run_ipc,run_events}.py` | Web-only runner process, flushed file IPC (including emergency `revoke_lesson` control), and the shared Web event schema/middleware. |
 | `phone_agent/v2/session.py` | Owns device/session state, run-local implicit-alias evidence, and the atomic observation lifecycle. |
 | `phone_agent/v2/tools/` | Perception, mark-bound actuation, TaskDoc updates, run-bound HTML deliverables, finish, user query, and takeover. |
-| `phone_agent/v2/middleware/` | Safety, TaskDoc pinning, image hygiene, compaction, token budget, trace, and diagnostics. Image hygiene, compaction, and the token budget are now wired as event-bus listeners; only the bridges and trace/diagnostic remain as LangChain middleware. |
+| `phone_agent/v2/middleware/` | Safety, TaskDoc pinning, image hygiene, compaction, token budget, trace, and diagnostics. **All policy behavior now lives on the event bus.** The compiled `create_agent` stack contains only the core bridge middlewares (`tool/execute`, `model/pre_request`, `model/request`, `model/post_request`, `agent/after`) plus optional `extra_middleware` observers. |
 | `phone_agent/v2/{taskdoc,resolver,review,verify}.py` | Task state, unique mark resolution, finish review packet, and independent verification. |
 | `phone_agent/v2/names.py` | App-name normalization, four-route candidate generation, typed evidence classification, prior/rank-score ordering, three-state decision, and structured result types. |
 | `phone_agent/v2/experience.py` | Append-only, fixed-schema run/tool experience records and rebuildable episode view. |

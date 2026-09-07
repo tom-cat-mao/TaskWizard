@@ -38,12 +38,9 @@ _CAPABILITY_ID = re.compile(r"^[a-z][a-z0-9_]*$")
 _SERVICE_NAME = _CAPABILITY_ID
 _RUN_HOOK_WHEN = frozenset({"start", "end"})
 
-# Preserve the pre-WP-C2 middleware ordering while allowing each capability to
-# register independently.  Core harness middleware occupies the gaps through
-# ``register_core_middleware(order=...)``.
-_MIDDLEWARE_ORDER = {
-    "safety": 90,
-}
+# Middleware is now reserved for LangChain bridge middleware only; all policy
+# behavior lives on the event bus.  Capabilities should not register middleware
+# directly; the core harness owns the four bridges plus optional extra_middleware.
 _RUN_HOOK_ORDER = {
     "start": {
         "taskdoc": 10,
@@ -265,7 +262,13 @@ class CapabilityAssemblyContext:
         target.append(_Mount(self._owner(), value, self._sequence, order, replace_key))
 
     def register_middleware(self, middleware: Any) -> None:
-        owner = self._owner()
+        """Register one bridge middleware owned by the applying capability.
+
+        Policy code must use the event bus; this seam is reserved for LangChain
+        bridge middleware.  The caller must supply an explicit order via
+        :meth:`register_core_middleware` or accept the neutral default of 50.
+        """
+
         replace_key = None
         if isinstance(middleware, MiddlewareReplacement):
             replace_key = middleware.replace_key
@@ -273,7 +276,7 @@ class CapabilityAssemblyContext:
         self._mount(
             self._middleware,
             middleware,
-            _MIDDLEWARE_ORDER.get(owner, 50),
+            50,
             replace_key=replace_key,
         )
 

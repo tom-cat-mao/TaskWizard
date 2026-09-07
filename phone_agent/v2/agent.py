@@ -382,13 +382,19 @@ class _ModelCallLimitListener:
 
 
 class ThinPhoneAgent:
-    """Thin-loop phone agent built on ``create_agent`` + v2 middleware.
+    """Thin-loop phone agent built on ``create_agent`` + v2 event-bus bridges.
+
+    The compiled LangChain middleware stack contains only four bridge
+    middlewares (tool/execute, model/pre_request, model/request,
+    model/post_request, agent/after) plus any ``extra_middleware`` observers.
+    All policy behavior — safety, image hygiene, budget, compaction, trace,
+    diagnostics — lives on the event bus as listeners.
 
     ``extra_middleware`` is an optional observability extension point for
-    add-ons such as the local web UI. Extra middleware is appended to the
-    built-in observation stack, before the safety-warning wrapper, so it can
-    observe both ordinary tool results and calls short-circuited by safety.
-    The core agent remains fully headless when the argument is omitted.
+    add-ons such as the local web UI. Extra middleware is appended after the
+    core bridges so it can observe both ordinary tool results and calls
+    short-circuited by safety. The core agent remains fully headless when the
+    argument is omitted.
     """
 
     def __init__(
@@ -618,10 +624,11 @@ class ThinPhoneAgent:
         # listener last during assembly, making it the innermost onion layer.
         self.event_bus.on(TOOL_EXECUTE, self._trace.on_tool_execute)
         if self._diagnostic is not None:
+            # Tool/execute and model/request must be registered before capability
+            # assembly so diagnostic sits inside trace and outside/inside the
+            # safety/control layers as before.
             self.event_bus.on(TOOL_EXECUTE, self._diagnostic.on_tool_execute)
-            self._capability_ctx.register_core_middleware(
-                self._diagnostic, order=70
-            )
+            self.event_bus.on(MODEL_REQUEST, self._diagnostic.on_model_request)
         self._control_hitl = build_control_hitl_middleware()
         self.event_bus.on(TOOL_EXECUTE, self._control_hitl)
         self._capability_ctx.register_core_middleware(
@@ -640,7 +647,9 @@ class ThinPhoneAgent:
             _AgentAfterBridgeMiddleware(self.event_bus, self.run_id),
             order=48,
         )
-        self._capability_ctx.register_core_middleware(self._trace, order=50)
+        # Trace observes the model request (outermost wrapper) and run end.
+        self.event_bus.on(MODEL_REQUEST, self._trace.on_model_request, prepend=True)
+        self.event_bus.on(AGENT_AFTER, self._trace.on_agent_after)
         self._capability_ctx.add_core_run_hook(
             "start", self._capability_snapshot_run_start, order=30
         )
@@ -658,6 +667,13 @@ class ThinPhoneAgent:
         middleware = self._capability_ctx.middleware
         self._budget = self._capability_ctx.service("budget_instance")
         self._compact = self._capability_ctx.service("compact_instance")
+
+        # Diagnostic request/run-end listeners are registered after capability
+        # assembly so they observe post-compact, post-taskdoc, post-budget state.
+        if self._diagnostic is not None:
+            self.event_bus.on(RUN_START, self._diagnostic.on_run_start)
+            self.event_bus.on(MODEL_PRE_REQUEST, self._diagnostic.on_pre_request)
+            self.event_bus.on(AGENT_AFTER, self._diagnostic.on_agent_after)
 
         # Runaway-loop fuse: registered after budget so the cost ceiling wins when
         # both would fire, matching the old middleware order (budget before limit).

@@ -1,6 +1,7 @@
-"""v2 middleware package: safety HITL, image pruning, and JSONL trace.
+"""v2 middleware package: safety HITL, image pruning, JSONL trace, diagnostics.
 
-See ``AGENTS.md`` §9 for the binding contract.
+Policy behavior now lives on the event bus; only LangChain bridge middleware
+remains in the compiled stack.  See ``AGENTS.md`` §9 for the binding contract.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from phone_agent.v2.middleware.compact import (
 )
 from phone_agent.v2.middleware.diagnostic import (
     DiagnosticEvidenceMiddleware,
+    DiagnosticEvidenceWriter,
     build_diagnostic_middleware,
 )
 from phone_agent.v2.middleware.images import (
@@ -40,6 +42,7 @@ from phone_agent.v2.middleware.taskdoc import (
 )
 from phone_agent.v2.middleware.trace import (
     TraceMiddleware,
+    TraceWriter,
     build_trace_middleware,
     redact_args,
 )
@@ -68,8 +71,10 @@ __all__ = [
     "TaskDocMiddleware",
     "build_taskdoc_middleware",
     "TraceMiddleware",
+    "TraceWriter",
     "build_trace_middleware",
     "redact_args",
     "DiagnosticEvidenceMiddleware",
+    "DiagnosticEvidenceWriter",
     "build_diagnostic_middleware",
 ]
