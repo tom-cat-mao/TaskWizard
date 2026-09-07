@@ -375,6 +375,15 @@ class V2Config:
     # safety-reviewer model (S2 §3.3); falls back to verifier_model then the main
     # model when unset.
     safety_reviewer_model: str | None = None
+    # External capability plugins (WP-PLUGIN-C). ``plugins_enabled`` is the master
+    # switch (env ``PHONE_AGENT_PLUGINS``, default on); an empty manifest is a
+    # no-op with zero behavior change. ``plugin_manifest`` overrides the
+    # project-level manifest path (default ``<repo>/.taskwizard.toml``).
+    # ``plugin_index`` is the search index source (URL or local json path,
+    # default repo-local ``plugins/index.json``).
+    plugins_enabled: bool = True
+    plugin_manifest: str | None = None
+    plugin_index: str = "plugins/index.json"
 
     @classmethod
     def from_env(cls, overrides: dict | None = None) -> "V2Config":
@@ -585,6 +594,9 @@ class V2Config:
             memory_model=_env_opt_str("PHONE_AGENT_MEMORY_MODEL"),
             verifier_model=_env_opt_str("PHONE_AGENT_VERIFIER_MODEL"),
             safety_reviewer_model=_env_opt_str("PHONE_AGENT_SAFETY_REVIEWER_MODEL"),
+            plugins_enabled=_env_bool_default_true("PHONE_AGENT_PLUGINS", True),
+            plugin_manifest=_env_opt_str("PHONE_AGENT_PLUGIN_MANIFEST"),
+            plugin_index=_env_str("PHONE_AGENT_PLUGIN_INDEX", "plugins/index.json"),
         )
 
         for field_name, value in (overrides or {}).items():
