@@ -52,4 +52,5 @@ nav:
   - Web 控制台: console.md
   - 安全模式: safety.md
   - 记忆与自进化: memory.md
+  - 插件开发: plugins.md
   - 路线图: roadmap.md

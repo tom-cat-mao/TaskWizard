@@ -25,7 +25,8 @@ TaskWizard 采用 thin-loop v2：模型每轮观察真实设备、决定一个�
 - **经验数据面**：每次 run 结束以固定 schema 落盘 episode outcome 与工具结果分类（字符串原文照存，工具事件另含模型逐步自述的 intent/note；schema 之外的内容直接丢弃），持久化分角色 token 账本；数据采集全程 observe-only，并审计本轮实际注入的 lesson id。
 - **经验提炼与晋升**：离线 `--distill` 从证据充足的 episode 组生成 proposed lesson；Rule-of-3 通过后仍须人工 approve。仅 `PHONE_AGENT_MEMORY_RAG=on` 时，approved lesson 才在 run 开局以“参考、非规则”的 L0 Mirror 受控注入。
 - **RAG shadow 召回**：sqlite-vec + FTS5 混合检索历史 episode 与 App 别名；默认只写 trace 并按实际启动应用统计命中率，绝不注入 actor 上下文。
-- **能力装配层**：十个内建能力通过稳定 `cap_id` 和 `apply/release` 生命周期挂入中间件、工具、提示块、run hooks 或 CLI 命令；注册表按 id/档位 diff 做 reconcile，依赖缺失保持 pending，卸载后不残留能力产物。每次 run 的能力快照仍写入 trace 与 episode。
+- **能力装配层 + 事件总线**：十个内建能力经稳定 `cap_id` 与 `apply/release` 生命周期挂载；所有策略行为都是事件总线上的监听器，LangChain 栈只剋桥接器（嵌套顺序 = 注册顺序，safety 恒居最内）。能力快照每次 run 写入 trace 与 episode。
+- **插件系统**：外部插件以 CapabilitySpec 挂入同一装配层——pip 包声明 `taskwizard.capabilities` entry point，或 `plugin add` 本地目录；插件包可携带应用词表注入 App-KB。API 暂为 provisional v1。
 - **长任务可控**：token 预算限制成本，两级 auto-compact 在接近上下文窗口时保留关键状态。
 
 ## 快速开始
@@ -94,6 +95,16 @@ dream 会对账：证据被折叠后不再够格的 approved 经验自动降回�
 
 exemplar（成功先例回注）通道尚未上线，其离线评估用 `python -m phone_agent.v2.replay`：它按时间序在内存 `VecIndex` 里重放 `memory/experience/events.jsonl`，模拟每次 run 开局只能看到先于它结束的 episode，输出 coverage/relevance/steps-delta 三道闸的 JSON 指标；全程 observe-only，不触碰生产索引。
 
+## 插件与扩展
+
+策略层全事件化（栈上只剋桥接器），插件与内建能力共用同一装配层，可挂事件监听器、工具、提示块、run hooks、CLI 命令。
+
+```bash
+.venv/bin/python main_v2.py plugin add ./my-plugin   # 或 pip 安装声明了 taskwizard.capabilities entry point 的包
+```
+
+`plugin add` 的目录会在下次启动时执行其 `plugin.py`——与 `pip install` 同级信任，只加你信任的源码。开发指南见[文档站插件页](https://tom-cat-mao.github.io/TaskWizard/plugins/)。
+
 ## 文档
 
 📖 **完整文档站：<https://tom-cat-mao.github.io/TaskWizard/>**
@@ -102,7 +113,7 @@ exemplar（成功先例回注）通道尚未上线，其离线评估用 `python 
 |---|---|
 | 快速开始 | [文档站](https://tom-cat-mao.github.io/TaskWizard/quickstart/) · [`.env` 模板](.env.example) |
 | 配置参考（全量） | [文档站配置页](https://tom-cat-mao.github.io/TaskWizard/configuration/) |
-| 架构 / 安全 / 记忆 / 路线图 | [文档站](https://tom-cat-mao.github.io/TaskWizard/) |
+| 架构 / 安全 / 记忆 / 路线图 / 插件 | [文档站](https://tom-cat-mao.github.io/TaskWizard/) |
 | Agent 开发约定 | [AGENTS.md](AGENTS.md) |
 
 ## Contributing
