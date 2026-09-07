@@ -441,23 +441,30 @@ def reconcile_lessons(
     lessons_dir: str | os.PathLike[str],
     episodes: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Return approved lessons to proposed once their evidence stops qualifying.
+    """Return injectable lessons to review once their evidence stops qualifying.
 
     ``episodes`` must be the *current* materialized episode view (see
     :func:`phone_agent.v2.experience.load_episodes`), never the raw event log:
     archived and folded episodes are absent from that view, so a lesson whose
     cited runs were folded into an aggregate has lost the evidence that
     approved it.  Re-running the same gate that blocked promotion keeps
-    approval and withdrawal symmetric.  Only ``approved`` lessons are
-    reconsidered — a revoked lesson stays revoked because there is
-    deliberately no automatic reinstatement path, and a demoted lesson must be
-    approved again by a human before it can be injected.
+    approval and withdrawal symmetric.  Only injectable lessons are
+    reconsidered — ``approved`` (any kind) and ``auto_approved`` procedure
+    cards — a revoked lesson stays revoked because there is deliberately no
+    automatic reinstatement path, and a demoted lesson must be approved again
+    by a human before it can be injected.
     """
 
-    from phone_agent.v2.evolution import LessonStore, evaluate_promotion
+    from phone_agent.v2.evolution import (
+        LessonStore,
+        evaluate_promotion,
+        lesson_injectable,
+    )
 
     store = LessonStore(lessons_dir)
-    approved = store.lessons(status="approved")
+    approved = [
+        lesson for lesson in store.lessons() if lesson_injectable(lesson)
+    ]
     demoted: list[dict[str, Any]] = []
     for lesson in approved:
         evaluation = evaluate_promotion(lesson, episodes, approved_lessons=approved)

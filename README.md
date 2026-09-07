@@ -23,7 +23,7 @@ TaskWizard 采用 thin-loop v2：模型每轮观察真实设备、决定一个�
 - **App-KB 自积累记忆**：同步本机应用名称；验证启动成功后沉淀非敏感别名，并累计成功反馈。同一 run 中未知中文名失败、回执列出的包名随后启动成功时，自动把该中文名写为 `learned` 别名（隐式纠正，证据闭环）。dream 还能从最小化工具事件识别“启动 A→1–2 步内明确自述开错并退出→成功启动 B”，删除错误 learned 映射并写入 B；用户可通过 CLI 写入最高信任的 `user` 别名或忘记 user/learned 别名。
 - **类型化 App 名解析**：统一做 NFKC/大小写/空白归一化，再从 exact、lexical、pinyin、embedding 四路生成候选；候选携带 `match_type` / `authority`，默认按证据类型与三态代价决策，`rank_score` 只参与排序和分差。歧义时只返回排序后的 top-K，装机事实与 launch policy 仍独立 fail-closed。
 - **经验数据面**：每次 run 结束以固定 schema 落盘 episode outcome 与工具结果分类（字符串原文照存，工具事件另含模型逐步自述的 intent/note；schema 之外的内容直接丢弃），持久化分角色 token 账本；数据采集全程 observe-only，并审计本轮实际注入的 lesson id。
-- **经验提炼与晋升**：离线 `--distill` 从证据充足的 episode 组生成 proposed lesson；Rule-of-3 通过后仍须人工 approve。仅 `PHONE_AGENT_MEMORY_RAG=on` 时，approved lesson 才在 run 开局以“参考、非规则”的 L0 Mirror 受控注入。
+- **经验提炼与晋升**：离线 `--distill` 从证据充足的 episode 组生成 proposed lesson（两类产物：单条 rule 与多步过程卡 procedure，后者由蒸馏自判 `auto_approved` / `needs_review`）；rule 的 Rule-of-3 通过后仍须人工 approve。仅 `PHONE_AGENT_MEMORY_RAG=on` 时，approved lesson 与自批通过的过程卡才在 run 开局以"参考、非规则"的 L0 Mirror 受控注入。
 - **RAG shadow 召回**：sqlite-vec + FTS5 混合检索历史 episode 与 App 别名；默认只写 trace 并按实际启动应用统计命中率，绝不注入 actor 上下文。
 - **能力装配层 + 事件总线**：十个内建能力经稳定 `cap_id` 与 `apply/release` 生命周期挂载；所有策略行为都是事件总线上的监听器，LangChain 栈只剋桥接器（嵌套顺序 = 注册顺序，safety 恒居最内）。能力快照每次 run 写入 trace 与 episode。
 - **插件系统**：外部插件以 CapabilitySpec 挂入同一装配层——pip 包声明 `taskwizard.capabilities` entry point，或 `plugin add` 本地目录；插件包可携带应用词表注入 App-KB。API 暂为 provisional v1。
@@ -68,7 +68,7 @@ RAG 默认 `PHONE_AGENT_MEMORY_RAG=shadow`。每次 run 结束会把通过
 增量写入 sqlite-vec；dream 负责从 JSON 权威源补漏并清除失效项。App alias 通过静态 registry
 与 learned/user 名称做确定性 mention 匹配，episode 独立走默认 top-1 语义榜（门槛 0.50）。向量模型
 `Qwen/Qwen3-Embedding-0.6B` 仅在索引或非空 episode 召回第一次真正 embed 时懒加载；
-`PHONE_AGENT_MEMORY_RAG=on` 会在 run 开局一次性注入人审 approved lesson，默认上限为
+`PHONE_AGENT_MEMORY_RAG=on` 会在 run 开局一次性注入人审 approved lesson 与自批通过的过程卡，默认上限为
 `PHONE_AGENT_LESSON_INJECT_MAX=3` 条、`PHONE_AGENT_LESSON_INJECT_TOKENS=800` 估算 token；
 设备 scope 必须匹配，开局未知 app 时不会选择 app 级 lesson。提示明确标为历史参考而非规则，
 lesson 视图缺失或损坏时 fail-open。`shadow` 仍只做 trace 召回与命中统计，`off` 不召回也不注入。
@@ -88,10 +88,11 @@ Web 控制台默认只监听 `127.0.0.1:8080`：输入任务后可实时查看�
 
 `PHONE_AGENT_EVOLUTION=manual` 仅开放显式离线命令；候选写入
 `memory/lessons/{events.jsonl,lessons.json}`。蒸馏以水位线批次处理新 episode（上限 40 条），看到完整任务过程卡片（目标原文 + 逐步 intent/note 账本 + 结局），输出先经严格
-schema、证据与 scope 校验，再以 proposed 状态落盘；证据校验是逐候选跳过而非整批拒绝，`repeated_failure` 经验需 ≥2 条被引用的失败共享相同 reason 与相同有效工具前缀（前 3 个工具，排除 wait/read_screen）；Rule-of-3 也只产生“可供人工晋升”结论。
-dream 会对账：证据被折叠后不再够格的 approved 经验自动降回草案（lesson_demoted），并按注入组/未注入组成功率给出建议撤销清单（仅提醒）。
-离线管线不参与 actor prompt；proposed/revoked 永不注入。默认 `shadow` 继续只观测，只有显式
-`PHONE_AGENT_MEMORY_RAG=on` 才按上述边界把 approved lesson 注入一次，并在 trace 与 episode 记录 id。
+schema、证据与 scope 校验，再以 proposed 状态落盘；证据校验是逐候选跳过而非整批拒绝，`repeated_failure` 经验需 ≥2 条被引用的失败共享相同 reason 与相同有效工具前缀（前 3 个工具，排除 wait/read_screen）；Rule-of-3 也只产生"可供人工晋升"结论。
+蒸馏分两次调用：第一次产出 `{"rules": [...], "procedures": [...]}`，过程卡的 steps 必须是语义步（坐标/mark id/工具参数会被丢弃）且子过程需在 ≥2 个不同任务中重复出现；harness 为每张过程卡算事实单（支持 run、结局一致性、app_scope 是否有 App-KB 验证包名、是否已被历史批次提炼过），第二次调用据此给每张卡判 `auto_approved` 或 `needs_review` 并写一句依据，grade/依据/事实单只落 `events.jsonl`。
+dream 会对账：证据被折叠后不再够格的 approved 与 auto_approved 经验自动降回草案（lesson_demoted，过程卡落到 needs_review），并按注入组/未注入组成功率给出建议撤销清单（仅提醒）。
+离线管线不参与 actor prompt；proposed/needs_review/revoked 永不注入，`auto_approved` 只对过程卡生效。默认 `shadow` 继续只观测，只有显式
+`PHONE_AGENT_MEMORY_RAG=on` 才按上述边界把 approved lesson 与自批过程卡注入一次，并在 trace 与 episode 记录 id。
 
 exemplar（成功先例回注）通道尚未上线，其离线评估用 `python -m phone_agent.v2.replay`：它按时间序在内存 `VecIndex` 里重放 `memory/experience/events.jsonl`，模拟每次 run 开局只能看到先于它结束的 episode，输出 coverage/relevance/steps-delta 三道闸的 JSON 指标；全程 observe-only，不触碰生产索引。
 

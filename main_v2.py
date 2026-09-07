@@ -187,17 +187,36 @@ def _review_lessons(config: V2Config) -> dict[str, int]:
 
     from phone_agent.v2.evolution import evaluate_promotion, read_episode_outcomes
 
+    from phone_agent.v2.evolution import proposal_metadata
+
     store = _lesson_store(config)
     episodes = read_episode_outcomes(config.experience_dir)
     suggestions = _lesson_effectiveness_by_id(config)
+    metadata = proposal_metadata(config.lessons_dir)
     reviewed = approved = revoked = 0
-    for candidate in store.lessons(status="proposed"):
+    for candidate in [
+        *store.lessons(status="proposed"),
+        *store.lessons(status="needs_review"),
+    ]:
         evaluation = evaluate_promotion(
             candidate,
             episodes,
             approved_lessons=store.lessons(status="approved"),
         )
-        print(json.dumps(evaluation.candidate.to_dict(), ensure_ascii=False, indent=2))
+        # Print the stored record: Rule-of-3 evaluation rewrites the status to
+        # proposed, which would hide a needs_review procedure card.
+        print(json.dumps(candidate.to_dict(), ensure_ascii=False, indent=2))
+        if evaluation.reasons:
+            print(
+                "rule_of_3: "
+                + json.dumps(list(evaluation.reasons), ensure_ascii=False, sort_keys=True)
+            )
+        grading = metadata.get(candidate.lesson_id)
+        if grading:
+            print(
+                "grading: "
+                + json.dumps(grading, ensure_ascii=False, indent=2, sort_keys=True)
+            )
         suggestion = suggestions.get(candidate.lesson_id)
         if suggestion is not None:
             print(
@@ -304,6 +323,7 @@ def _build_cli_capability_context(config: V2Config) -> CapabilityAssemblyContext
             config.lessons_dir,
             model=build_distill_model(config),
             token_budget=config.token_budget,
+            appkb_dir=config.memory_dir,
         )
         print(
             "distill: "
