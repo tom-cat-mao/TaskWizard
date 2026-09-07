@@ -533,19 +533,6 @@ class ThinPhoneAgent:
             keep_marks=getattr(config, "obs_marks_keep", 2),
         )
 
-        # When auto-compact is off there is no compact listener to drive the
-        # context pruner internally, so register a lightweight listener that
-        # still performs image/OBS-marks hygiene before every model call (P0 #3).
-        if not getattr(config, "compact_enabled", True):
-
-            def _prune_only_listener(messages, next):  # noqa: ANN001
-                context_pruner.prune(messages)
-                return next(messages)
-
-            self.event_bus.on(
-                MODEL_PRE_REQUEST, _prune_only_listener, prepend=True
-            )
-
         self._capability_ctx = CapabilityAssemblyContext(
             {
                 "event_bus": self.event_bus,
@@ -619,18 +606,7 @@ class ThinPhoneAgent:
             _ToolExecuteBridgeMiddleware(self.event_bus),
             order=0,
         )
-        # Tool/execute listeners are registered in nested order (first = outermost):
-        # trace -> diagnostic -> control HITL. The safety capability adds its
-        # listener last during assembly, making it the innermost onion layer.
-        self.event_bus.on(TOOL_EXECUTE, self._trace.on_tool_execute)
-        if self._diagnostic is not None:
-            # Tool/execute and model/request must be registered before capability
-            # assembly so diagnostic sits inside trace and outside/inside the
-            # safety/control layers as before.
-            self.event_bus.on(TOOL_EXECUTE, self._diagnostic.on_tool_execute)
-            self.event_bus.on(MODEL_REQUEST, self._diagnostic.on_model_request)
         self._control_hitl = build_control_hitl_middleware()
-        self.event_bus.on(TOOL_EXECUTE, self._control_hitl)
         self._capability_ctx.register_core_middleware(
             _ModelPreRequestBridgeMiddleware(self.event_bus),
             order=45,
@@ -647,9 +623,13 @@ class ThinPhoneAgent:
             _AgentAfterBridgeMiddleware(self.event_bus, self.run_id),
             order=48,
         )
-        # Trace observes the model request (outermost wrapper) and run end.
-        self.event_bus.on(MODEL_REQUEST, self._trace.on_model_request, prepend=True)
-        self.event_bus.on(AGENT_AFTER, self._trace.on_agent_after)
+        # Every core event-bus listener is registered by the two explicit chain
+        # methods; see their docstrings for the nesting table. The split is not
+        # cosmetic: capability listeners (safety, taskdoc, budget, compact) are
+        # mounted by assemble_capabilities between the two calls, so anything
+        # registered here nests OUTSIDE them and anything registered afterwards
+        # nests INSIDE them.
+        self._register_event_chain_pre_assembly()
         self._capability_ctx.add_core_run_hook(
             "start", self._capability_snapshot_run_start, order=30
         )
@@ -668,21 +648,12 @@ class ThinPhoneAgent:
         self._budget = self._capability_ctx.service("budget_instance")
         self._compact = self._capability_ctx.service("compact_instance")
 
-        # Diagnostic request/run-end listeners are registered after capability
-        # assembly so they observe post-compact, post-taskdoc, post-budget state.
-        if self._diagnostic is not None:
-            self.event_bus.on(RUN_START, self._diagnostic.on_run_start)
-            self.event_bus.on(MODEL_PRE_REQUEST, self._diagnostic.on_pre_request)
-            self.event_bus.on(AGENT_AFTER, self._diagnostic.on_agent_after)
-
-        # Runaway-loop fuse: registered after budget so the cost ceiling wins when
-        # both would fire, matching the old middleware order (budget before limit).
+        # Runaway-loop fuse; why it is registered behind budget is documented in
+        # _register_event_chain_post_assembly.
         self._model_call_limiter = _ModelCallLimitListener(
             getattr(config, "max_model_calls", 100)
         )
-        self.event_bus.on(
-            MODEL_PRE_REQUEST, self._model_call_limiter.on_pre_request
-        )
+        self._register_event_chain_post_assembly()
 
         self._safety_warning = self._capability_ctx.service("_safety_warning_listener")
 
@@ -697,6 +668,94 @@ class ThinPhoneAgent:
         self._base_system_prompt = get_system_prompt(getattr(config, "lang", "cn"))
         self._system_prompt = self._base_system_prompt
         self._revoked_lesson_ids: set[str] = set()
+
+    def _register_event_chain_pre_assembly(self) -> None:
+        """Register the core listeners that must nest OUTSIDE the capabilities.
+
+        Registration order is onion order: **first registered = outermost**.
+        Everything registered here runs *outside* every capability listener,
+        because capabilities mount during ``assemble_capabilities``, after this
+        method returns.
+
+        ``tool/execute`` (outermost -> innermost)
+          * ``trace``        — writes ``tool_call`` *before* delegating and
+            ``tool_result`` after, so an inner short-circuit is still paired.
+          * ``diagnostic``   — observe-only live-diagnosis mirror of the same pair.
+          * ``control_hitl`` — ``ask_user``/``take_over`` interrupts; must see the
+            request before safety can short-circuit a tap/type.
+          * ``safety``       — **innermost**, registered last by the safety
+            capability during assembly (never here).
+
+          Why safety must be innermost: a flagged call is *not executed* and
+          returns a warning ``ToolMessage`` instead of calling ``next``. If safety
+          were outermost, it would return before trace ever ran, and the blocked
+          call would vanish from the trace (no ``tool_call``, no ``tool_result``).
+          With safety innermost, trace has already written the ``tool_call`` and
+          writes the warning as the paired ``tool_result`` — P0 #6 / WP-D2.
+          Behaviour guard: ``tests/v2/test_event_chain_behavior.py``
+          (see also ``tests/v2/test_trace_invariant.py``).
+
+        ``model/request``
+          * ``trace`` (``prepend=True``) is the outermost wrapper so step,
+            latency and usage accounting enclose every other listener.
+          * ``diagnostic`` appends inside trace; the budget capability appends
+            during assembly, i.e. innermost.
+
+        ``model/pre_request`` (final order, completed across both phases)
+          compact (prepended by the compact capability — or the prune-only
+          listener below when compact is off) -> taskdoc -> budget -> diagnostic
+          -> model-call limiter.
+
+        ``agent/after``
+          ``trace`` (writes ``run_end``) then ``diagnostic``.
+        """
+
+        # --- tool/execute: outermost -> innermost --------------------------
+        self.event_bus.on(TOOL_EXECUTE, self._trace.on_tool_execute)
+        if self._diagnostic is not None:
+            self.event_bus.on(TOOL_EXECUTE, self._diagnostic.on_tool_execute)
+        self.event_bus.on(TOOL_EXECUTE, self._control_hitl)
+
+        # --- model/request: trace outermost, diagnostic inside it -----------
+        self.event_bus.on(MODEL_REQUEST, self._trace.on_model_request, prepend=True)
+        if self._diagnostic is not None:
+            self.event_bus.on(MODEL_REQUEST, self._diagnostic.on_model_request)
+
+        # --- image hygiene (P0 #3) ----------------------------------------
+        # When auto-compact is off there is no compact listener to drive the
+        # context pruner internally, so prune from a dedicated listener that is
+        # prepended in front of every capability listener.
+        if not getattr(self.config, "compact_enabled", True):
+            pruner = self._capability_ctx.service("context_pruner")
+
+            def _prune_only_listener(messages, next):  # noqa: ANN001
+                pruner.prune(messages)
+                return next(messages)
+
+            self.event_bus.on(MODEL_PRE_REQUEST, _prune_only_listener, prepend=True)
+
+        # --- agent/after (emit order: trace, then diagnostic) ---------------
+        self.event_bus.on(AGENT_AFTER, self._trace.on_agent_after)
+
+    def _register_event_chain_post_assembly(self) -> None:
+        """Register the core listeners that must sit INSIDE the capabilities.
+
+        Continues the nesting table in :meth:`_register_event_chain_pre_assembly`.
+        Both registrations here are deliberate "after assembly" placements:
+
+        * diagnostic ``run/start``, ``model/pre_request`` and ``agent/after`` —
+          must observe post-compact / post-taskdoc / post-budget state, so they
+          are appended behind the capability listeners rather than in front.
+        * the runaway-loop fuse (``model/pre_request``) — appended behind budget
+          so the token cost ceiling wins when both would fire, matching the old
+          middleware order (budget before limit).
+        """
+
+        if self._diagnostic is not None:
+            self.event_bus.on(RUN_START, self._diagnostic.on_run_start)
+            self.event_bus.on(MODEL_PRE_REQUEST, self._diagnostic.on_pre_request)
+            self.event_bus.on(AGENT_AFTER, self._diagnostic.on_agent_after)
+        self.event_bus.on(MODEL_PRE_REQUEST, self._model_call_limiter.on_pre_request)
 
     def _owned_capability_product(self, cap_id: str, seam: str) -> Any | None:
         values = self._capability_ctx.owned_values(cap_id, seam)
