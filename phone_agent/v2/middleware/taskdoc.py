@@ -27,6 +27,7 @@ one-shot nudge, and it costs no bespoke detection heuristic.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
@@ -183,11 +184,16 @@ def _derive_flow_lines(messages: list, lang: str, max_items: int = MAX_FLOW_ITEM
     return lines
 
 
-class TaskDocMiddleware(AgentMiddleware):
-    """before_model: inject the pinned TaskDoc block + the derived flow line."""
+class TaskDocInjector:
+    """Inject/refresh the pinned ``[TASK_DOC]`` block before each model call.
+
+    Shared by the legacy :class:`TaskDocMiddleware` (kept for unit tests) and the
+    new ``model/pre_request`` event listener.  It removes the previous pinned
+    copy by id and appends a fresh block at the tail, deriving the ``## 流程线``
+    section from the current messages.
+    """
 
     def __init__(self, session: Any, lang: str = "cn", nudge_steps: int = 5) -> None:
-        super().__init__()
         self.session = session
         self.lang = lang
         # ``nudge_steps`` is retained for backward-compatible construction only
@@ -196,7 +202,6 @@ class TaskDocMiddleware(AgentMiddleware):
         # Id of the last injected task-board message (removed + refreshed next turn).
         self._injected_id: str | None = None
 
-    # ------------------------------------------------------------------
     def _flow_block(self, messages: list) -> str:
         """Render the ``## 流程线`` section from the transcript, or ``""`` if empty."""
 
@@ -206,7 +211,9 @@ class TaskDocMiddleware(AgentMiddleware):
         header = _FLOW_HEADER["cn" if _is_cn(self.lang) else "en"].format(n=len(lines))
         return header + "\n" + "\n".join(lines)
 
-    def before_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
+    def make_delta(self, messages: list) -> list[Any] | None:
+        """Return the messages to add (RemoveMessage + fresh SystemMessage) or ``None``."""
+
         doc = getattr(self.session, "task_doc", None)
         if doc is None:
             return None
@@ -219,7 +226,6 @@ class TaskDocMiddleware(AgentMiddleware):
             # Empty document: nothing pinned (and no trajectory worth pinning yet).
             return None
 
-        messages = state.get("messages", []) if isinstance(state, dict) else []
         block = "[TASK_DOC]\n" + rendered
         flow = self._flow_block(messages)
         if flow:
@@ -233,7 +239,34 @@ class TaskDocMiddleware(AgentMiddleware):
             out.append(RemoveMessage(id=self._injected_id))
         out.append(SystemMessage(content=block, id=new_id))
         self._injected_id = new_id
-        return {"messages": out}
+        return out
+
+    def __call__(self, messages: list, _next: Callable[[Any], Any]) -> Any:
+        """``model/pre_request`` waterfall listener: transform then delegate."""
+
+        delta = self.make_delta(messages)
+        if delta is None:
+            return _next(messages)
+        return _next(list(messages) + delta)
+
+
+class TaskDocMiddleware(AgentMiddleware):
+    """before_model: inject the pinned TaskDoc block + the derived flow line.
+
+    This is now a thin wrapper around :class:`TaskDocInjector` so the legacy
+    unit-test path keeps working while production wiring uses the event listener.
+    """
+
+    def __init__(self, session: Any, lang: str = "cn", nudge_steps: int = 5) -> None:
+        super().__init__()
+        self._injector = TaskDocInjector(session, lang=lang, nudge_steps=nudge_steps)
+
+    def before_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
+        messages = state.get("messages", []) if isinstance(state, dict) else []
+        delta = self._injector.make_delta(messages)
+        if delta is None:
+            return None
+        return {"messages": delta}
 
     async def abefore_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
         return self.before_model(state, runtime)
@@ -244,15 +277,15 @@ def build_taskdoc_middleware(
 ) -> TaskDocMiddleware:
     """Build a :class:`TaskDocMiddleware` bound to ``session``.
 
-    The session is captured directly so the middleware can read
-    ``session.task_doc`` before every model call. ``nudge_steps`` is accepted for
-    backward-compatible call sites (U3 removed the stagnation nudge) and ignored.
+    Kept for tests and compatibility; production code registers a
+    :class:`TaskDocInjector` as a ``model/pre_request`` listener instead.
     """
 
     return TaskDocMiddleware(session, lang=lang, nudge_steps=nudge_steps)
 
 
 __all__ = [
+    "TaskDocInjector",
     "TaskDocMiddleware",
     "build_taskdoc_middleware",
     "MAX_FLOW_ITEMS",

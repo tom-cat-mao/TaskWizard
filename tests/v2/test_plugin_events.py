@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import RemoveMessage, SystemMessage, ToolMessage
 
 from phone_agent.v2.capabilities import (
     CapabilityAssemblyContext,
@@ -21,6 +23,7 @@ from phone_agent.v2.events import (
     validate_event_name,
 )
 from phone_agent.v2.middleware.safety import SafetyWarningMiddleware
+from phone_agent.v2.middleware.taskdoc import TaskDocInjector
 
 
 def test_event_name_validation() -> None:
@@ -234,3 +237,125 @@ def test_run_start_event_emitted(tmp_path, monkeypatch) -> None:
     assert end_payloads[0]["run_id"] == agent.run_id
     assert end_payloads[0]["success"] is True
     assert end_payloads[0]["exception"] is False
+
+
+# ---------------------------------------------------------------------------
+# D6: TaskDoc pinning as a model/pre_request listener
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _TaskDocListenerDoc:
+    goal_base: str = ""
+    items: list = field(default_factory=list)
+    facts: list = field(default_factory=list)
+
+    def render(self, lang: str = "cn") -> str:  # noqa: ARG002
+        if not (self.goal_base or self.items or self.facts):
+            return ""
+        lines = ["## 目标", f"base: {self.goal_base}"]
+        if self.items:
+            lines.append("## 路线")
+            for item in self.items:
+                lines.append(f"- [{item['status']}] {item['id']}: {item['content']}")
+        if self.facts:
+            lines.append("## 关键事实")
+            lines.extend(f"- {f}" for f in self.facts)
+        return "\n".join(lines)
+
+
+def _taskdoc_registry(enabled: bool):
+    return build_capability_registry(
+        SimpleNamespace(
+            taskdoc_enabled=enabled,
+            safety_mode="off",
+            compact_enabled=False,
+            finish_verify="off",
+            app_kb_enabled=False,
+            dream_mode="manual",
+            experience_enabled=False,
+            memory_rag="off",
+            deliverable_enabled=False,
+        )
+    )
+
+
+def test_taskdoc_capability_injects_via_model_pre_request_listener() -> None:
+    bus = EventBus()
+    session = SimpleNamespace(
+        task_doc=_TaskDocListenerDoc(
+            goal_base="订一张票",
+            items=[{"id": "s1", "content": "选出发地", "status": "in_progress"}],
+        )
+    )
+    ctx = CapabilityAssemblyContext(
+        {
+            "event_bus": bus,
+            "session": session,
+            "config": SimpleNamespace(lang="cn", taskdoc_nudge_steps=5),
+            "taskdoc_tool_factory": lambda: None,
+            "taskdoc_run_start": lambda _state: None,
+        }
+    )
+
+    assemble_capabilities(_taskdoc_registry(True), ctx)
+
+    messages = [SystemMessage(content="sys")]
+    result = bus.waterfall("model/pre_request", messages, terminal=lambda x: x)
+
+    # One fresh pinned block appended; content carries the rendered doc.
+    assert len(result) == len(messages) + 1
+    assert result[-1].content.startswith("[TASK_DOC]\n")
+    assert "订一张票" in result[-1].content
+    assert result[-1].id.startswith("__taskdoc__")
+
+
+def test_taskdoc_listener_refreshes_one_block_per_call() -> None:
+    bus = EventBus()
+    session = SimpleNamespace(
+        task_doc=_TaskDocListenerDoc(goal_base="目标", items=[])
+    )
+    injector = TaskDocInjector(session, lang="cn")
+    bus.on("model/pre_request", injector)
+
+    first = bus.waterfall("model/pre_request", [], terminal=lambda x: x)
+    first_id = first[-1].id
+
+    second = bus.waterfall("model/pre_request", first, terminal=lambda x: x)
+
+    # The second call removes the stale copy and appends exactly one fresh block.
+    removals = [m for m in second if isinstance(m, RemoveMessage)]
+    assert len(removals) == 1
+    assert removals[0].id == first_id
+    # After accounting for the removal, only the freshly pinned block remains.
+    taskdoc_ids = {
+        (getattr(m, "id") or "")
+        for m in second
+        if (getattr(m, "id") or "").startswith("__taskdoc__")
+    }
+    assert taskdoc_ids == {first_id, second[-1].id}
+    assert second[-1].id != first_id
+
+
+def test_taskdoc_capability_release_disposes_listener() -> None:
+    bus = EventBus()
+    session = SimpleNamespace(
+        task_doc=_TaskDocListenerDoc(goal_base="目标", items=[])
+    )
+    ctx = CapabilityAssemblyContext(
+        {
+            "event_bus": bus,
+            "session": session,
+            "config": SimpleNamespace(lang="cn", taskdoc_nudge_steps=5),
+            "taskdoc_tool_factory": lambda: None,
+            "taskdoc_run_start": lambda _state: None,
+        }
+    )
+
+    assemble_capabilities(_taskdoc_registry(True), ctx)
+    assert bus.waterfall("model/pre_request", [], terminal=lambda x: x) != []
+
+    assemble_capabilities(_taskdoc_registry(False), ctx)
+    # After release the listener is gone and the payload passes through unchanged.
+    payload = [SystemMessage(content="sys")]
+    assert bus.waterfall("model/pre_request", payload, terminal=lambda x: x) is payload

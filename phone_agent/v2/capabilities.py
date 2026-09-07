@@ -18,6 +18,8 @@ from dataclasses import dataclass
 import re
 from typing import Any, Protocol, runtime_checkable
 
+from phone_agent.v2.events import MODEL_PRE_REQUEST
+
 CapabilityHook = Callable[..., None]
 PromptProvider = Callable[..., Any]
 RunHook = Callable[..., Any]
@@ -35,7 +37,6 @@ _RUN_HOOK_WHEN = frozenset({"start", "end"})
 # register independently.  Core harness middleware occupies the gaps through
 # ``register_core_middleware(order=...)``.
 _MIDDLEWARE_ORDER = {
-    "taskdoc": 10,
     "compact": 20,
     "budget": 40,
     "safety": 90,
@@ -507,12 +508,19 @@ def _register_cli(ctx: CapabilityAssemblyContext, names: Sequence[str]) -> None:
 
 
 def _apply_taskdoc(ctx: CapabilityAssemblyContext) -> None:
-    _register_factory(
-        ctx,
-        "taskdoc_middleware_factory",
-        "register_middleware",
-        fail_open=True,
-    )
+    bus = ctx.service("event_bus")
+    if bus is not None:
+        from phone_agent.v2.middleware.taskdoc import TaskDocInjector
+
+        session = ctx.service("session")
+        config = ctx.service("config")
+        injector = TaskDocInjector(
+            session,
+            lang=getattr(config, "lang", "cn"),
+            nudge_steps=getattr(config, "taskdoc_nudge_steps", 5),
+        )
+        disposer = bus.on(MODEL_PRE_REQUEST, injector)
+        ctx.register_service("taskdoc_event_disposer", disposer)
     _register_factory(ctx, "taskdoc_tool_factory", "register_tool")
     _register_service_hook(ctx, "start", "taskdoc_run_start")
 
@@ -611,6 +619,11 @@ def _owned_release(cap_id: str) -> CapabilityHook:
             if callable(disposer):
                 disposer()
                 ctx.set_service("_safety_event_disposer", None)
+        if cap_id == "taskdoc":
+            disposer = ctx.service("taskdoc_event_disposer")
+            if callable(disposer):
+                disposer()
+                ctx.set_service("taskdoc_event_disposer", None)
         ctx.release_capability(cap_id)
 
     return release
