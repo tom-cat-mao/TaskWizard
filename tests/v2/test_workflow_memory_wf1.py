@@ -728,3 +728,31 @@ def test_review_cli_shows_kind_steps_app_scope_and_grade_basis(
     assert APP in printed
     assert "事实单显示结局不一致" in printed
     assert "needs_review" in printed
+
+
+def test_distill_parser_accepts_bare_run_id_evidence_and_list_pitfalls():
+    """Real gateway output: models emit evidence as bare run_id strings and
+    pitfalls as a list. Both must be tolerated instead of dropping the card."""
+    from phone_agent.v2.evolution import LessonCandidate
+
+    payload = {
+        "lesson_id": "les_" + "a" * 16,
+        "schema_v": 1,
+        "version": 1,
+        "status": "proposed",
+        "text": "B站按UP主找最新视频并播放/记录",
+        "scope": {"device": None, "app": "tv.danmaku.bili", "app_version": None},
+        "evidence": ["run_a", "run_b"],
+        "support_count": 2,
+        "task_keys": ["open_app", "search"],
+        "conflicts": [],
+        "created_ts": 1.0,
+        "source": "distill",
+        "kind": "procedure",
+        "app_scope": "tv.danmaku.bili",
+        "steps": ["启动应用进入首页", "搜索 UP 主"],
+        "pitfalls": ["坑一", "坑二"],
+    }
+    candidate = LessonCandidate.from_dict(payload)
+    assert [e["run_id"] for e in candidate.evidence] == ["run_a", "run_b"]
+    assert candidate.pitfalls == "坑一；坑二"

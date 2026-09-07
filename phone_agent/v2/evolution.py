@@ -196,7 +196,14 @@ class LessonCandidate:
             raise ValueError(f"kind must be one of {sorted(LESSON_KINDS)!r}")
         raw_steps = payload.get("steps")
         steps = _step_list(raw_steps) if raw_steps is not None else []
-        pitfalls = _nullable_str(payload.get("pitfalls"), "pitfalls")
+        raw_pitfalls = payload.get("pitfalls")
+        if isinstance(raw_pitfalls, list):
+            # Models naturally emit pitfalls as an array; join into the
+            # schema's single-string form instead of dropping the card.
+            raw_pitfalls = "；".join(
+                s for s in (str(i).strip() for i in raw_pitfalls) if s
+            ) or None
+        pitfalls = _nullable_str(raw_pitfalls, "pitfalls")
         app_scope = _nullable_str(payload.get("app_scope"), "app_scope")
         if kind == "procedure":
             if not steps:
@@ -247,6 +254,11 @@ class LessonCandidate:
         evidence: list[dict[str, str]] = []
         seen_runs: set[str] = set()
         for item in raw_evidence:
+            # The model may cite a bare run_id string; the canonical evidence
+            # rebuild overwrites notes from episode outcomes anyway, so accept
+            # both shapes instead of dropping an otherwise-valid candidate.
+            if isinstance(item, str):
+                item = {"run_id": item, "note": "cited by distill"}
             if not isinstance(item, Mapping) or set(item) != _EVIDENCE_FIELDS:
                 raise ValueError("each evidence item must contain run_id and note")
             run_id = item["run_id"]
@@ -1027,7 +1039,8 @@ def _build_distill_messages(
             "status 必须是 proposed，schema_v/version 必须是 1，source 必须是 distill；"
             "lesson_id 使用 les_ 加 12-64 位小写十六进制。"
             "scope 的 device/app 只能逐字选自输入，app_version 必须为 null。"
-            "evidence 只能引用输入 run_id；support_count 必须等于去重 evidence 数；"
+            "evidence 只能引用输入 run_id（元素为 run_id 字符串或 {\"run_id\", \"note\"} "
+            "对象，note 可留一句话支撑点）；support_count 必须等于去重 evidence 数；"
             "task_keys 只能选输入 task_key。"
             "rules（单条行为规则）：text 只能是一句行为规则及适用条件，应能指导未来同类任务，"
             "不得照抄单次任务的具体参数；kind 必须是 rule，不得携带 steps/app_scope。"
@@ -1036,7 +1049,8 @@ def _build_distill_messages(
             "仅引用成功 run 的候选会被丢弃。"
             "procedures（多步过程卡）：kind 必须填 procedure；text 写卡名（一句短语）；"
             "app_scope 填应用包名，跨应用通用的卡填 \"general\"；steps 写有序语义步；"
-            "pitfalls 写观察到的坑位（失败后恢复、弹窗/权限框如何处理），没有观察到就填 null。"
+            "pitfalls 写观察到的坑位（失败后恢复、弹窗/权限框如何处理），没有观察到就填 null"
+            "（字符串或 null，不要数组）。"
             "只有当一个子过程在 ≥2 个不同任务（task_key）里重复出现时才提案；"
             "只在单一任务里出现过的流程不要提案。"
             "steps 必须是语义步：描述意图与目标，例如「搜索框输入目标」「选店进入」"
