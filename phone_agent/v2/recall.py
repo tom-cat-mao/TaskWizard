@@ -39,7 +39,10 @@ _GLOBAL_DEVICE_SCOPE = "global"
 # WP-WF2a procedure-recall knobs.  The threshold is a module constant (not a
 # config key) because WP-WF2b scans it offline in replay; the injection budget
 # is deliberately separate from the rule budget (3 items / 800 tokens).
-PROCEDURE_MIN_SCORE = 0.50
+PROCEDURE_MIN_SCORE = 0.30  # calibrated on real episodes (20 runs, 2 cards) via
+# `replay --channel procedure --sweep --calibrate`: knee at highest coverage
+# (0.30) whose relevance clears 0.60 (0.667); tau>=0.45 reaches relevance 1.0
+# but coverage drops to 0.20.
 PROCEDURE_MAX_ITEMS = 1
 PROCEDURE_MAX_TOKENS = 300
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]+|[\u3400-\u9fff]+")

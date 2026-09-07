@@ -382,6 +382,7 @@ def replay_procedure_metrics(
     embedder: Any | None = None,
     min_steps: int = 2,
     min_score: float = 0.50,
+    calibrate: bool = False,
 ) -> dict[str, Any]:
     """Replay episodes chronologically and score the procedure channel.
 
@@ -393,6 +394,12 @@ def replay_procedure_metrics(
     served by the cross-app ``general`` pool instead) followed by cosine
     top-1 ranking against the goal.  ``steps_delta`` is reported as N/A — see
     the module docstring.
+
+    ``calibrate=True`` drops the no-time-travel invariant: every episode is
+    scored against the **final** injectable pool.  This exists solely for
+    threshold tuning on cold-start data (cards distilled from the very
+    episodes being replayed are otherwise invisible to all of them); its
+    numbers must never feed ``channel_recommended``.
     """
 
     events_path = Path(experience_dir) / "events.jsonl"
@@ -414,7 +421,11 @@ def replay_procedure_metrics(
             device = ""
         pool = [
             card
-            for card in _pool_at(timeline, float(event.get("ts_start", 0.0) or 0.0))
+            for card in (
+                timeline[-1][1]
+                if calibrate and timeline
+                else _pool_at(timeline, float(event.get("ts_start", 0.0) or 0.0))
+            )
             if card.scope.get("device") in {None, device or None}
         ]
         if packages:
@@ -554,6 +565,7 @@ def sweep_procedure_thresholds(
     stop: float = PROCEDURE_SWEEP_STOP,
     step: float = PROCEDURE_SWEEP_STEP,
     relevance_target: float = PROCEDURE_RELEVANCE_TARGET,
+    calibrate: bool = False,
 ) -> dict[str, Any]:
     """Score the procedure channel across a ``min_score`` grid.
 
@@ -572,6 +584,7 @@ def sweep_procedure_thresholds(
         embedder=embedder,
         min_steps=min_steps,
         min_score=start,
+        calibrate=calibrate,
     )
     rows = result["details"]
     runs_total = result["runs_total"]
@@ -687,6 +700,15 @@ def _main(argv: Sequence[str] | None = None) -> None:
             f" step {PROCEDURE_SWEEP_STEP} and recommend a knee point"
         ),
     )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help=(
+            "--channel procedure only: score every episode against the final "
+            "card pool (breaks no-time-travel; threshold tuning only, never "
+            "feeds channel_recommended)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.channel == "procedure":
@@ -695,6 +717,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
                 experience_dir=args.experience_dir,
                 lessons_dir=args.lessons_dir,
                 min_steps=args.min_steps,
+                calibrate=args.calibrate,
             )
         else:
             result = replay_procedure_metrics(
@@ -702,6 +725,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
                 lessons_dir=args.lessons_dir,
                 min_steps=args.min_steps,
                 min_score=args.min_score,
+                calibrate=args.calibrate,
             )
     else:
         result = replay_exemplar_metrics(

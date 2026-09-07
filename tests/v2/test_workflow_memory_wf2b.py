@@ -496,3 +496,39 @@ def test_exemplar_channel_is_untouched(tmp_path: Path, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert "channel" not in payload
     assert payload["runs_total"] == 2
+
+
+def test_procedure_calibrate_mode_uses_final_pool_for_all_episodes(tmp_path: Path) -> None:
+    """--calibrate deliberately breaks no-time-travel (cold-start threshold tuning)."""
+
+    card = _bili_card(status="proposed")
+    lessons = tmp_path / "lessons"
+    _write(
+        lessons,
+        [
+            _proposed(card, ts=10.0),
+            _lifecycle("lesson_approved", "les_0000000000000001", ts=100.0),
+        ],
+    )
+    experience = tmp_path / "experience"
+    _write(
+        experience,
+        [
+            _episode(run_id="run_early", ts_start=50.0, goal_text="B站搜索视频并播放"),
+            _launch(run_id="run_early", step=1, ts=51.0, package=BILI),
+        ],
+    )
+
+    strict = replay_procedure_metrics(
+        str(experience), str(lessons), embedder=HashEmbedder(dimension=64)
+    )
+    cal = replay_procedure_metrics(
+        str(experience),
+        str(lessons),
+        embedder=HashEmbedder(dimension=64),
+        calibrate=True,
+    )
+
+    assert strict["details"][0]["pool_size"] == 0  # card approved after ts_start
+    assert cal["details"][0]["pool_size"] == 1
+    assert cal["details"][0]["hit_lesson_id"] == "les_0000000000000001"
