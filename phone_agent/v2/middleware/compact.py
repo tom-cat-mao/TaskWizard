@@ -49,6 +49,7 @@ from phone_agent.v2.middleware._tokens import (
     estimate_context_tokens,
     estimate_message_tokens,
 )
+from phone_agent.v2.middleware.images import ContextPrunerService
 from phone_agent.v2.pins import COMPACT_ID_PREFIX, TASKDOC_ID_PREFIX
 
 # Default context window when the model name carries no size hint (design: 256k).
@@ -230,6 +231,7 @@ class CompactMiddleware(AgentMiddleware):
         *,
         model: Any | None = None,
         memory_state_provider: Any | None = None,
+        pruner: ContextPrunerService | None = None,
         warn_ratio: float = 0.75,
         trigger_ratio: float = 0.92,
         keep_ratio: float = 0.5,
@@ -242,6 +244,7 @@ class CompactMiddleware(AgentMiddleware):
         self.config = config
         self._main_model = model
         self._memory_state_provider = memory_state_provider
+        self._pruner = pruner
         self.warn_ratio = _clamp_ratio(warn_ratio, 0.75)
         self.trigger_ratio = _clamp_ratio(trigger_ratio, 0.92)
         # Keep-ratio: how much of the window the recent verbatim tail may occupy
@@ -266,12 +269,32 @@ class CompactMiddleware(AgentMiddleware):
 
         self._warned = False
 
+    # -- event-listener adapter --------------------------------------------
+    def on_pre_request(self, messages: list[Any], next: Any) -> Any:
+        """Adapter for the ``model/pre_request`` waterfall.
+
+        ``before_model`` already invokes the pruner as its first step (C1), so
+        the listener simply forwards the result to downstream listeners.
+        """
+
+        update = self.before_model({"messages": messages}, None)
+        if update is None:
+            return next(messages)
+        if isinstance(update, dict) and "messages" in update:
+            return next(update["messages"])
+        return next(messages)
+
     # -- thresholds --------------------------------------------------------
     def before_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
         messages = state.get("messages") if isinstance(state, dict) else None
         messages = list(messages or [])
         if not messages:
             return None
+        # C1: coarse folding runs after the fine-grained image/OBS-marks pruner.
+        # The pruner mutates message content in place so the summariser sees the
+        # real textual history without paying for stale screenshots.
+        if self._pruner is not None:
+            self._pruner.prune(messages)
         total = estimate_context_tokens(messages)
 
         if total >= self.window * self.trigger_ratio:
@@ -596,6 +619,7 @@ def build_compact_middleware(
     *,
     model: Any | None = None,
     memory_state_provider: Any | None = None,
+    pruner: ContextPrunerService | None = None,
 ) -> CompactMiddleware:
     """Build a :class:`CompactMiddleware` from resolved config values."""
 
@@ -604,6 +628,7 @@ def build_compact_middleware(
         config,
         model=model,
         memory_state_provider=memory_state_provider,
+        pruner=pruner,
         warn_ratio=getattr(config, "compact_warn_ratio", 0.75),
         trigger_ratio=getattr(config, "compact_trigger_ratio", 0.92),
         lang=getattr(config, "lang", "cn"),

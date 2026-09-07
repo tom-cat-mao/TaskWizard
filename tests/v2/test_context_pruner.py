@@ -14,6 +14,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from phone_agent.v2.agent import ThinPhoneAgent
 from phone_agent.v2.capabilities import CapabilityAssemblyContext
+from phone_agent.v2.events import MODEL_PRE_REQUEST
 from phone_agent.v2.middleware.images import (
     ContextPrunerService,
     ContextPruningMiddleware,
@@ -140,10 +141,10 @@ def test_service_accessible_via_agent_capability_context(monkeypatch, tmp_path):
     assert isinstance(service, ContextPrunerService)
     assert service.keep_images == 2
     assert service.keep_marks == 2
-    # The core middleware uses the same instance so keep values stay in sync.
+    # Image pruning is now performed by a model/pre_request listener, not by a
+    # middleware in the LangChain stack.
     middleware = agent._capability_ctx.middleware
-    pruner_mw = next(m for m in middleware if isinstance(m, ContextPruningMiddleware))
-    assert pruner_mw._pruner is service
+    assert not any(isinstance(m, ContextPruningMiddleware) for m in middleware)
 
 
 # --------------------------------------------------------------------------
@@ -187,6 +188,69 @@ def test_service_and_middleware_dedup_same_message_hit_by_both_passes():
     assert service_modified.count(mw_msgs[0]) == 1
     assert _count_images(mw_msgs[0]) == 0
     assert "[marks 已折叠:3]" in _message_text(mw_msgs[0])
+
+
+# --------------------------------------------------------------------------
+# (d) compact on/off: image pruning always happens exactly once
+# --------------------------------------------------------------------------
+def _prune_call_counter(service: ContextPrunerService):
+    calls = 0
+    orig = service.prune
+
+    def counted(messages: list[Any]) -> list[Any]:
+        nonlocal calls
+        calls += 1
+        return orig(messages)
+
+    service.prune = counted
+    return lambda: calls
+
+
+def test_compact_off_prunes_images_exactly_once(monkeypatch, tmp_path):
+    from tests.v2.test_experience import _install_mini_agent_modules
+
+    config = _install_mini_agent_modules(monkeypatch, tmp_path, enabled=False)
+    config.compact_enabled = False
+    config.image_keep = 2
+    config.obs_marks_keep = 2
+
+    agent = ThinPhoneAgent(config)
+    service = agent._capability_ctx.service("context_pruner")
+    get_calls = _prune_call_counter(service)
+
+    msgs = [_obs_msg("app", i) for i in range(1, 5)]
+    agent.event_bus.waterfall(
+        MODEL_PRE_REQUEST, msgs, terminal=lambda x: x
+    )
+
+    assert get_calls() == 1
+    assert _count_images(msgs[0]) == 0
+    assert "[screen#1 已剪除]" in _message_text(msgs[0])
+    assert _count_images(msgs[3]) == 1
+
+
+def test_compact_on_prunes_images_exactly_once(monkeypatch, tmp_path):
+    from tests.v2.test_experience import _install_mini_agent_modules
+
+    config = _install_mini_agent_modules(monkeypatch, tmp_path, enabled=False)
+    config.compact_enabled = True
+    config.image_keep = 2
+    config.obs_marks_keep = 2
+
+    agent = ThinPhoneAgent(config)
+    service = agent._capability_ctx.service("context_pruner")
+    get_calls = _prune_call_counter(service)
+
+    msgs = [_obs_msg("app", i) for i in range(1, 5)]
+    agent.event_bus.waterfall(
+        MODEL_PRE_REQUEST, msgs, terminal=lambda x: x
+    )
+
+    # Compact listener calls the pruner internally; no separate middleware.
+    assert get_calls() == 1
+    assert _count_images(msgs[0]) == 0
+    assert "[screen#1 已剪除]" in _message_text(msgs[0])
+    assert _count_images(msgs[3]) == 1
 
 
 # --------------------------------------------------------------------------

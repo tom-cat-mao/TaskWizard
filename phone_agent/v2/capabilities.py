@@ -18,7 +18,11 @@ from dataclasses import dataclass
 import re
 from typing import Any, Protocol, runtime_checkable
 
-from phone_agent.v2.events import MODEL_PRE_REQUEST
+from phone_agent.v2.events import (
+    MODEL_POST_REQUEST,
+    MODEL_PRE_REQUEST,
+    MODEL_REQUEST,
+)
 
 CapabilityHook = Callable[..., None]
 PromptProvider = Callable[..., Any]
@@ -37,8 +41,6 @@ _RUN_HOOK_WHEN = frozenset({"start", "end"})
 # register independently.  Core harness middleware occupies the gaps through
 # ``register_core_middleware(order=...)``.
 _MIDDLEWARE_ORDER = {
-    "compact": 20,
-    "budget": 40,
     "safety": 90,
 }
 _RUN_HOOK_ORDER = {
@@ -541,16 +543,39 @@ def _apply_safety(ctx: CapabilityAssemblyContext) -> None:
 
 
 def _apply_budget(ctx: CapabilityAssemblyContext) -> None:
-    _register_factory(ctx, "budget_middleware_factory", "register_middleware")
+    bus = ctx.service("event_bus")
+    factory = ctx.service("budget_middleware_factory")
+    if not callable(factory) or bus is None:
+        return
+    budget = factory()
+    if budget is None:
+        return
+    disposers = [
+        bus.on(MODEL_PRE_REQUEST, budget.on_pre_request),
+        bus.on(MODEL_REQUEST, budget.on_model_request),
+        bus.on(MODEL_POST_REQUEST, budget.on_post_request),
+    ]
+    ctx.register_service("budget_instance", budget)
+    ctx.register_service("budget_event_disposers", disposers)
 
 
 def _apply_compact(ctx: CapabilityAssemblyContext) -> None:
-    _register_factory(
-        ctx,
-        "compact_middleware_factory",
-        "register_middleware",
-        fail_open=True,
-    )
+    bus = ctx.service("event_bus")
+    factory = ctx.service("compact_middleware_factory")
+    if not callable(factory) or bus is None:
+        return
+    pruner = ctx.service("context_pruner")
+    try:
+        compact = factory(pruner=pruner) if pruner is not None else factory()
+    except Exception:
+        return
+    if compact is None:
+        return
+    # Compact must run before other model/pre_request listeners (taskdoc, budget,
+    # model_limit) so the coarse fold and image pruning happen at the old slot.
+    disposer = bus.on(MODEL_PRE_REQUEST, compact.on_pre_request, prepend=True)
+    ctx.register_service("compact_instance", compact)
+    ctx.register_service("compact_pre_request_disposer", disposer)
 
 
 def _apply_finish_verify(ctx: CapabilityAssemblyContext) -> None:
@@ -624,6 +649,15 @@ def _owned_release(cap_id: str) -> CapabilityHook:
             if callable(disposer):
                 disposer()
                 ctx.set_service("taskdoc_event_disposer", None)
+        # Dispose any model-domain event listeners registered by the capability.
+        disposer = ctx.service(f"{cap_id}_pre_request_disposer")
+        if callable(disposer):
+            disposer()
+            ctx.set_service(f"{cap_id}_pre_request_disposer", None)
+        for d in ctx.service(f"{cap_id}_event_disposers") or ():
+            if callable(d):
+                d()
+        ctx.set_service(f"{cap_id}_event_disposers", None)
         ctx.release_capability(cap_id)
 
     return release

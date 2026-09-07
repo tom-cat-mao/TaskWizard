@@ -23,6 +23,7 @@ import time
 from typing import Any, Callable, Mapping
 
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import hook_config
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from phone_agent.v2.capabilities import (
@@ -34,6 +35,7 @@ from phone_agent.v2.capabilities import (
 )
 from phone_agent.v2.events import (
     AGENT_AFTER,
+    JUMP_END,
     MODEL_POST_REQUEST,
     MODEL_PRE_REQUEST,
     MODEL_REQUEST,
@@ -195,6 +197,7 @@ class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
         super().__init__()
         self._event_bus = event_bus
 
+    @hook_config(can_jump_to=["end"])
     def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
         messages = state.get("messages") or []
         result = self._event_bus.waterfall(
@@ -202,8 +205,18 @@ class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
         )
         if result is messages:
             return None
+        # Circuit-breaker sentinels become a graph jump. A listener may also return
+        # a dict that already carries ``jump_to="end"`` plus optional messages.
+        if result is JUMP_END:
+            return {"jump_to": "end"}
+        if isinstance(result, dict):
+            if result.get("jump_to") == "end":
+                return result
+            if "messages" in result:
+                return result
         return {"messages": result}
 
+    @hook_config(can_jump_to=["end"])
     async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
         return self.before_model(state, runtime)
 
@@ -347,6 +360,28 @@ class _AgentAfterBridgeMiddleware(AgentMiddleware):
         return self.after_agent(state, runtime)
 
 
+class _ModelCallLimitListener:
+    """Runaway-loop fuse: counts model calls and jumps to ``end`` at the limit.
+
+    Replaces the LangChain ``ModelCallLimitMiddleware`` in the v2 stack.  Because
+    it is a ``model/pre_request`` listener, it runs inside the pre-request bridge
+    and short-circuits before the model is invoked once the fuse blows.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1, int(limit))
+        self.calls = 0
+
+    def reset(self) -> None:
+        self.calls = 0
+
+    def on_pre_request(self, messages: list[Any], next: Any) -> Any:
+        self.calls += 1
+        if self.calls > self.limit:
+            return {"jump_to": "end", "messages": messages}
+        return next(messages)
+
+
 class ThinPhoneAgent:
     """Thin-loop phone agent built on ``create_agent`` + v2 middleware.
 
@@ -381,7 +416,6 @@ class ThinPhoneAgent:
         # Lazy imports: these modules are produced by the concurrent core/tools
         # worktrees and may not exist when this module is first imported.
         from langchain.agents import create_agent
-        from langchain.agents.middleware import ModelCallLimitMiddleware
 
         from phone_agent.v2.model import build_chat_model
         from phone_agent.v2.session import PhoneSession
@@ -390,10 +424,7 @@ class ThinPhoneAgent:
             from phone_agent.v2 import tools as tools_module
         from phone_agent.v2.usage import UsageLedger
         from phone_agent.v2.middleware.budget import build_budget_middleware
-        from phone_agent.v2.middleware.images import (
-            ContextPrunerService,
-            build_context_pruning_middleware,
-        )
+        from phone_agent.v2.middleware.images import ContextPrunerService
         from phone_agent.v2.middleware.safety import (
             build_capability_safety_middleware,
             build_control_hitl_middleware,
@@ -440,7 +471,7 @@ class ThinPhoneAgent:
                 nudge_steps=getattr(config, "taskdoc_nudge_steps", 5),
             )
 
-        def compact_middleware_factory():
+        def compact_middleware_factory(pruner=None):
             from phone_agent.v2.middleware.compact import build_compact_middleware
 
             return build_compact_middleware(
@@ -448,6 +479,7 @@ class ThinPhoneAgent:
                 config,
                 model=self.model,
                 memory_state_provider=self._compact_memory_state,
+                pruner=pruner,
             )
 
         def budget_middleware_factory():
@@ -498,6 +530,19 @@ class ThinPhoneAgent:
             keep_images=getattr(config, "image_keep", 2),
             keep_marks=getattr(config, "obs_marks_keep", 2),
         )
+
+        # When auto-compact is off there is no compact listener to drive the
+        # context pruner internally, so register a lightweight listener that
+        # still performs image/OBS-marks hygiene before every model call (P0 #3).
+        if not getattr(config, "compact_enabled", True):
+
+            def _prune_only_listener(messages, next):  # noqa: ANN001
+                context_pruner.prune(messages)
+                return next(messages)
+
+            self.event_bus.on(
+                MODEL_PRE_REQUEST, _prune_only_listener, prepend=True
+            )
 
         self._capability_ctx = CapabilityAssemblyContext(
             {
@@ -564,10 +609,6 @@ class ThinPhoneAgent:
             order=1,
         )
         self._capability_ctx.register_core_middleware(
-            build_context_pruning_middleware(pruner=context_pruner),
-            order=30,
-        )
-        self._capability_ctx.register_core_middleware(
             _ModelPreRequestBridgeMiddleware(self.event_bus),
             order=45,
         )
@@ -584,13 +625,6 @@ class ThinPhoneAgent:
             order=48,
         )
         self._capability_ctx.register_core_middleware(self._trace, order=50)
-        self._capability_ctx.register_core_middleware(
-            ModelCallLimitMiddleware(
-                thread_limit=getattr(config, "max_model_calls", 100),
-                exit_behavior="end",
-            ),
-            order=60,
-        )
         self._capability_ctx.add_core_run_hook(
             "start", self._capability_snapshot_run_start, order=30
         )
@@ -635,8 +669,18 @@ class ThinPhoneAgent:
         assemble_capabilities(self.capability_registry, self._capability_ctx)
         self.tools = self._capability_ctx.tools
         middleware = self._capability_ctx.middleware
-        self._budget = self._owned_capability_product("budget", "middleware")
-        self._compact = self._owned_capability_product("compact", "middleware")
+        self._budget = self._capability_ctx.service("budget_instance")
+        self._compact = self._capability_ctx.service("compact_instance")
+
+        # Runaway-loop fuse: registered after budget so the cost ceiling wins when
+        # both would fire, matching the old middleware order (budget before limit).
+        self._model_call_limiter = _ModelCallLimitListener(
+            getattr(config, "max_model_calls", 100)
+        )
+        self.event_bus.on(
+            MODEL_PRE_REQUEST, self._model_call_limiter.on_pre_request
+        )
+
         safety_product = self._owned_capability_product("safety", "middleware")
         self._safety_warning = (
             safety_product
@@ -1358,6 +1402,8 @@ class ThinPhoneAgent:
                 self._compact.reset()
             except Exception:  # noqa: BLE001 - best-effort reset; never block a run
                 pass
+        if getattr(self, "_model_call_limiter", None) is not None:
+            self._model_call_limiter.reset()
         try:
             self.session.launched_apps = []
             self.session.finish_verifier = "skipped"
@@ -1532,10 +1578,11 @@ class ThinPhoneAgent:
 
         # No terminal declaration. Distinguish the terminal causes (A4 §2): a
         # spent HITL-resume budget, an exhausted **token** cost budget (the L0
-        # BudgetMiddleware hard ceiling set ``exhausted``), the runaway-loop fuse
-        # (ModelCallLimit hard-stopped at ``max_model_calls`` — its injected
-        # terminal message never runs wrap_model_call, so ``_trace._step`` equals
-        # the fuse limit, F6), or a model that simply stopped emitting tool calls.
+        # budget listener set ``exhausted``), the runaway-loop fuse
+        # (_ModelCallLimitListener hard-stopped at ``max_model_calls`` — the jump
+        # to ``end`` means the terminal model call never runs wrap_model_call, so
+        # ``_trace._step`` equals the fuse limit, F6), or a model that simply
+        # stopped emitting tool calls.
         if getattr(self, "_hitl_exhausted", False):
             return RunResult(False, "hitl_resume_exhausted", steps, self.trace_path)
         budget = getattr(self, "_budget", None)

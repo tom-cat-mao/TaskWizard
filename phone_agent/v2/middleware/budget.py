@@ -216,6 +216,34 @@ class BudgetMiddleware(AgentMiddleware):
         self._record_first_diff(request)
         return await handler(request)
 
+    # -- event-listener adapters -------------------------------------------
+    def on_pre_request(self, messages: list[Any], next: Any) -> Any:
+        """Adapter for the ``model/pre_request`` waterfall.
+
+        Mirrors ``before_model``: warn mirrors are forwarded to downstream
+        listeners; the hard ceiling short-circuits with ``jump_to="end"``.
+        """
+
+        result = self.before_model({"messages": messages}, None)
+        if result is None:
+            return next(messages)
+        if isinstance(result, dict) and result.get("jump_to") == "end":
+            return result
+        if isinstance(result, dict) and "messages" in result:
+            return next(result["messages"])
+        return next(messages)
+
+    def on_model_request(self, request: Any, next: Any) -> Any:
+        """Adapter for the ``model/request`` waterfall (wraps the real call)."""
+
+        self._record_first_diff(request)
+        return next(request)
+
+    def on_post_request(self, payload: dict[str, Any]) -> None:
+        """Adapter for the ``model/post_request`` emit."""
+
+        self.after_model(payload, payload.get("runtime"))
+
 
 def _input_block_hashes(request: Any) -> tuple[str, str, tuple[str, ...]]:
     """Hash system / pinned TaskDoc / remaining message blocks separately."""
