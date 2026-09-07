@@ -24,7 +24,7 @@ from phone_agent.grounding.provider import (
     ScreenBinding,
 )
 from phone_agent.v2.coords import convert_relative_to_absolute
-from phone_agent.v2.events import EventBus
+from phone_agent.v2.events import APP_LAUNCHED, EventBus
 from phone_agent.v2.locate_scope import (
     ScopeCrop,
     build_scope_crop,
@@ -227,6 +227,8 @@ class PhoneSession:
         # Observe-only experience mirrors. Tools append only after device-confirmed
         # launches; finish records whether its independent verifier actually ran.
         self.launched_apps: list[str] = []
+        # WP-WF3: ``app/launched`` is emitted at most once per package per run.
+        self._launched_this_run: set[str] = set()
         self.finish_verifier: str = "skipped"
         # finish two-step review (S2 §1.2): the first finish() call emits a world
         # mirror (review packet) and sets finish_reviewed=True at finish_review_seq;
@@ -274,6 +276,34 @@ class PhoneSession:
         value = str(package or "").strip()
         if value:
             self.launched_apps.append(value)
+
+    def emit_app_launched(self, package: str, device_id: str | None = None) -> bool:
+        """Emit ``app/launched`` once per package for this run (WP-WF3).
+
+        The second procedure-card injection point listens on this event. The
+        emission is idempotent per package and fail-open: a missing bus or a
+        broken listener can never turn a successful launch into a failure.
+        """
+
+        value = str(package or "").strip()
+        if not value or value in self._launched_this_run:
+            return False
+        self._launched_this_run.add(value)
+        bus = self.event_bus
+        if bus is None:
+            return False
+        serial = device_id or getattr(self.config, "device_id", None)
+        try:
+            bus.emit(APP_LAUNCHED, {"package": value, "device_id": serial})
+        except Exception:  # noqa: BLE001 - observation events are fail-open
+            return False
+        return True
+
+    def reset_launched_events(self) -> None:
+        """Clear the per-run ``app/launched`` dedupe set (run boundary)."""
+
+        self._launched_this_run.clear()
+
     @staticmethod
     def _normalize_launch_term(value: str) -> str:
         """Strip all whitespace from a launch term without guessing aliases."""

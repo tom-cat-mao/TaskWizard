@@ -677,6 +677,14 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
                     record_launch(resolution.package_name)
                 except Exception:  # noqa: BLE001 - experience mirror is observe-only
                     pass
+            # WP-WF3: one ``app/launched`` observation per package per run; the
+            # procedure-card injection point listens on it (fail-open, idempotent).
+            emit_launch = getattr(session, "emit_app_launched", None)
+            if callable(emit_launch):
+                try:
+                    emit_launch(resolution.package_name, device_id)
+                except Exception:  # noqa: BLE001 - observation events are fail-open
+                    pass
             _record_verified_launch(
                 session,
                 config,

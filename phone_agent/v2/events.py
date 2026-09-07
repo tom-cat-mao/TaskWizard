@@ -17,6 +17,13 @@ Payload contracts for the plugin events:
     Payload contains ``epoch``, ``screen_seq``, ``marks_count``, and
     ``marks_failure_code``.
 
+``APP_LAUNCHED`` / ``"app/launched"``
+    Observed with :meth:`EventBus.emit` after a device-confirmed
+    ``launch_app`` success. Payload is
+    ``{"package": <resolved package name>, "device_id": <device serial>}``.
+    Emitted at most once per package per run; the emission point is fail-open
+    (WP-WF3 procedure-card injection point two listens on it).
+
 ``TOOL_PRE_EXECUTE`` / ``"tool/pre_execute"``
     Applied with :meth:`EventBus.waterfall`. Payload is the tool-call object
     seen by middleware: tool ``name``, ``args``, and session-facing request
@@ -70,6 +77,7 @@ from typing import Any
 RUN_START = "run/start"
 RUN_END = "run/end"
 OBSERVE = "observe"
+APP_LAUNCHED = "app/launched"
 TOOL_PRE_EXECUTE = "tool/pre_execute"
 MODEL_PRE_REQUEST = "model/pre_request"
 MODEL_REQUEST = "model/request"
@@ -83,6 +91,7 @@ _RESERVED_EVENTS = frozenset(
         RUN_START,
         RUN_END,
         OBSERVE,
+        APP_LAUNCHED,
         TOOL_PRE_EXECUTE,
         MODEL_PRE_REQUEST,
         MODEL_REQUEST,
@@ -221,6 +230,7 @@ class EventBus:
 
 __all__ = [
     "AGENT_AFTER",
+    "APP_LAUNCHED",
     "Disposer",
     "EventBus",
     "JUMP_END",

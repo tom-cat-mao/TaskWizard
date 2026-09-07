@@ -628,6 +628,22 @@ def _apply_recall(ctx: CapabilityAssemblyContext) -> None:
     _register_service_hook(ctx, "end", "recall_run_end")
     _register_service(ctx, "recall_service_factory", "recall")
     _register_prompt(ctx, "recall_prompt_provider")
+    # WP-WF3: the procedure card rides a second prompt provider (separate
+    # 1-card/300-token budget) and two event listeners — ``app/launched``
+    # selects the app card, ``model/pre_request`` injects the pending one.
+    _register_prompt(ctx, "procedure_prompt_provider")
+    bus = ctx.service("event_bus")
+    injector = ctx.service("procedure_injector")
+    if bus is not None and injector is not None:
+        from phone_agent.v2.events import APP_LAUNCHED
+
+        ctx.register_service(
+            "recall_event_disposers",
+            [
+                bus.on(APP_LAUNCHED, injector.on_app_launched),
+                bus.on(MODEL_PRE_REQUEST, injector.on_pre_request),
+            ],
+        )
     _register_cli(
         ctx,
         (

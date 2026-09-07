@@ -40,6 +40,7 @@ EPISODE_OUTCOME_FIELDS = (
     "verifier",
     "capabilities",
     "injected_lessons",
+    "injected_procedures",
     "deliverable_path",
 )
 EXPERIENCE_EVENT_FIELDS = (
@@ -118,6 +119,9 @@ def _classify_and_clean(record: Mapping[str, Any]) -> dict[str, Any]:
     * ``capabilities`` retains only stable ids paired with one bounded state;
       titles, hook data, configuration values, and dependency details are absent.
     * ``injected_lessons`` contains only validated lesson ids, never lesson text.
+    * ``injected_procedures`` holds the WP-WF3 procedure-card ids injected this
+      run (run-start general card and post-launch app cards); it is a separate
+      field so the rule channel's id list keeps its exact meaning.
     * optional ``deliverable_path`` identifies a successfully written local
       artifact; the HTML body itself has no schema field and is discarded.
     * ``tool``/``result_class`` describe execution shape, and optional
@@ -182,6 +186,16 @@ def _classify_and_clean(record: Mapping[str, Any]) -> dict[str, Any]:
                     and lesson_id not in injected_lessons
                 ):
                     injected_lessons.append(lesson_id)
+        injected_procedures: list[str] = []
+        raw_injected_procedures = record.get("injected_procedures", [])
+        if isinstance(raw_injected_procedures, (list, tuple)):
+            for raw_procedure_id in raw_injected_procedures:
+                procedure_id = _clean_text(raw_procedure_id).strip()
+                if (
+                    _LESSON_ID_PATTERN.fullmatch(procedure_id)
+                    and procedure_id not in injected_procedures
+                ):
+                    injected_procedures.append(procedure_id)
 
         raw_deliverable_path = record.get("deliverable_path")
         deliverable_path = (
@@ -213,6 +227,7 @@ def _classify_and_clean(record: Mapping[str, Any]) -> dict[str, Any]:
             "verifier": verifier,
             "capabilities": capabilities,
             "injected_lessons": injected_lessons,
+            "injected_procedures": injected_procedures,
             "deliverable_path": deliverable_path,
         }
 
