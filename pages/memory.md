@@ -70,7 +70,13 @@ flowchart LR
 - **回注**（`PHONE_AGENT_MEMORY_RAG=on`）：已批准的经验在 run 开局以"参考提示"身份注入（上限 3 条 / 800 token，设备 scope 过滤，run 内钉死该代）；注入的 lesson id 写入 trace 与 episode 档案，用于事后度量"注入是否有帮助"；
 - **约束**：只有人审通过的经验可被注入；proposed/revoked 永不注入；shadow/off 档完全不注入。
 
-原则：先记录、再影子验证、晋升靠人审、注入有上限可撤销；每一步可回退。
+原则：先记录、再影子验证、rule 晋升靠人审、过程卡靠自判分级，注入有上限可撤销；每一步可回退。
+
+### 过程卡（procedure card，WP-WF 已落地）
+
+lesson 管道的第二种产物：rule 是单条行为规则，过程卡是多步流程经验（`kind=procedure`，字段 `steps`（纯语义步，禁坐标/工具参数）+ `pitfalls` + `app_scope`）。蒸馏一次调用同产两类候选；过程卡走**自判分级**——harness 只供事实单（支持 run/结局一致性/app 包名是否验证过/是否跨批次复现），模型拿得准直接 `auto_approved` 可注入，非常拿不准才落 `needs_review` 等人看（不阻塞）；rule 维持人审不变。
+
+匹配是硬过滤加软排序：app 包名精确相等（绝不用 embedding）+ goal 与卡摘要 cosine top-1（阈值 0.30，真实数据扫描拐点）。注入两个时机、与 rule 各占额度（卡单独 1 张/约 300 token）：run 开局注入通用卡；首次 `launch_app` 成功后注入该 app 的专属卡（下一个模型调用一次性出现）。`on` 档注入，`shadow` 只记录。离线评估：`replay --channel procedure [--sweep] [--calibrate]`（无时间旅行；`--calibrate` 为冷启动阈值调优专用，不参与通道判定）。
 
 ## 成功先例通道离线评估（exemplar replay）
 

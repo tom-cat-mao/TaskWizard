@@ -2,7 +2,7 @@
 
 > 本文档记录 roadmap 的阶段进展与未来方向。硬性执行约束见仓库根 `AGENTS.md`（P0 表）；v2 模块契约以 `phone_agent/v2/` docstring 为准（重构规格文档属工作稿，不入库）；历史批次执行任务书见 `docs/archive/`。
 >
-> **最新状态（2026-08-30）**：经验数据面（WP-I）、RAG shadow 回想（WP-I2）、隐式纠正（WP-I3）、能力注册表（WP-J）、观测加固（WP-O）、compact 记忆状态与缓存计量（WP-M）、经验提炼+晋升（WP-L）、受控经验回注（WP-A3，自进化闭环完成）、runner 子进程化（WP-R）、能力挂载层（WP-C2）、**插件系统全量（WP-PLUGIN A–E：服务容器 + 事件总线 + manifest/CLI/发现 + 钉板契约 + 全部策略件迁为监听器，LangChain 栈只剋桥接器）**均已落地。通用长期记忆与经验注入已实现。剩余方向：prefix-cache 优化（评审中）、user 别名写入入口（规划中）、插件 API 真实插件验证（S3）、workflow 记忆与模型路由（远期）。
+> **最新状态（2026-08-30）**：经验数据面（WP-I）、RAG shadow 回想（WP-I2）、隐式纠正（WP-I3）、能力注册表（WP-J）、观测加固（WP-O）、compact 记忆状态与缓存计量（WP-M）、经验提炼+晋升（WP-L）、受控经验回注（WP-A3，自进化闭环完成）、runner 子进程化（WP-R）、能力挂载层（WP-C2）、**插件系统全量（WP-PLUGIN A–E：服务容器 + 事件总线 + manifest/CLI/发现 + 钉板契约 + 全部策略件迁为监听器，LangChain 栈只剋桥接器）**、**workflow 记忆（WP-WF1–3：lesson 管道第二产物“过程卡”——语义步 + pitfalls + app_scope；distill 两调用自判分级（auto_approved/needs_review）；硬过滤包名 + embedding top-1；run-start 通用卡与 launch_app 后 app 卡双注入点、独立 1 张/300 token；replay procedure 通道 + 真实数据标定阈值 0.30）**均已落地。通用长期记忆与经验注入已实现。剩余方向：prefix-cache 优化（评审中）、user 别名写入入口（规划中）、插件 API 真实插件验证（S3）、模型路由（远期）。
 
 ---
 
