@@ -241,7 +241,10 @@ class ThinPhoneAgent:
             from phone_agent.v2 import tools as tools_module
         from phone_agent.v2.usage import UsageLedger
         from phone_agent.v2.middleware.budget import build_budget_middleware
-        from phone_agent.v2.middleware.images import build_context_pruning_middleware
+        from phone_agent.v2.middleware.images import (
+            ContextPrunerService,
+            build_context_pruning_middleware,
+        )
         from phone_agent.v2.middleware.safety import (
             build_capability_safety_middleware,
             build_control_hitl_middleware,
@@ -342,11 +345,17 @@ class ThinPhoneAgent:
                 placement="system_message",
             )
 
+        context_pruner = ContextPrunerService(
+            keep_images=getattr(config, "image_keep", 2),
+            keep_marks=getattr(config, "obs_marks_keep", 2),
+        )
+
         self._capability_ctx = CapabilityAssemblyContext(
             {
                 "event_bus": self.event_bus,
                 "session": self.session,
                 "config": config,
+                "context_pruner": context_pruner,
                 "taskdoc_middleware_factory": taskdoc_middleware_factory,
                 "taskdoc_tool_factory": taskdoc_tool_factory,
                 "taskdoc_run_start": self._taskdoc_run_start,
@@ -402,10 +411,7 @@ class ThinPhoneAgent:
             replace_key="control_hitl",
         )
         self._capability_ctx.register_core_middleware(
-            build_context_pruning_middleware(
-                keep_images=getattr(config, "image_keep", 2),
-                keep_marks=getattr(config, "obs_marks_keep", 2),
-            ),
+            build_context_pruning_middleware(pruner=context_pruner),
             order=30,
         )
         self._capability_ctx.register_core_middleware(

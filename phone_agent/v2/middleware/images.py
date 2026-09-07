@@ -137,11 +137,17 @@ def _fold_message_marks(message: Any) -> bool:
     return changed
 
 
-class ContextPruningMiddleware(AgentMiddleware):
-    """Bound image + OBS-marks growth before each model call (two idempotent passes)."""
+class ContextPrunerService:
+    """Pure facade for image + OBS-marks pruning over a message list.
+
+    This is the reusable service behind :class:`ContextPruningMiddleware`.
+    It exposes one idempotent operation, ``prune(messages)``, that mutates
+    message content in place and returns the modified messages deduped by
+    identity.  The keep_images/keep_marks contract is identical to the
+    middleware's (P0 #3).
+    """
 
     def __init__(self, keep_images: int = 2, keep_marks: int = 2) -> None:
-        super().__init__()
         # Never fully strip context: at least the newest bearer is retained.
         self.keep_images = max(1, int(keep_images))
         self.keep_marks = max(1, int(keep_marks))
@@ -174,13 +180,19 @@ class ContextPruningMiddleware(AgentMiddleware):
                 modified.append(messages[idx])
         return modified
 
-    def before_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
-        messages = state.get("messages") or []
+    def prune(self, messages: list[Any]) -> list[Any]:
+        """Run both passes and return modified messages (deduped by identity).
+
+        The returned list is empty when nothing needs pruning.  Mutates
+        message content in place so the caller can replace messages by
+        identity in a reducer-style update.
+        """
+
         modified: list[Any] = []
         modified.extend(self._prune_images(messages))
         modified.extend(self._fold_old_marks(messages))
         if not modified:
-            return None
+            return []
         # A message hit by both passes appears twice: dedup by identity so the
         # add_messages reducer replaces it once (same id => in-place replace).
         seen: set[int] = set()
@@ -190,7 +202,34 @@ class ContextPruningMiddleware(AgentMiddleware):
                 continue
             seen.add(id(msg))
             deduped.append(msg)
-        return {"messages": deduped}
+        return deduped
+
+
+class ContextPruningMiddleware(AgentMiddleware):
+    """Bound image + OBS-marks growth before each model call (two idempotent passes)."""
+
+    def __init__(
+        self,
+        keep_images: int = 2,
+        keep_marks: int = 2,
+        pruner: ContextPrunerService | None = None,
+    ) -> None:
+        super().__init__()
+        if pruner is not None:
+            self._pruner = pruner
+        else:
+            self._pruner = ContextPrunerService(
+                keep_images=keep_images, keep_marks=keep_marks
+            )
+        self.keep_images = self._pruner.keep_images
+        self.keep_marks = self._pruner.keep_marks
+
+    def before_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
+        messages = state.get("messages") or []
+        modified = self._pruner.prune(messages)
+        if not modified:
+            return None
+        return {"messages": modified}
 
     async def abefore_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
         return self.before_model(state, runtime)
@@ -205,9 +244,13 @@ class ImagePruningMiddleware(ContextPruningMiddleware):
 
 
 def build_context_pruning_middleware(
-    keep_images: int = 2, keep_marks: int = 2
+    keep_images: int = 2,
+    keep_marks: int = 2,
+    pruner: ContextPrunerService | None = None,
 ) -> ContextPruningMiddleware:
-    return ContextPruningMiddleware(keep_images=keep_images, keep_marks=keep_marks)
+    return ContextPruningMiddleware(
+        keep_images=keep_images, keep_marks=keep_marks, pruner=pruner
+    )
 
 
 def build_image_middleware() -> ImagePruningMiddleware:
@@ -215,6 +258,7 @@ def build_image_middleware() -> ImagePruningMiddleware:
 
 
 __all__ = [
+    "ContextPrunerService",
     "ContextPruningMiddleware",
     "build_context_pruning_middleware",
     "ImagePruningMiddleware",

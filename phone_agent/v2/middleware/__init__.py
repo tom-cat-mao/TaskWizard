@@ -19,6 +19,7 @@ from phone_agent.v2.middleware.diagnostic import (
     build_diagnostic_middleware,
 )
 from phone_agent.v2.middleware.images import (
+    ContextPrunerService,
     ContextPruningMiddleware,
     ImagePruningMiddleware,
     build_context_pruning_middleware,
@@ -55,6 +56,7 @@ __all__ = [
     "TOKEN_BUDGET_EXHAUSTED_MARKER",
     "CompactMiddleware",
     "build_compact_middleware",
+    "ContextPrunerService",
     "ContextPruningMiddleware",
     "build_context_pruning_middleware",
     "ImagePruningMiddleware",
