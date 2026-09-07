@@ -1147,6 +1147,7 @@ class ThinPhoneAgent:
         """Retrieve trace-only candidates without touching actor context."""
 
         self._shadow_candidates: list[dict[str, Any]] = []
+        self._shadow_procedure = None
         self._shadow_recall_ready = False
         reset = getattr(self._trace, "reset_run_observations", None)
         if callable(reset):
@@ -1193,6 +1194,17 @@ class ThinPhoneAgent:
                             self.config, "recall_decay_lambda", 0.02
                         ),
                     )
+                    # WP-WF2a: the procedure channel stays shadow — select the
+                    # card (no app known at run start, so general cards only)
+                    # and let run-end record the outcome in recall_stats. Its
+                    # failures are contained so they cannot downgrade the
+                    # episode/alias recall status above.
+                    try:
+                        self._shadow_procedure = index.select_procedure(
+                            task, app_package=None, device_id=serial
+                        )
+                    except Exception:  # noqa: BLE001 - procedure channel is fail-open
+                        self._shadow_procedure = None
                 self._shadow_recall_ready = True
                 trace_payload["status"] = "ok"
                 trace_payload["candidates"] = [
@@ -1215,40 +1227,54 @@ class ThinPhoneAgent:
     def _shadow_recall_finish(self) -> None:
         """Evaluate trace-only recall against confirmed launch receipts."""
 
-        if not getattr(self, "_shadow_recall_ready", False):
+        selection = getattr(self, "_shadow_procedure", None)
+        if not getattr(self, "_shadow_recall_ready", False) and selection is None:
             return
         try:
             from pathlib import Path
 
-            from phone_agent.v2.recall import evaluate_recall, update_recall_stats
+            from phone_agent.v2.recall import (
+                evaluate_recall,
+                update_procedure_recall_stats,
+                update_recall_stats,
+            )
 
-            actual_apps = getattr(self._trace, "launched_apps", set())
-            evaluation = evaluate_recall(self._shadow_candidates, actual_apps)
             stats_path = (
                 Path(getattr(self.config, "memory_dir", "memory"))
                 / "experience/recall_stats.json"
             )
-            stats = update_recall_stats(stats_path, evaluation, run_id=self.run_id)
-            record = getattr(self._trace, "record_event", None)
-            if callable(record):
-                record(
-                    "recall_evaluation",
-                    evaluation=evaluation,
-                    cumulative={
-                        "evaluations": stats["evaluations"],
-                        "hit_rate": stats["hit_rate"],
-                        "hit_at_1": stats["hit_at_1"],
-                        "conditional_hit_rate": stats["conditional_hit_rate"],
-                        "contaminated_run_rate": stats[
-                            "contaminated_run_rate"
-                        ],
-                        "package_precision": stats["package_precision"],
-                        "package_recall": stats["package_recall"],
-                        "precision_at_k": stats["precision_at_k"],
-                        "recall_at_k": stats["recall_at_k"],
-                        # Compatibility for the unchanged web/app.py reader.
-                        "false_hit_rate": stats["false_hit_rate"],
-                    },
+            if getattr(self, "_shadow_recall_ready", False):
+                actual_apps = getattr(self._trace, "launched_apps", set())
+                evaluation = evaluate_recall(self._shadow_candidates, actual_apps)
+                stats = update_recall_stats(
+                    stats_path, evaluation, run_id=self.run_id
+                )
+                record = getattr(self._trace, "record_event", None)
+                if callable(record):
+                    record(
+                        "recall_evaluation",
+                        evaluation=evaluation,
+                        cumulative={
+                            "evaluations": stats["evaluations"],
+                            "hit_rate": stats["hit_rate"],
+                            "hit_at_1": stats["hit_at_1"],
+                            "conditional_hit_rate": stats["conditional_hit_rate"],
+                            "contaminated_run_rate": stats[
+                                "contaminated_run_rate"
+                            ],
+                            "package_precision": stats["package_precision"],
+                            "package_recall": stats["package_recall"],
+                            "precision_at_k": stats["precision_at_k"],
+                            "recall_at_k": stats["recall_at_k"],
+                            # Compatibility for the unchanged web/app.py reader.
+                            "false_hit_rate": stats["false_hit_rate"],
+                        },
+                    )
+            if selection is not None:
+                # The procedure channel records every run it observed, zero
+                # recall included: that neutrality is the measurement.
+                update_procedure_recall_stats(
+                    stats_path, selection, run_id=self.run_id
                 )
         except Exception:  # noqa: BLE001 - shadow evaluation never changes run outcome
             pass
@@ -1415,6 +1441,7 @@ class ThinPhoneAgent:
             except Exception:  # noqa: BLE001 - duck-typed sessions may be immutable
                 pass
             self._shadow_candidates = []
+            self._shadow_procedure = None
             self._shadow_recall_ready = False
             self._run_injected_lessons = []
             self._app_kb_prompt_suffix = ""

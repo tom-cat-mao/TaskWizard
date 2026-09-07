@@ -75,6 +75,13 @@ lesson 视图缺失或损坏时 fail-open。`shadow` 仍只做 trace 召回与�
 召回统计以 evaluations 为 run 级统一分母，输出 `hit_at_1`、`contaminated_run_rate`、
 `conditional_hit_rate`、`precision_at_k` / `recall_at_k` 与 package 级 precision/recall；
 旧 `false_hits` / `false_hit_rate` 字段暂时保留给现有 Web 控制台读取。
+
+过程卡（procedure）走同一索引的独立召回通道：可注入的过程卡按 `title + steps` 建向量进入 `procedure`
+namespace，run-end 增量与 dream 对账都随 lesson 状态同步（变为可注入即写入，撤销/降级即删除）。选择先做
+app 包名精确相等 + device scope 硬过滤，再按 embedding cosine 取 top-1，阈值 `recall.PROCEDURE_MIN_SCORE`
+（默认 0.50，待离线扫描后调整）。注入额度与 rule 各占：过程卡每次最多 1 张、约 300 token，超出则截断
+steps，提示标注"参考不是规则"并具名来源卡 id。该通道目前全程 shadow：只把每轮的候选数/过滤后数/命中与
+未命中原因记入 `recall_stats.json`，两个注入点尚未接线。
 runner 的 `control.jsonl` 接受 `revoke_lesson` 紧急撤销消息：它会立即把 lesson store 标为 revoked，
 并让本 run 的后续注入点排除该 id。已经发送给模型的历史消息不可撤回，不会伪装成已从上下文删除。
 
