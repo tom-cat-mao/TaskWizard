@@ -133,10 +133,15 @@ class ThinPhoneAgent:
         checkpointer: Any | None = None,
         extra_middleware: list[Any] | None = None,
         run_id: str | None = None,
+        extra_capabilities: list[Any] | None = None,
     ) -> None:
         self.config = config
         self.run_id = str(run_id or uuid.uuid4().hex)
         self.capability_registry = build_capability_registry(config)
+        for spec in extra_capabilities or []:
+            # External plugin specs (WP-PLUGIN-C); cap_id collisions raise via
+            # the registry's own duplicate check.
+            self.capability_registry.register(spec)
         self._run_capabilities: dict[str, str] = {}
         self._run_memory_generation: dict[str, Any] | None = None
         self._run_capability_snapshot_ready = False
