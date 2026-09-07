@@ -435,8 +435,118 @@ def _build_cli_capability_context(config: V2Config) -> CapabilityAssemblyContext
     return assemble_capabilities(build_capability_registry(config), context)
 
 
+def _build_plugin_parser() -> argparse.ArgumentParser:
+    """Argparse layer for ``plugin`` subcommands (logic lives in plugins.py)."""
+
+    parser = argparse.ArgumentParser(
+        prog="main_v2.py plugin",
+        description="Manage external capability plugins (WP-PLUGIN-C)",
+    )
+    sub = parser.add_subparsers(dest="plugin_command", required=True)
+
+    sub.add_parser("list", help="show manifest entries and their assembly state")
+
+    p_add = sub.add_parser("add", help="install a pip package or register a local path")
+    p_add.add_argument("target", help="pip package name or local plugin directory")
+    scope = p_add.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--user", dest="scope", action="store_const", const="user",
+        help="write the user manifest (~/.taskwizard/profile.toml)",
+    )
+    scope.add_argument(
+        "--project", dest="scope", action="store_const", const="project",
+        help="write the project manifest (default)",
+    )
+    p_add.set_defaults(scope="project")
+
+    p_remove = sub.add_parser("remove", help="uninstall a package and clean the manifest")
+    p_remove.add_argument("name", help="plugin name")
+    rscope = p_remove.add_mutually_exclusive_group()
+    rscope.add_argument(
+        "--user", dest="scope", action="store_const", const="user",
+        help="operate on the user manifest",
+    )
+    rscope.add_argument(
+        "--project", dest="scope", action="store_const", const="project",
+        help="operate on the project manifest (default)",
+    )
+    p_remove.set_defaults(scope="project")
+
+    p_update = sub.add_parser("update", help="pip install -U one or all package plugins")
+    ug = p_update.add_mutually_exclusive_group(required=True)
+    ug.add_argument("name", nargs="?", default=None, help="plugin name")
+    ug.add_argument("--all", dest="all_", action="store_true", help="update every package plugin")
+
+    p_search = sub.add_parser("search", help="search the plugin index")
+    p_search.add_argument("term", nargs="?", default=None, help="optional filter term")
+
+    return parser
+
+
+def _run_plugin_cli(argv: list[str], config: V2Config) -> int:
+    """Dispatch a ``plugin`` subcommand; all failures print + return non-zero."""
+
+    from phone_agent.v2 import plugins
+
+    args = _build_plugin_parser().parse_args(argv)
+    try:
+        if args.plugin_command == "list":
+            rows = plugins.cmd_list(config)
+            if not rows:
+                print("plugins: (none configured)")
+            for row in rows:
+                print("plugin: " + json.dumps(row, ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.plugin_command == "add":
+            receipt = plugins.cmd_add(args.target, config=config, scope=args.scope)
+            print("plugin: " + json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.plugin_command == "remove":
+            receipt = plugins.cmd_remove(args.name, config=config, scope=args.scope)
+            print("plugin: " + json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.plugin_command == "update":
+            receipt = plugins.cmd_update(args.name, all_=args.all_, config=config)
+            print("plugin: " + json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.plugin_command == "search":
+            matches = plugins.cmd_search(args.term, config=config)
+            if not matches:
+                print("plugins: (no matches)")
+            for item in matches:
+                print("plugin: " + json.dumps(item, ensure_ascii=False, sort_keys=True))
+            return 0
+    except plugins.PluginError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 1
+
+
+def _external_capabilities(config: V2Config) -> list[Any]:
+    """Discover enabled external plugin specs; fail-visible via SystemExit.
+
+    A misconfigured / unloadable enabled plugin must not silently degrade the
+    run, so a load or API-gate failure ends bring-up with a clear message.
+    """
+
+    if not getattr(config, "plugins_enabled", True):
+        return []
+    from phone_agent.v2.plugins import PluginError, discover_external_specs
+
+    try:
+        return discover_external_specs(config)
+    except PluginError as exc:
+        print(f"error: plugin load failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     load_project_env()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == "plugin":
+        config = V2Config.from_env({})
+        return _run_plugin_cli(raw_argv[1:], config)
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -470,7 +580,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    agent = ThinPhoneAgent(config)
+    external_capabilities = _external_capabilities(config)
+    # Pass the plugin seam only when populated so injected/legacy agent
+    # factories without the parameter keep working (empty = zero-diff path).
+    if external_capabilities:
+        agent = ThinPhoneAgent(config, extra_capabilities=external_capabilities)
+    else:
+        agent = ThinPhoneAgent(config)
     result = agent.run(args.task)
     if getattr(agent, "_last_dream_summary", None) is not None:
         _print_dream_summary(agent._last_dream_summary)

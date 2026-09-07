@@ -91,3 +91,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 ## 记忆
 
 三层结构：App-KB 事实库（已上线）、episode 经验档案（已上线）、RAG shadow 回想（已上线，默认不注入）。详见[记忆与自进化](memory.md)。
+
+## 扩展性
+
+策略层完全事件化：LangChain 中间件栈只剩 5 个桥接器，安全预警、上下文压缩、token 预算、trace、诊断全部是事件总线上的监听器（嵌套顺序 = 注册顺序，safety 恒居 `tool/execute` 最内层）。外部插件与内建能力共用同一装配层，可挂监听器、工具、提示块、run hooks 与 CLI 命令。详见[插件开发](plugins.md)。

@@ -1,7 +1,12 @@
-"""JSONL trace middleware: redacted, per-run observability.
+"""JSONL trace writer: redacted, per-run observability.
 
 Per AGENTS.md (P0 #6, egress redaction): every model call and
 tool call is appended as a JSONL event to ``<trace_dir>/<run_id>.jsonl``.
+
+This module now exposes only event-bus listeners.  The core harness registers
+``on_model_request`` on ``model/request`` (outermost wrapper) and
+``on_agent_after`` on ``agent/after``; ``on_tool_execute`` is registered on
+``tool/execute`` by the core harness as the outermost onion layer.
 
 Redaction rules (applied to every logged text value):
   * text values longer than 64 chars are truncated (``…`` suffix, original
@@ -23,8 +28,7 @@ import os
 import time
 from typing import Any, Mapping
 
-from langchain.agents.middleware import AgentMiddleware
-
+from phone_agent.v2.events import REJECT
 from phone_agent.v2.middleware._redact import (
     redact_text as _redact_context_text,
     redact_value_no_base64,
@@ -78,8 +82,13 @@ def _tool_artifact(result: Any) -> Any:
     return artifact
 
 
-class TraceMiddleware(AgentMiddleware):
-    """Append redacted model/tool events to a per-run JSONL trace file."""
+class TraceWriter:
+    """Append redacted model/tool events to a per-run JSONL trace file.
+
+    The harness registers selected methods as event-bus listeners.  The object
+    itself is stateless with respect to LangChain middleware; it only needs the
+    listener contract signatures.
+    """
 
     def __init__(
         self,
@@ -92,7 +101,6 @@ class TraceMiddleware(AgentMiddleware):
         alias_overwrite_enabled: bool = True,
         alias_overwrite_notes: tuple[str, ...] = (),
     ) -> None:
-        super().__init__()
         self.run_id = run_id
         self.trace_dir = trace_dir
         self.enabled = enabled
@@ -248,14 +256,16 @@ class TraceMiddleware(AgentMiddleware):
 
         self._launched_apps.update(extract_launched_apps(content))
 
-    # --- model call ---------------------------------------------------------
-    def wrap_model_call(self, request, handler):  # noqa: ANN001
+    # --- model/request listener (outermost wrapper) -------------------------
+    def on_model_request(self, request, next):  # noqa: ANN001
+        """Wrap the real model call: step, latency, error, model_call event."""
+
         self._step += 1
         step = self._step
         started = time.perf_counter()
         error: str | None = None
         try:
-            response = handler(request)
+            response = next(request)
         except Exception as exc:  # noqa: BLE001 - trace then re-raise
             error = f"{type(exc).__name__}: {exc}"
             self._write(
@@ -277,23 +287,17 @@ class TraceMiddleware(AgentMiddleware):
         )
         return response
 
-    async def awrap_model_call(self, request, handler):  # noqa: ANN001
-        self._step += 1
-        step = self._step
-        started = time.perf_counter()
-        response = await handler(request)
-        self._write(
-            {
-                "event": "model_call",
-                "step": step,
-                "latency_ms": int((time.perf_counter() - started) * 1000),
-                "error": None,
-            }
-        )
-        return response
+    # --- tool/execute listener (outermost onion layer) ----------------------
+    def on_tool_execute(self, request, next):  # noqa: ANN001
+        """Onion listener: records tool_call, delegates, then records tool_result.
 
-    # --- tool call ----------------------------------------------------------
-    def wrap_tool_call(self, request, handler):  # noqa: ANN001
+        The listener is registered on the event bus by the core harness; it sees
+        whatever the inner listeners/terminal return, including REJECT or a
+        warning ToolMessage from safety, so every model-visible result is paired
+        with a tool_call record (WP-D2). The experience sink is independent of
+        ``enabled`` and is always notified.
+        """
+
         tool_call = getattr(request, "tool_call", {}) or {}
         name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""
         args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
@@ -309,7 +313,7 @@ class TraceMiddleware(AgentMiddleware):
         launched_before = len(getattr(self._session, "launched_apps", []) or [])
         error: str | None = None
         try:
-            result = handler(request)
+            result = next(request)
         except Exception as exc:  # noqa: BLE001 - trace then re-raise
             error = f"{type(exc).__name__}: {exc}"
             self._write(
@@ -328,58 +332,25 @@ class TraceMiddleware(AgentMiddleware):
                 name, args, error=exc, launched_before=launched_before
             )
             raise
-        content = getattr(result, "content", None)
-        self._record_successful_launch(name, content)
-        artifact = _tool_artifact(result)
-        self._write(
-            {
-                "event": "tool_result",
-                "step": self._step,
-                "tool": name,
-                "latency_ms": int((time.perf_counter() - started) * 1000),
-                "result": _redact_value(content) if content is not None else None,
-                "artifact": _redact_value(artifact) if artifact is not None else None,
-                "error": None,
-            }
-        )
-        self._write_experience(name, result, args=args, launched_before=launched_before)
-        self._write_alias_evidence(name, args, result, launched_before=launched_before)
-        return result
-
-    async def awrap_tool_call(self, request, handler):  # noqa: ANN001
-        tool_call = getattr(request, "tool_call", {}) or {}
-        name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""
-        args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
-        self._write(
-            {
-                "event": "tool_call",
-                "step": self._step,
-                "tool": name,
-                "args_redacted": redact_args(args),
-            }
-        )
-        started = time.perf_counter()
-        launched_before = len(getattr(self._session, "launched_apps", []) or [])
-        try:
-            result = await handler(request)
-        except Exception as exc:  # noqa: BLE001 - trace then re-raise
-            error = f"{type(exc).__name__}: {exc}"
+        if result is REJECT:
+            content = f"⚠️ 已拦截（未执行）：{name}\n工具调用被策略事件拒绝。"
             self._write(
                 {
                     "event": "tool_result",
                     "step": self._step,
                     "tool": name,
                     "latency_ms": int((time.perf_counter() - started) * 1000),
-                    "error": _redact_text(error),
+                    "result": _redact_text(content),
+                    "error": None,
                 }
             )
             self._write_experience(
-                name, error=exc, args=args, launched_before=launched_before
+                name, result=content, args=args, launched_before=launched_before
             )
             self._write_alias_evidence(
-                name, args, error=exc, launched_before=launched_before
+                name, args, result=content, launched_before=launched_before
             )
-            raise
+            return result
         content = getattr(result, "content", None)
         self._record_successful_launch(name, content)
         artifact = _tool_artifact(result)
@@ -398,13 +369,11 @@ class TraceMiddleware(AgentMiddleware):
         self._write_alias_evidence(name, args, result, launched_before=launched_before)
         return result
 
-    # --- run end ------------------------------------------------------------
-    def after_agent(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
+    # --- agent/after listener -----------------------------------------------
+    def on_agent_after(self, state_summary) -> None:  # noqa: ANN001
+        """Write the run_end event when the agent run terminates."""
+
         self._write({"event": "run_end", "steps": self._step})
-        return None
-
-    async def aafter_agent(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
-        return self.after_agent(state, runtime)
 
 
 def build_trace_middleware(
@@ -416,8 +385,10 @@ def build_trace_middleware(
     session: Any | None = None,
     alias_overwrite_enabled: bool = True,
     alias_overwrite_notes: tuple[str, ...] = (),
-) -> TraceMiddleware:
-    return TraceMiddleware(
+) -> TraceWriter:
+    """Build a :class:`TraceWriter` bound to the current run."""
+
+    return TraceWriter(
         run_id,
         trace_dir=trace_dir,
         enabled=enabled,
@@ -428,4 +399,7 @@ def build_trace_middleware(
     )
 
 
-__all__ = ["TraceMiddleware", "build_trace_middleware", "redact_args"]
+# Backward-compatible alias for external imports.
+TraceMiddleware = TraceWriter
+
+__all__ = ["TraceWriter", "TraceMiddleware", "build_trace_middleware", "redact_args"]

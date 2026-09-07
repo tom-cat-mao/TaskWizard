@@ -22,14 +22,27 @@ import sys
 import time
 from typing import Any, Callable, Mapping
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import hook_config
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from phone_agent.v2.capabilities import (
     CapabilityAssemblyContext,
-    MiddlewareReplacement,
     PromptBlock,
     assemble_capabilities,
     build_capability_registry,
+)
+from phone_agent.v2.events import (
+    AGENT_AFTER,
+    JUMP_END,
+    MODEL_POST_REQUEST,
+    MODEL_PRE_REQUEST,
+    MODEL_REQUEST,
+    REJECT,
+    RUN_END,
+    RUN_START,
+    TOOL_EXECUTE,
+    EventBus,
 )
 
 
@@ -41,6 +54,61 @@ class RunResult:
     reason: str
     steps: int
     trace_path: str | None = None
+
+
+class _ExperienceService:
+    """Read-only facade over the current run's experience writer (WP-PLUGIN-A).
+
+    The writer is opened at run start and cleared between runs, so the facade
+    resolves it live rather than capturing a stale handle at assembly time.
+    """
+
+    def __init__(self, agent: "ThinPhoneAgent") -> None:
+        self._agent = agent
+
+    @property
+    def writer(self) -> Any:
+        return getattr(self._agent, "_experience_writer", None)
+
+    def load_episodes(self) -> dict[str, Any]:
+        writer = self.writer
+        if writer is None:
+            return {}
+        from phone_agent.v2.experience import load_episodes
+
+        return load_episodes(getattr(writer, "root", "memory/experience"))
+
+
+class _RecallService:
+    """Read-only facade over the approved-lesson selector + run-start recall.
+
+    The agent's recall prompt block consumes this facade instead of closing
+    over private agent internals, so a plugin can replace the recall capability
+    without the prompt path reaching into a specific implementation.
+    """
+
+    def __init__(self, agent: "ThinPhoneAgent") -> None:
+        self._agent = agent
+
+    def lesson_prompt_block(self) -> "PromptBlock | None":
+        return self._agent._render_lesson_prompt_block()
+
+    def selected_lessons(self) -> list[Any]:
+        return list(getattr(self._agent, "_run_injected_lessons", []) or [])
+
+    def shadow_candidates(self) -> list[Any]:
+        return list(getattr(self._agent, "_shadow_candidates", []) or [])
+
+
+class _AppKbService:
+    """Facade over the live App knowledge store owned by the session."""
+
+    def __init__(self, agent: "ThinPhoneAgent") -> None:
+        self._agent = agent
+
+    @property
+    def store(self) -> Any:
+        return getattr(getattr(self._agent, "session", None), "app_store", None)
 
 
 def _marks_digest_lines(marks: Any, max_items: int = 40) -> str:
@@ -117,14 +185,216 @@ def _first_observation_content(
     return content
 
 
+class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
+    """Bridge ``model/pre_request`` event listeners into the middleware stack.
+
+    Listeners registered on the event bus may return a replacement messages
+    list; when no listener changes the payload this middleware is a no-op.
+    """
+
+    def __init__(self, event_bus: EventBus) -> None:
+        super().__init__()
+        self._event_bus = event_bus
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        messages = state.get("messages") or []
+        result = self._event_bus.waterfall(
+            MODEL_PRE_REQUEST, messages, terminal=lambda x: x
+        )
+        if result is messages:
+            return None
+        # Circuit-breaker sentinels become a graph jump. A listener may also return
+        # a dict that already carries ``jump_to="end"`` plus optional messages.
+        if result is JUMP_END:
+            return {"jump_to": "end"}
+        if isinstance(result, dict):
+            if result.get("jump_to") == "end":
+                return result
+            if "messages" in result:
+                return result
+        return {"messages": result}
+
+    @hook_config(can_jump_to=["end"])
+    async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        return self.before_model(state, runtime)
+
+
+class _ToolExecuteBridgeMiddleware(AgentMiddleware):
+    """Bridge ``tool/execute`` event listeners into the middleware stack.
+
+    The waterfall terminal is the real tool handler. When a listener returns
+    ``REJECT`` the bridge produces a generic warning ``ToolMessage`` so the
+    actor sees the call was blocked without executing any device action.
+    """
+
+    def __init__(self, event_bus: EventBus) -> None:
+        super().__init__()
+        self._event_bus = event_bus
+
+    @staticmethod
+    def _tool_call_id(request: Any) -> str:
+        tool_call = getattr(request, "tool_call", None) or {}
+        if isinstance(tool_call, dict):
+            return str(tool_call.get("id") or "")
+        return str(getattr(tool_call, "id", "") or "")
+
+    @staticmethod
+    def _tool_name(request: Any) -> str:
+        tool_call = getattr(request, "tool_call", None) or {}
+        if isinstance(tool_call, dict):
+            return str(tool_call.get("name") or "")
+        return str(getattr(tool_call, "name", "") or "")
+
+    def _reject_message(self, request: Any) -> ToolMessage:
+        name = self._tool_name(request)
+        return ToolMessage(
+            content=f"⚠️ 已拦截（未执行）：{name}\n工具调用被策略事件拒绝。",
+            tool_call_id=self._tool_call_id(request),
+            name=name,
+            status="error",
+        )
+
+    def wrap_tool_call(self, request, handler):  # noqa: ANN001
+        decision = self._event_bus.waterfall(
+            TOOL_EXECUTE, request, terminal=handler
+        )
+        if decision is REJECT:
+            return self._reject_message(request)
+        return decision
+
+    async def awrap_tool_call(self, request, handler):  # noqa: ANN001
+        decision = self._event_bus.waterfall(
+            TOOL_EXECUTE, request, terminal=handler
+        )
+        if decision is REJECT:
+            return self._reject_message(request)
+        return decision
+
+
+class _WrapModelBridgeMiddleware(AgentMiddleware):
+    """Bridge ``model/request`` event listeners into the middleware stack.
+
+    The waterfall terminal is the real model call. When no listener changes
+    the payload this middleware is a no-op.
+    """
+
+    def __init__(self, event_bus: EventBus) -> None:
+        super().__init__()
+        self._event_bus = event_bus
+
+    def wrap_model_call(self, request, handler):  # noqa: ANN001
+        return self._event_bus.waterfall(
+            MODEL_REQUEST, request, terminal=handler
+        )
+
+    async def awrap_model_call(self, request, handler):  # noqa: ANN001
+        return self._event_bus.waterfall(
+            MODEL_REQUEST, request, terminal=handler
+        )
+
+
+def _state_summary(
+    state: Any,
+    runtime: Any,
+    *,
+    run_id: str | None = None,
+    goal: str | None = None,
+) -> dict[str, Any]:
+    """Build a small state summary for emit-style events."""
+
+    messages = state.get("messages") if isinstance(state, dict) else None
+    return {
+        "run_id": run_id,
+        "goal": goal,
+        "messages": messages,
+        "runtime": runtime,
+    }
+
+
+class _PostRequestBridgeMiddleware(AgentMiddleware):
+    """Bridge ``model/post_request`` event listeners into the middleware stack.
+
+    Fired from the ``after_model`` hook with a state summary. Listener failures
+    are logged and swallowed by the event bus, so this bridge is fail-open.
+    """
+
+    def __init__(self, event_bus: EventBus, run_id: str) -> None:
+        super().__init__()
+        self._event_bus = event_bus
+        self._run_id = run_id
+
+    def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        self._event_bus.emit(
+            MODEL_POST_REQUEST,
+            _state_summary(state, runtime, run_id=self._run_id),
+        )
+        return None
+
+    async def aafter_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        return self.after_model(state, runtime)
+
+
+class _AgentAfterBridgeMiddleware(AgentMiddleware):
+    """Bridge ``agent/after`` event listeners into the middleware stack.
+
+    Fired from the ``after_agent`` hook with a terminal state summary.
+    Listener failures are logged and swallowed by the event bus, so this
+    bridge is fail-open.
+    """
+
+    def __init__(self, event_bus: EventBus, run_id: str) -> None:
+        super().__init__()
+        self._event_bus = event_bus
+        self._run_id = run_id
+
+    def after_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        self._event_bus.emit(
+            AGENT_AFTER,
+            _state_summary(state, runtime, run_id=self._run_id),
+        )
+        return None
+
+    async def aafter_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        return self.after_agent(state, runtime)
+
+
+class _ModelCallLimitListener:
+    """Runaway-loop fuse: counts model calls and jumps to ``end`` at the limit.
+
+    Replaces the LangChain ``ModelCallLimitMiddleware`` in the v2 stack.  Because
+    it is a ``model/pre_request`` listener, it runs inside the pre-request bridge
+    and short-circuits before the model is invoked once the fuse blows.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1, int(limit))
+        self.calls = 0
+
+    def reset(self) -> None:
+        self.calls = 0
+
+    def on_pre_request(self, messages: list[Any], next: Any) -> Any:
+        self.calls += 1
+        if self.calls > self.limit:
+            return {"jump_to": "end", "messages": messages}
+        return next(messages)
+
+
 class ThinPhoneAgent:
-    """Thin-loop phone agent built on ``create_agent`` + v2 middleware.
+    """Thin-loop phone agent built on ``create_agent`` + v2 event-bus bridges.
+
+    The compiled LangChain middleware stack contains only four bridge
+    middlewares (tool/execute, model/pre_request, model/request,
+    model/post_request, agent/after) plus any ``extra_middleware`` observers.
+    All policy behavior — safety, image hygiene, budget, compaction, trace,
+    diagnostics — lives on the event bus as listeners.
 
     ``extra_middleware`` is an optional observability extension point for
-    add-ons such as the local web UI. Extra middleware is appended to the
-    built-in observation stack, before the safety-warning wrapper, so it can
-    observe both ordinary tool results and calls short-circuited by safety.
-    The core agent remains fully headless when the argument is omitted.
+    add-ons such as the local web UI. Extra middleware is appended after the
+    core bridges so it can observe both ordinary tool results and calls
+    short-circuited by safety. The core agent remains fully headless when the
+    argument is omitted.
     """
 
     def __init__(
@@ -133,10 +403,16 @@ class ThinPhoneAgent:
         checkpointer: Any | None = None,
         extra_middleware: list[Any] | None = None,
         run_id: str | None = None,
+        extra_capabilities: list[Any] | None = None,
     ) -> None:
         self.config = config
         self.run_id = str(run_id or uuid.uuid4().hex)
+        self.event_bus = EventBus()
         self.capability_registry = build_capability_registry(config)
+        for spec in extra_capabilities or []:
+            # External plugin specs (WP-PLUGIN-C); cap_id collisions raise via
+            # the registry's own duplicate check.
+            self.capability_registry.register(spec)
         self._run_capabilities: dict[str, str] = {}
         self._run_memory_generation: dict[str, Any] | None = None
         self._run_capability_snapshot_ready = False
@@ -145,7 +421,6 @@ class ThinPhoneAgent:
         # Lazy imports: these modules are produced by the concurrent core/tools
         # worktrees and may not exist when this module is first imported.
         from langchain.agents import create_agent
-        from langchain.agents.middleware import ModelCallLimitMiddleware
 
         from phone_agent.v2.model import build_chat_model
         from phone_agent.v2.session import PhoneSession
@@ -154,11 +429,8 @@ class ThinPhoneAgent:
             from phone_agent.v2 import tools as tools_module
         from phone_agent.v2.usage import UsageLedger
         from phone_agent.v2.middleware.budget import build_budget_middleware
-        from phone_agent.v2.middleware.images import build_context_pruning_middleware
-        from phone_agent.v2.middleware.safety import (
-            build_capability_safety_middleware,
-            build_control_hitl_middleware,
-        )
+        from phone_agent.v2.middleware.images import ContextPrunerService
+        from phone_agent.v2.middleware.safety import build_control_hitl_middleware
         from phone_agent.v2.middleware.trace import build_trace_middleware
 
         if checkpointer is None:
@@ -168,6 +440,7 @@ class ThinPhoneAgent:
         self.checkpointer = checkpointer
 
         self.session = PhoneSession(config)
+        self.session.event_bus = self.event_bus
         self.usage_ledger = UsageLedger()
         self.session.usage_ledger = self.usage_ledger
         self.model = build_chat_model(config)
@@ -200,7 +473,7 @@ class ThinPhoneAgent:
                 nudge_steps=getattr(config, "taskdoc_nudge_steps", 5),
             )
 
-        def compact_middleware_factory():
+        def compact_middleware_factory(pruner=None):
             from phone_agent.v2.middleware.compact import build_compact_middleware
 
             return build_compact_middleware(
@@ -208,6 +481,7 @@ class ThinPhoneAgent:
                 config,
                 model=self.model,
                 memory_state_provider=self._compact_memory_state,
+                pruner=pruner,
             )
 
         def budget_middleware_factory():
@@ -254,19 +528,20 @@ class ThinPhoneAgent:
                 placement="system_message",
             )
 
+        context_pruner = ContextPrunerService(
+            keep_images=getattr(config, "image_keep", 2),
+            keep_marks=getattr(config, "obs_marks_keep", 2),
+        )
+
         self._capability_ctx = CapabilityAssemblyContext(
             {
+                "event_bus": self.event_bus,
+                "session": self.session,
+                "config": config,
+                "context_pruner": context_pruner,
                 "taskdoc_middleware_factory": taskdoc_middleware_factory,
                 "taskdoc_tool_factory": taskdoc_tool_factory,
                 "taskdoc_run_start": self._taskdoc_run_start,
-                "safety_middleware_factory": lambda: (
-                    MiddlewareReplacement(
-                        build_capability_safety_middleware(self.session, config),
-                        "control_hitl",
-                    )
-                    if getattr(config, "safety_mode", "wary") == "hard"
-                    else build_capability_safety_middleware(self.session, config)
-                ),
                 "budget_middleware_factory": budget_middleware_factory,
                 "compact_middleware_factory": compact_middleware_factory,
                 "finish_verify_tool_factory": finish_verify_tool_factory,
@@ -280,6 +555,12 @@ class ThinPhoneAgent:
                 "recall_run_start": self._recall_run_start,
                 "recall_run_end": self._recall_run_end,
                 "recall_prompt_provider": self._recall_prompt_block,
+                # WP-PLUGIN-A service factories: each capability publishes a
+                # live handle/facade under its ``provides`` key so plugins can
+                # discover it via ``ctx.service(...)`` and release removes it.
+                "experience_service_factory": lambda: _ExperienceService(self),
+                "recall_service_factory": lambda: _RecallService(self),
+                "app_kb_service_factory": lambda: _AppKbService(self),
             }
         )
 
@@ -295,34 +576,10 @@ class ThinPhoneAgent:
         for index, tool in enumerate(base_tools):
             self._capability_ctx.register_core_tool(tool, order=index)
 
-        self._capability_ctx.register_core_middleware(
-            build_control_hitl_middleware(),
-            order=0,
-            replace_key="control_hitl",
-        )
-        self._capability_ctx.register_core_middleware(
-            build_context_pruning_middleware(
-                keep_images=getattr(config, "image_keep", 2),
-                keep_marks=getattr(config, "obs_marks_keep", 2),
-            ),
-            order=30,
-        )
-        self._capability_ctx.register_core_middleware(self._trace, order=50)
-        self._capability_ctx.register_core_middleware(
-            ModelCallLimitMiddleware(
-                thread_limit=getattr(config, "max_model_calls", 100),
-                exit_behavior="end",
-            ),
-            order=60,
-        )
-        self._capability_ctx.add_core_run_hook(
-            "start", self._capability_snapshot_run_start, order=30
-        )
-
-        # Diagnostic evidence stream (live-diagnosis skill). Appended LAST so its
-        # before_model sees the post-image-prune + post-TaskDoc context and its
-        # wrap_tool_call is innermost (raw tool return). Default OFF, zero-cost;
-        # guarded like taskdoc so a missing module degrades to a plain thin loop.
+        # Diagnostic evidence stream (live-diagnosis skill). Created before the
+        # tool/execute bridge so its listener can be registered between trace and
+        # control HITL. Default OFF, zero-cost; guarded so a missing module degrades
+        # to a plain thin loop.
         self._diagnostic = None
         if getattr(config, "diagnostic_evidence", False):
             try:
@@ -341,12 +598,41 @@ class ThinPhoneAgent:
                     enabled=True,
                     unredacted=bool(getattr(config, "diagnostic_unredacted", False)),
                 )
-                self._capability_ctx.register_core_middleware(
-                    self._diagnostic, order=70
-                )
             except Exception:  # noqa: BLE001 - optional increment; never block bring-up
                 self._diagnostic = None
         self.evidence_path = getattr(self._diagnostic, "evidence_path", None)
+
+        self._capability_ctx.register_core_middleware(
+            _ToolExecuteBridgeMiddleware(self.event_bus),
+            order=0,
+        )
+        self._control_hitl = build_control_hitl_middleware()
+        self._capability_ctx.register_core_middleware(
+            _ModelPreRequestBridgeMiddleware(self.event_bus),
+            order=45,
+        )
+        self._capability_ctx.register_core_middleware(
+            _WrapModelBridgeMiddleware(self.event_bus),
+            order=46,
+        )
+        self._capability_ctx.register_core_middleware(
+            _PostRequestBridgeMiddleware(self.event_bus, self.run_id),
+            order=47,
+        )
+        self._capability_ctx.register_core_middleware(
+            _AgentAfterBridgeMiddleware(self.event_bus, self.run_id),
+            order=48,
+        )
+        # Every core event-bus listener is registered by the two explicit chain
+        # methods; see their docstrings for the nesting table. The split is not
+        # cosmetic: capability listeners (safety, taskdoc, budget, compact) are
+        # mounted by assemble_capabilities between the two calls, so anything
+        # registered here nests OUTSIDE them and anything registered afterwards
+        # nests INSIDE them.
+        self._register_event_chain_pre_assembly()
+        self._capability_ctx.add_core_run_hook(
+            "start", self._capability_snapshot_run_start, order=30
+        )
 
         # Optional add-ons may observe the run without coupling the core to a UI
         # or transport. Place them outside the final safety wrapper so a blocked
@@ -359,15 +645,17 @@ class ThinPhoneAgent:
         assemble_capabilities(self.capability_registry, self._capability_ctx)
         self.tools = self._capability_ctx.tools
         middleware = self._capability_ctx.middleware
-        self._budget = self._owned_capability_product("budget", "middleware")
-        self._compact = self._owned_capability_product("compact", "middleware")
-        safety_product = self._owned_capability_product("safety", "middleware")
-        self._safety_warning = (
-            safety_product
-            if safety_product is not None
-            and hasattr(safety_product, "warning_count")
-            else None
+        self._budget = self._capability_ctx.service("budget_instance")
+        self._compact = self._capability_ctx.service("compact_instance")
+
+        # Runaway-loop fuse; why it is registered behind budget is documented in
+        # _register_event_chain_post_assembly.
+        self._model_call_limiter = _ModelCallLimitListener(
+            getattr(config, "max_model_calls", 100)
         )
+        self._register_event_chain_post_assembly()
+
+        self._safety_warning = self._capability_ctx.service("_safety_warning_listener")
 
         from phone_agent.v2.prompts import get_system_prompt
 
@@ -381,9 +669,127 @@ class ThinPhoneAgent:
         self._system_prompt = self._base_system_prompt
         self._revoked_lesson_ids: set[str] = set()
 
+    def _register_event_chain_pre_assembly(self) -> None:
+        """Register the core listeners that must nest OUTSIDE the capabilities.
+
+        Registration order is onion order: **first registered = outermost**.
+        Everything registered here runs *outside* every capability listener,
+        because capabilities mount during ``assemble_capabilities``, after this
+        method returns.
+
+        ``tool/execute`` (outermost -> innermost)
+          * ``trace``        — writes ``tool_call`` *before* delegating and
+            ``tool_result`` after, so an inner short-circuit is still paired.
+          * ``diagnostic``   — observe-only live-diagnosis mirror of the same pair.
+          * ``control_hitl`` — ``ask_user``/``take_over`` interrupts; must see the
+            request before safety can short-circuit a tap/type.
+          * ``safety``       — **innermost**, registered last by the safety
+            capability during assembly (never here).
+
+          Why safety must be innermost: a flagged call is *not executed* and
+          returns a warning ``ToolMessage`` instead of calling ``next``. If safety
+          were outermost, it would return before trace ever ran, and the blocked
+          call would vanish from the trace (no ``tool_call``, no ``tool_result``).
+          With safety innermost, trace has already written the ``tool_call`` and
+          writes the warning as the paired ``tool_result`` — P0 #6 / WP-D2.
+          Behaviour guard: ``tests/v2/test_event_chain_behavior.py``
+          (see also ``tests/v2/test_trace_invariant.py``).
+
+        ``model/request``
+          * ``trace`` (``prepend=True``) is the outermost wrapper so step,
+            latency and usage accounting enclose every other listener.
+          * ``diagnostic`` appends inside trace; the budget capability appends
+            during assembly, i.e. innermost.
+
+        ``model/pre_request`` (final order, completed across both phases)
+          compact (prepended by the compact capability — or the prune-only
+          listener below when compact is off) -> taskdoc -> budget -> diagnostic
+          -> model-call limiter.
+
+        ``agent/after``
+          ``trace`` (writes ``run_end``) then ``diagnostic``.
+        """
+
+        # --- tool/execute: outermost -> innermost --------------------------
+        self.event_bus.on(TOOL_EXECUTE, self._trace.on_tool_execute)
+        if self._diagnostic is not None:
+            self.event_bus.on(TOOL_EXECUTE, self._diagnostic.on_tool_execute)
+        self.event_bus.on(TOOL_EXECUTE, self._control_hitl)
+
+        # --- model/request: trace outermost, diagnostic inside it -----------
+        self.event_bus.on(MODEL_REQUEST, self._trace.on_model_request, prepend=True)
+        if self._diagnostic is not None:
+            self.event_bus.on(MODEL_REQUEST, self._diagnostic.on_model_request)
+
+        # --- image hygiene (P0 #3) ----------------------------------------
+        # When auto-compact is off there is no compact listener to drive the
+        # context pruner internally, so prune from a dedicated listener that is
+        # prepended in front of every capability listener.
+        if not getattr(self.config, "compact_enabled", True):
+            pruner = self._capability_ctx.service("context_pruner")
+
+            def _prune_only_listener(messages, next):  # noqa: ANN001
+                pruner.prune(messages)
+                return next(messages)
+
+            self.event_bus.on(MODEL_PRE_REQUEST, _prune_only_listener, prepend=True)
+
+        # --- agent/after (emit order: trace, then diagnostic) ---------------
+        self.event_bus.on(AGENT_AFTER, self._trace.on_agent_after)
+
+    def _register_event_chain_post_assembly(self) -> None:
+        """Register the core listeners that must sit INSIDE the capabilities.
+
+        Continues the nesting table in :meth:`_register_event_chain_pre_assembly`.
+        Both registrations here are deliberate "after assembly" placements:
+
+        * diagnostic ``run/start``, ``model/pre_request`` and ``agent/after`` —
+          must observe post-compact / post-taskdoc / post-budget state, so they
+          are appended behind the capability listeners rather than in front.
+        * the runaway-loop fuse (``model/pre_request``) — appended behind budget
+          so the token cost ceiling wins when both would fire, matching the old
+          middleware order (budget before limit).
+        """
+
+        if self._diagnostic is not None:
+            self.event_bus.on(RUN_START, self._diagnostic.on_run_start)
+            self.event_bus.on(MODEL_PRE_REQUEST, self._diagnostic.on_pre_request)
+            self.event_bus.on(AGENT_AFTER, self._diagnostic.on_agent_after)
+        self.event_bus.on(MODEL_PRE_REQUEST, self._model_call_limiter.on_pre_request)
+
     def _owned_capability_product(self, cap_id: str, seam: str) -> Any | None:
         values = self._capability_ctx.owned_values(cap_id, seam)
         return values[0] if values else None
+
+    def _emit_run_event(self, event: str, run_state: dict[str, Any]) -> None:
+        """Emit a run lifecycle event; failures are swallowed (fail-open)."""
+
+        bus = getattr(self, "event_bus", None)
+        if bus is None:
+            return
+        try:
+            result = run_state.get("result")
+            payload: dict[str, Any] = {
+                "run_id": self.run_id,
+                "goal": str(run_state.get("task", "")),
+            }
+            if event == RUN_END:
+                if isinstance(result, RunResult):
+                    payload["success"] = result.success
+                    payload["reason"] = result.reason
+                    payload["steps"] = result.steps
+                payload["exception"] = bool(run_state.get("exception"))
+            else:
+                payload["device_scope"] = str(
+                    run_state.get("device_scope", "device:unknown")
+                )
+                payload["config"] = {
+                    "model": getattr(self.config, "model", None),
+                    "safety_mode": getattr(self.config, "safety_mode", "wary"),
+                }
+            bus.emit(event, payload)
+        except Exception:  # noqa: BLE001 - event bus observations must not alter run semantics
+            pass
 
     def _record_deliverable_path(self, path: str) -> None:
         """Remember a successfully written run artifact for episode linkage."""
@@ -461,6 +867,15 @@ class ThinPhoneAgent:
         return PromptBlock("\n".join(lines), placement="system_message")
 
     def _recall_prompt_block(self) -> PromptBlock | None:
+        # Consume the recall capability through its published service handle
+        # rather than reaching into private agent state (WP-PLUGIN-A). When the
+        # recall capability is off/replaced the service is absent, so fall back
+        # to the local renderer (which returns nothing without injection).
+        ctx = getattr(self, "_capability_ctx", None)
+        service = ctx.service("recall") if ctx is not None else None
+        getter = getattr(service, "lesson_prompt_block", None)
+        if callable(getter):
+            return getter()
         return self._render_lesson_prompt_block()
 
     def _app_kb_prompt_block(self) -> PromptBlock | None:
@@ -1028,6 +1443,7 @@ class ThinPhoneAgent:
                 run_state["device_scope"] = self._experience_device_scope()
             self._prepare_lesson_injection(str(run_state["device_scope"]))
         device_scope = str(run_state["device_scope"])
+        self._emit_run_event(RUN_START, run_state)
         # Reset per-run one-shot flags so a reused agent behaves like a fresh run
         # (S1 R7): the HITL-exhaustion terminal flag, the token-budget state, and
         # the compaction middleware's per-run counters.
@@ -1042,6 +1458,8 @@ class ThinPhoneAgent:
                 self._compact.reset()
             except Exception:  # noqa: BLE001 - best-effort reset; never block a run
                 pass
+        if getattr(self, "_model_call_limiter", None) is not None:
+            self._model_call_limiter.reset()
         try:
             self.session.launched_apps = []
             self.session.finish_verifier = "skipped"
@@ -1098,6 +1516,7 @@ class ThinPhoneAgent:
                     ts_end=run_state["ts_end"],
                     device_scope=device_scope,
                 )
+            self._emit_run_event(RUN_END, run_state)
             raise
 
         run_result = self._build_result(result)
@@ -1113,6 +1532,7 @@ class ThinPhoneAgent:
                 ts_end=run_state["ts_end"],
                 device_scope=device_scope,
             )
+        self._emit_run_event(RUN_END, run_state)
         return run_result
 
     def _experience_device_scope(self) -> str:
@@ -1214,10 +1634,11 @@ class ThinPhoneAgent:
 
         # No terminal declaration. Distinguish the terminal causes (A4 §2): a
         # spent HITL-resume budget, an exhausted **token** cost budget (the L0
-        # BudgetMiddleware hard ceiling set ``exhausted``), the runaway-loop fuse
-        # (ModelCallLimit hard-stopped at ``max_model_calls`` — its injected
-        # terminal message never runs wrap_model_call, so ``_trace._step`` equals
-        # the fuse limit, F6), or a model that simply stopped emitting tool calls.
+        # budget listener set ``exhausted``), the runaway-loop fuse
+        # (_ModelCallLimitListener hard-stopped at ``max_model_calls`` — the jump
+        # to ``end`` means the terminal model call never runs wrap_model_call, so
+        # ``_trace._step`` equals the fuse limit, F6), or a model that simply
+        # stopped emitting tool calls.
         if getattr(self, "_hitl_exhausted", False):
             return RunResult(False, "hitl_resume_exhausted", steps, self.trace_path)
         budget = getattr(self, "_budget", None)

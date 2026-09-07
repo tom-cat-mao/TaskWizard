@@ -1,9 +1,9 @@
-"""Diagnostic evidence middleware: opt-in run evidence for live diagnosis.
+"""Diagnostic evidence writer: opt-in run evidence for live diagnosis.
 
 This is the diagnosis-grade counterpart to :mod:`phone_agent.v2.middleware.trace`.
-Where ``TraceMiddleware`` is the P0 #6 compliance artifact (every text value
+Where ``TraceWriter`` is the P0 #6 compliance artifact (every text value
 truncated to 64 chars, sensitive substrings redacted, base64 never logged), this
-middleware records the *full* picture a live-diagnosis run needs — the final
+writer records the *full* picture a live-diagnosis run needs — the final
 context the model actually saw, the task board, each model turn (thinking +
 tool calls), and each tool's raw return — plus it lands screenshots on disk so a
 step-by-step replay report can show what the model actually looked at.
@@ -30,19 +30,22 @@ un-flippable 64-char-truncate + redact + no-base64 branch).
 
 Design (``outputs/design-council/ROUND2-D1.md`` §1, extended by A5):
 
-* A **separate** middleware, not a mode switch on ``TraceMiddleware``.
+* A **separate** writer, not a mode switch on ``TraceWriter``.
 * Shares the base64-drop / sensitive-redaction primitives via
   :mod:`phone_agent.v2.middleware._redact`.
 * **Default OFF, zero-cost when off** (``V2Config.diagnostic_evidence``). Enabled
   only by the live-diagnosis skill.
-* Mounted **last** in the middleware list so ``before_model`` observes the
-  post-image-prune + post-TaskDoc context, ``wrap_model_call`` sees the model's
-  own turn, and ``wrap_tool_call`` is innermost (the raw tool return).
+* Registered as event-bus listeners: ``run/start`` for run_start,
+  ``model/pre_request`` for the request snapshot, ``model/request`` for the
+  model's own turn, ``tool/execute`` for the tool observation, and
+  ``agent/after`` for run_end.  This places the request snapshot after the
+  image-prune and TaskDoc listeners, and the model-turn listener inside the
+  trace wrapper.
 
 Emits one JSONL line per event to ``<evidence_dir>/<run_id>.evidence.jsonl``.
 ``hitl_decision`` events are written by the driver layer (the skill's logging
 HITL handler), not here — a HITL interrupt unwinds the graph, so
-``wrap_tool_call`` never sees the human verdict. ``result_class`` (§2 taxonomy)
+``on_tool_execute`` never sees the human verdict. ``result_class`` (§2 taxonomy)
 is likewise computed at analysis time, not written here.
 """
 
@@ -54,8 +57,6 @@ import json
 import os
 import time
 from typing import Any
-
-from langchain.agents.middleware import AgentMiddleware
 
 from phone_agent.v2.middleware._redact import (
     estimate_image_bytes,
@@ -237,13 +238,15 @@ def _extract_b64(url: str) -> str | None:
     return url[idx + len(marker) :]
 
 
-class DiagnosticEvidenceMiddleware(AgentMiddleware):
+class DiagnosticEvidenceWriter:
     """Append full run evidence to a JSONL stream + land screenshots on disk.
 
     ``unredacted`` selects the text policy: full-fidelity (local-first, the
     default the skill sets) keeps sensitive substrings and never truncates;
     otherwise text is redacted + bounded at ``DIAG_MAX_TEXT`` (the share policy).
     Either way the JSONL never carries base64 and multimodal content is split.
+
+    The harness registers selected methods as event-bus listeners.
     """
 
     def __init__(
@@ -254,7 +257,6 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
         enabled: bool = False,
         unredacted: bool = False,
     ) -> None:
-        super().__init__()
         self.run_id = run_id
         self.evidence_dir = evidence_dir
         self.session = session
@@ -264,11 +266,8 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
         self._started = False
         self._opening_captured = False
         self._path: str | None = None
-        # doc-change dedupe + stagnation mirror.
+        # doc-change dedupe.
         self._last_doc_hash: str | None = None
-        self._max_seen = 0
-        self._stagnant = 0
-        self._last_nudged = False
         if self.enabled:
             os.makedirs(self.evidence_dir, exist_ok=True)
             self._path = os.path.join(self.evidence_dir, f"{run_id}.evidence.jsonl")
@@ -366,7 +365,7 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
         except Exception:  # noqa: BLE001 - observability must never crash the loop
             pass
 
-    # -- run_start ---------------------------------------------------------
+    # -- run/start listener ------------------------------------------------
     def _config_digest(self) -> dict[str, Any]:
         cfg = getattr(self.session, "config", None)
         return {
@@ -396,39 +395,33 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
             }
         )
 
-    def before_agent(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
+    def on_run_start(self, state_summary) -> None:  # noqa: ANN001
+        """Emit the run_start event at the beginning of a run."""
+
         if not self.enabled:
-            return None
+            return
         try:
             self._emit_run_start()
         except Exception:  # noqa: BLE001
             pass
-        return None
 
-    async def abefore_agent(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
-        return self.before_agent(state, runtime)
+    # -- model/pre_request listener ----------------------------------------
+    def on_pre_request(self, messages, next):  # noqa: ANN001
+        """Snapshot model request context after pruning and TaskDoc pinning."""
 
-    # -- before_model: model_request + taskdoc_snapshot + stagnation -------
-    def before_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
         if not self.enabled:
-            return None
+            return next(messages)
         try:
-            # run_start is normally emitted by before_agent; guard here too so a
-            # harness that resumes past before_agent still records the header.
+            # run_start is normally emitted by the run/start listener; guard here
+            # too so a harness that skips run/start still records the header.
             self._emit_run_start()
             self._step += 1
-            messages = state.get("messages") if isinstance(state, dict) else None
-            messages = messages or []
             self._capture_opening_screens(messages)
             self._emit_model_request(messages)
             self._emit_taskdoc_snapshot()
-            self._emit_stagnation_if_nudged()
         except Exception:  # noqa: BLE001 - observability must never crash the loop
             pass
-        return None
-
-    async def abefore_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
-        return self.before_model(state, runtime)
+        return next(messages)
 
     def _emit_model_request(self, messages: list[Any]) -> None:
         image_messages = 0
@@ -517,35 +510,13 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
             }
         )
 
-    def _emit_stagnation_if_nudged(self) -> None:
-        # Mirror the TaskDoc middleware's stagnation counter so the recorded
-        # stagnant_steps matches; TaskDoc runs before us and may have already
-        # flipped session.nudged this turn.
-        seen = getattr(self.session, "seen_states", None)
-        count = len(seen) if seen is not None else 0
-        if count > self._max_seen:
-            self._max_seen = count
-            self._stagnant = 0
-        else:
-            self._stagnant += 1
-        nudged = bool(getattr(self.session, "nudged", False))
-        if nudged and not self._last_nudged:
-            self._write(
-                {
-                    "event": "stagnation_nudge",
-                    "step": self._step,
-                    "stagnant_steps": self._stagnant,
-                }
-            )
-        self._last_nudged = nudged
-
-    # -- wrap_model_call: model_response (thinking + tool calls + usage) ----
+    # -- model/request listener (inside trace) -----------------------------
     def _emit_model_response(self, response: Any) -> None:
         """Record the model's own turn: thinking text, tool calls, token usage.
 
         The evidence stream otherwise only sees tool *invocations* (args), not the
         model's free-text reasoning — the step-replay report needs that reasoning,
-        so we capture it here where ``wrap_model_call`` returns the AIMessage.
+        so we capture it here where the model/request listener returns the AIMessage.
         """
 
         result = getattr(response, "result", None)
@@ -583,27 +554,19 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
             }
         )
 
-    def wrap_model_call(self, request, handler):  # noqa: ANN001
+    def on_model_request(self, request, next):  # noqa: ANN001
+        """Wrap the real model call and record the model's own turn."""
+
         if not self.enabled:
-            return handler(request)
-        response = handler(request)
+            return next(request)
+        response = next(request)
         try:
             self._emit_model_response(response)
         except Exception:  # noqa: BLE001 - observability must never crash the loop
             pass
         return response
 
-    async def awrap_model_call(self, request, handler):  # noqa: ANN001
-        if not self.enabled:
-            return await handler(request)
-        response = await handler(request)
-        try:
-            self._emit_model_response(response)
-        except Exception:  # noqa: BLE001
-            pass
-        return response
-
-    # -- wrap_tool_call: tool_invoke + tool_observation --------------------
+    # -- tool/execute listener ---------------------------------------------
     def _emit_tool_invoke(self, name: str, args: Any) -> None:
         self._write(
             {
@@ -639,9 +602,11 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
             }
         )
 
-    def wrap_tool_call(self, request, handler):  # noqa: ANN001
+    def on_tool_execute(self, request, next):  # noqa: ANN001
+        """Onion listener: emits tool_invoke, delegates, then tool_observation."""
+
         if not self.enabled:
-            return handler(request)
+            return next(request)
         tool_call = getattr(request, "tool_call", {}) or {}
         name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""
         args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
@@ -651,7 +616,7 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
             pass
         started = time.perf_counter()
         try:
-            result = handler(request)
+            result = next(request)
         except Exception as exc:  # noqa: BLE001 - record then re-raise
             latency_ms = int((time.perf_counter() - started) * 1000)
             try:
@@ -669,40 +634,12 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
             pass
         return result
 
-    async def awrap_tool_call(self, request, handler):  # noqa: ANN001
-        if not self.enabled:
-            return await handler(request)
-        tool_call = getattr(request, "tool_call", {}) or {}
-        name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""
-        args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
-        try:
-            self._emit_tool_invoke(name, args)
-        except Exception:  # noqa: BLE001
-            pass
-        started = time.perf_counter()
-        try:
-            result = await handler(request)
-        except Exception as exc:  # noqa: BLE001
-            latency_ms = int((time.perf_counter() - started) * 1000)
-            try:
-                self._emit_tool_observation(
-                    name, None, latency_ms, f"{type(exc).__name__}: {exc}"
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            raise
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        try:
-            content = getattr(result, "content", None)
-            self._emit_tool_observation(name, content, latency_ms, None)
-        except Exception:  # noqa: BLE001
-            pass
-        return result
+    # -- agent/after listener -----------------------------------------------
+    def on_agent_after(self, state_summary) -> None:  # noqa: ANN001
+        """Write the run_end event when the agent run terminates."""
 
-    # -- run_end -----------------------------------------------------------
-    def after_agent(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
         if not self.enabled:
-            return None
+            return
         try:
             session = self.session
             terminal = {
@@ -717,10 +654,6 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
             )
         except Exception:  # noqa: BLE001
             pass
-        return None
-
-    async def aafter_agent(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
-        return self.after_agent(state, runtime)
 
 
 def build_diagnostic_middleware(
@@ -729,10 +662,10 @@ def build_diagnostic_middleware(
     session: Any | None = None,
     enabled: bool = False,
     unredacted: bool = False,
-) -> DiagnosticEvidenceMiddleware:
-    """Build a :class:`DiagnosticEvidenceMiddleware` bound to ``session``."""
+) -> "DiagnosticEvidenceWriter":
+    """Build a :class:`DiagnosticEvidenceWriter` bound to ``session``."""
 
-    return DiagnosticEvidenceMiddleware(
+    return DiagnosticEvidenceWriter(
         run_id,
         evidence_dir=evidence_dir,
         session=session,
@@ -741,7 +674,11 @@ def build_diagnostic_middleware(
     )
 
 
+# Backward-compatible alias for external imports.
+DiagnosticEvidenceMiddleware = DiagnosticEvidenceWriter
+
 __all__ = [
+    "DiagnosticEvidenceWriter",
     "DiagnosticEvidenceMiddleware",
     "build_diagnostic_middleware",
     "DIAG_MAX_TEXT",

@@ -20,6 +20,7 @@ TaskWizard 是一个 LLM 驱动的安卓手机操作 Agent。模型通过工具�
 | 经验记录 | 每次运行落盘结构化档案（episode），隐私白名单过滤 |
 | 经验回想 | 本地向量索引（sqlite-vec + MLX 嵌入）shadow 模式召回历史经验，自动统计命中率 |
 | 能力注册表 | 所有能力可独立开关、记录依赖关系、每次运行快照可审计 |
+| 插件系统 | 策略层全事件化；插件经 entry points 或 `plugin add` 挂入同一装配层，API provisional v1 |
 | 控制台 | 本地 Web 界面：实时画面、步骤时间线、任务板、应用库、记忆页 |
 
 ## 入口
@@ -27,6 +28,7 @@ TaskWizard 是一个 LLM 驱动的安卓手机操作 Agent。模型通过工具�
 - [快速开始](quickstart.md)：安装到跑通第一个任务
 - [配置参考](configuration.md)：全部 `PHONE_AGENT_*` 配置项
 - [架构](architecture.md)：thin-loop 循环与约束
+- [插件开发](plugins.md)：事件目录、payload 契约、manifest 与安全模型
 
 ## License
 
