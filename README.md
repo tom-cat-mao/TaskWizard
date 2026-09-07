@@ -87,10 +87,12 @@ Web 控制台默认只监听 `127.0.0.1:8080`：输入任务后可实时查看�
 
 `PHONE_AGENT_EVOLUTION=manual` 仅开放显式离线命令；候选写入
 `memory/lessons/{events.jsonl,lessons.json}`。蒸馏以水位线批次处理新 episode（上限 40 条），看到完整任务过程卡片（目标原文 + 逐步 intent/note 账本 + 结局），输出先经严格
-schema、证据与 scope 校验，再以 proposed 状态落盘；Rule-of-3 也只产生“可供人工晋升”结论。
+schema、证据与 scope 校验，再以 proposed 状态落盘；证据校验是逐候选跳过而非整批拒绝，`repeated_failure` 经验需 ≥2 条被引用的失败共享相同 reason 与相同有效工具前缀（前 3 个工具，排除 wait/read_screen）；Rule-of-3 也只产生“可供人工晋升”结论。
 dream 会对账：证据被折叠后不再够格的 approved 经验自动降回草案（lesson_demoted），并按注入组/未注入组成功率给出建议撤销清单（仅提醒）。
 离线管线不参与 actor prompt；proposed/revoked 永不注入。默认 `shadow` 继续只观测，只有显式
 `PHONE_AGENT_MEMORY_RAG=on` 才按上述边界把 approved lesson 注入一次，并在 trace 与 episode 记录 id。
+
+exemplar（成功先例回注）通道尚未上线，其离线评估用 `python -m phone_agent.v2.replay`：它按时间序在内存 `VecIndex` 里重放 `memory/experience/events.jsonl`，模拟每次 run 开局只能看到先于它结束的 episode，输出 coverage/relevance/steps-delta 三道闸的 JSON 指标；全程 observe-only，不触碰生产索引。
 
 ## 文档
 

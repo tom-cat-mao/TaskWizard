@@ -64,10 +64,24 @@ flowchart LR
 
 ## 提炼、晋升与回注（已实现）
 
-- **提炼**：`--distill` 离线蒸馏——按水位线取新档案整批交给 LLM（每张卡含目标原文、逐步 intent/note 账本与结局，上限 40 条，处理后推进水位线不重复消费），产出候选经验（严格 schema，证据必须引用真实 run、support_count 与证据一致）；
+- **提炼**：`--distill` 离线蒸馏——按水位线取新档案整批交给 LLM（每张卡含目标原文、逐步 intent/note 账本与结局，上限 40 条，处理后推进水位线不重复消费），产出候选经验（严格 schema，证据必须引用真实 run、support_count 与证据一致）；证据校验**逐候选**放行：一张卡不合格只跳过它，不再整批拒绝（同批其余合格候选照常晋升）；蒸馏 prompt 明确要求候选证据**锚定失败**——要么同时引用失败与成功 run 且至少一次失败早于成功（先踩坑后绕开），要么引用 ≥2 次可复现的失败；仅引用成功 run 的卡被丢弃；`repeated_failure` 型经验要求相同失败原因 **且**共享有效工具前缀（前 3 个工具、剔除 `wait`/`read_screen`）才算同一个可复现的坑；
 - **晋升**：Rule-of-3（≥3 次独立出现、跨 ≥2 任务、0 冲突）+ 人工审批（`--review-lessons` / `--approve-lesson` / `--revoke-lesson`），版本链可撤销（supersede 即下线，重新批准才恢复注入）；
 - **维护**：dream 对账——证据档案被折叠后不再够格的 approved 经验自动降回草案（`lesson_demoted`，需重新人审）；并按"注入组 vs 未注入组"成功率统计每条经验的实际效果，更差的列入建议撤销清单（只提醒，不自动撤）；
 - **回注**（`PHONE_AGENT_MEMORY_RAG=on`）：已批准的经验在 run 开局以"参考提示"身份注入（上限 3 条 / 800 token，设备 scope 过滤，run 内钉死该代）；注入的 lesson id 写入 trace 与 episode 档案，用于事后度量"注入是否有帮助"；
 - **约束**：只有人审通过的经验可被注入；proposed/revoked 永不注入；shadow/off 档完全不注入。
 
 原则：先记录、再影子验证、晋升靠人审、注入有上限可撤销；每一步可回退。
+
+## 成功先例通道离线评估（exemplar replay）
+
+"成功先例通道"设想在 run 开局注入一条同类任务的成功 episode 作为先例。注入本身**尚未上线**；`phone_agent/v2/replay.py` 先为"是否值得注入"提供离线证据。
+
+它按 `ts_end` 时间序重放 `memory/experience/events.jsonl` 的 episode 日志，在**内存** `VecIndex`（`:memory:`，不碰生产索引）里模拟每次 run 启动时的召回窗口——一个 run 只能看到先于它结束的 episode——取语义召回 top-1 成功先例，测三道闸：
+
+- **coverage（可用率）**：多少 run 能召回到一条够格（成功且步数 ≥ `min_steps`）的先例；达标线 ≥ 0.30；
+- **relevance（相关性）**：命中先例是否与当前 run 同 `task_key`；在已 covered 的 run 中达标线 ≥ 0.70；
+- **steps-delta（更高效）**：先例步数是否比当前 run 更少（`当前步数 - 先例步数`，>0 表示先例更省步）；以中位数 >0 为达标线。
+
+三闸全过才建议开通道（`channel_recommended`）。
+
+运行方式：`python -m phone_agent.v2.replay`，输出 JSON 指标。参数：`--experience-dir`（默认 `memory/experience`）、`--min-steps`（默认 2，够格 episode 的最小步数）、`--min-score`（默认 0.50，召回分阈值）、`--top-k`（默认 1，每 run 的 episode 召回名额）。
