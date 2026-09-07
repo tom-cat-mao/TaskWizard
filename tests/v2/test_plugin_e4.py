@@ -181,6 +181,17 @@ def _is_bound_method(listener, obj, name: str) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# WP-F1: mechanism-level (white-box) event-chain assertions.
+#
+# These pin *how* the chain is wired by reading ``event_bus._listeners``. They
+# are deliberately duplicated with the registration order, so they cannot stop
+# someone from moving a registration statement and updating them in the same
+# commit. The behavioural guarantee they exist for is asserted in
+# ``tests/v2/test_event_chain_behavior.py`` ("机制测试，行为保证见该文件").
+# ---------------------------------------------------------------------------
+
+
 def test_trace_is_outermost_model_request_listener(captured_agent):
     agent, _ = captured_agent
     listeners = agent.event_bus._listeners.get(MODEL_REQUEST, [])
@@ -189,6 +200,12 @@ def test_trace_is_outermost_model_request_listener(captured_agent):
 
 
 def test_tool_execute_chain_order(captured_agent):
+    """Mechanism test: trace is outermost, safety innermost.
+
+    行为保证见 tests/v2/test_event_chain_behavior.py::test_blocked_call_is_traced_as_a_pair
+    —— 被 safety 拦下的调用仍必须成对出现在 trace 里（且未真实执行）。
+    """
+
     agent, _ = captured_agent
     listeners = agent.event_bus._listeners.get(TOOL_EXECUTE, [])
     safety = agent._capability_ctx.service("_safety_warning_listener")
