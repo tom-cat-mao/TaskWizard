@@ -518,6 +518,17 @@ def _apply_taskdoc(ctx: CapabilityAssemblyContext) -> None:
 
 
 def _apply_safety(ctx: CapabilityAssemblyContext) -> None:
+    bus = ctx.service("event_bus")
+    if bus is not None:
+        from phone_agent.v2.middleware.safety import register_default_safety_listener
+
+        disposer = register_default_safety_listener(
+            bus,
+            ctx.service("session"),
+            ctx.service("config"),
+        )
+        if callable(disposer):
+            ctx.set_service("_safety_event_disposer", disposer)
     _register_factory(ctx, "safety_middleware_factory", "register_middleware")
 
 
@@ -595,6 +606,11 @@ def _owned_apply(cap_id: str, hook: CapabilityHook) -> CapabilityHook:
 
 def _owned_release(cap_id: str) -> CapabilityHook:
     def release(ctx: CapabilityAssemblyContext) -> None:
+        if cap_id == "safety":
+            disposer = ctx.service("_safety_event_disposer")
+            if callable(disposer):
+                disposer()
+                ctx.set_service("_safety_event_disposer", None)
         ctx.release_capability(cap_id)
 
     return release

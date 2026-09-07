@@ -22,6 +22,7 @@ import sys
 import time
 from typing import Any, Callable, Mapping
 
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from phone_agent.v2.capabilities import (
@@ -31,6 +32,7 @@ from phone_agent.v2.capabilities import (
     assemble_capabilities,
     build_capability_registry,
 )
+from phone_agent.v2.events import RUN_END, RUN_START, EventBus
 
 
 @dataclass
@@ -172,6 +174,28 @@ def _first_observation_content(
     return content
 
 
+class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
+    """Bridge ``model/pre_request`` event listeners into the middleware stack.
+
+    Listeners registered on the event bus may return a replacement messages
+    list; when no listener changes the payload this middleware is a no-op.
+    """
+
+    def __init__(self, event_bus: EventBus) -> None:
+        super().__init__()
+        self._event_bus = event_bus
+
+    def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        messages = state.get("messages") or []
+        result = self._event_bus.waterfall("model/pre_request", messages)
+        if result is messages:
+            return None
+        return {"messages": result}
+
+    async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
+        return self.before_model(state, runtime)
+
+
 class ThinPhoneAgent:
     """Thin-loop phone agent built on ``create_agent`` + v2 middleware.
 
@@ -191,6 +215,7 @@ class ThinPhoneAgent:
     ) -> None:
         self.config = config
         self.run_id = str(run_id or uuid.uuid4().hex)
+        self.event_bus = EventBus()
         self.capability_registry = build_capability_registry(config)
         self._run_capabilities: dict[str, str] = {}
         self._run_memory_generation: dict[str, Any] | None = None
@@ -223,6 +248,7 @@ class ThinPhoneAgent:
         self.checkpointer = checkpointer
 
         self.session = PhoneSession(config)
+        self.session.event_bus = self.event_bus
         self.usage_ledger = UsageLedger()
         self.session.usage_ledger = self.usage_ledger
         self.model = build_chat_model(config)
@@ -311,16 +337,23 @@ class ThinPhoneAgent:
 
         self._capability_ctx = CapabilityAssemblyContext(
             {
+                "event_bus": self.event_bus,
+                "session": self.session,
+                "config": config,
                 "taskdoc_middleware_factory": taskdoc_middleware_factory,
                 "taskdoc_tool_factory": taskdoc_tool_factory,
                 "taskdoc_run_start": self._taskdoc_run_start,
                 "safety_middleware_factory": lambda: (
                     MiddlewareReplacement(
-                        build_capability_safety_middleware(self.session, config),
+                        build_capability_safety_middleware(
+                            self.session, config, event_bus=self.event_bus
+                        ),
                         "control_hitl",
                     )
                     if getattr(config, "safety_mode", "wary") == "hard"
-                    else build_capability_safety_middleware(self.session, config)
+                    else build_capability_safety_middleware(
+                        self.session, config, event_bus=self.event_bus
+                    )
                 ),
                 "budget_middleware_factory": budget_middleware_factory,
                 "compact_middleware_factory": compact_middleware_factory,
@@ -367,6 +400,10 @@ class ThinPhoneAgent:
                 keep_marks=getattr(config, "obs_marks_keep", 2),
             ),
             order=30,
+        )
+        self._capability_ctx.register_core_middleware(
+            _ModelPreRequestBridgeMiddleware(self.event_bus),
+            order=45,
         )
         self._capability_ctx.register_core_middleware(self._trace, order=50)
         self._capability_ctx.register_core_middleware(
@@ -445,6 +482,36 @@ class ThinPhoneAgent:
     def _owned_capability_product(self, cap_id: str, seam: str) -> Any | None:
         values = self._capability_ctx.owned_values(cap_id, seam)
         return values[0] if values else None
+
+    def _emit_run_event(self, event: str, run_state: dict[str, Any]) -> None:
+        """Emit a run lifecycle event; failures are swallowed (fail-open)."""
+
+        bus = getattr(self, "event_bus", None)
+        if bus is None:
+            return
+        try:
+            result = run_state.get("result")
+            payload: dict[str, Any] = {
+                "run_id": self.run_id,
+                "goal": str(run_state.get("task", "")),
+            }
+            if event == RUN_END:
+                if isinstance(result, RunResult):
+                    payload["success"] = result.success
+                    payload["reason"] = result.reason
+                    payload["steps"] = result.steps
+                payload["exception"] = bool(run_state.get("exception"))
+            else:
+                payload["device_scope"] = str(
+                    run_state.get("device_scope", "device:unknown")
+                )
+                payload["config"] = {
+                    "model": getattr(self.config, "model", None),
+                    "safety_mode": getattr(self.config, "safety_mode", "wary"),
+                }
+            bus.emit(event, payload)
+        except Exception:  # noqa: BLE001 - event bus observations must not alter run semantics
+            pass
 
     def _record_deliverable_path(self, path: str) -> None:
         """Remember a successfully written run artifact for episode linkage."""
@@ -1098,6 +1165,7 @@ class ThinPhoneAgent:
                 run_state["device_scope"] = self._experience_device_scope()
             self._prepare_lesson_injection(str(run_state["device_scope"]))
         device_scope = str(run_state["device_scope"])
+        self._emit_run_event(RUN_START, run_state)
         # Reset per-run one-shot flags so a reused agent behaves like a fresh run
         # (S1 R7): the HITL-exhaustion terminal flag, the token-budget state, and
         # the compaction middleware's per-run counters.
@@ -1168,6 +1236,7 @@ class ThinPhoneAgent:
                     ts_end=run_state["ts_end"],
                     device_scope=device_scope,
                 )
+            self._emit_run_event(RUN_END, run_state)
             raise
 
         run_result = self._build_result(result)
@@ -1183,6 +1252,7 @@ class ThinPhoneAgent:
                 ts_end=run_state["ts_end"],
                 device_scope=device_scope,
             )
+        self._emit_run_event(RUN_END, run_state)
         return run_result
 
     def _experience_device_scope(self) -> str:
