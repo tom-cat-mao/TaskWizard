@@ -67,28 +67,44 @@ def test_emit_is_fail_open(caplog: pytest.LogCaptureFixture) -> None:
 def test_waterfall_replaces_payload_and_reject_short_circuits() -> None:
     bus = EventBus()
     seen: list[int] = []
-    bus.on("tool/pre_execute", lambda payload: {**payload, "a": 1})
+    bus.on("tool/pre_execute", lambda payload, next: next({**payload, "a": 1}))
 
-    def reject(payload: dict) -> object:
+    def reject(payload: dict, next) -> object:  # noqa: A002 - next is the onion contract
         seen.append(payload["a"])
         return REJECT
 
     bus.on("tool/pre_execute", reject)
-    bus.on("tool/pre_execute", lambda payload: seen.append(99))
+    bus.on("tool/pre_execute", lambda payload, next: seen.append(99))
 
-    assert bus.waterfall("tool/pre_execute", {}) is REJECT
+    assert bus.waterfall("tool/pre_execute", {}, terminal=lambda x: x) is REJECT
     assert seen == [1]
 
 
 def test_waterfall_raises_listener_exception() -> None:
     bus = EventBus()
 
-    def fail(payload: object) -> object:
+    def fail(payload: object, next) -> object:  # noqa: A002 - next is the onion contract
         raise RuntimeError("policy failed")
 
     bus.on("tool/pre_execute", fail)
     with pytest.raises(RuntimeError, match="policy failed"):
-        bus.waterfall("tool/pre_execute", {})
+        bus.waterfall("tool/pre_execute", {}, terminal=lambda x: x)
+
+
+def test_waterfall_listener_can_wrap_terminal_result() -> None:
+    """Onion semantics let a listener execute downstream and wrap the result."""
+
+    bus = EventBus()
+    bus.on(
+        "tool/pre_execute",
+        lambda payload, next: {"wrapped": next(payload), "meta": "post"},  # noqa: A002
+    )
+
+    result = bus.waterfall(
+        "tool/pre_execute", {"x": 1}, terminal=lambda p: {"executed": p}
+    )
+
+    assert result == {"wrapped": {"executed": {"x": 1}}, "meta": "post"}
 
 
 def test_serial_collects_results_and_raises() -> None:
@@ -116,7 +132,7 @@ def _req(name: str, args: dict):
 def test_safety_warning_middleware_uses_event_bus_listener() -> None:
     bus = EventBus()
     mw = SafetyWarningMiddleware(None, _Cfg(), notify=lambda _message: None, event_bus=bus)
-    bus.on("tool/pre_execute", lambda payload: REJECT)
+    bus.on("tool/pre_execute", lambda payload, next: REJECT)  # noqa: A002
     executed = {"n": 0}
 
     def handler(request):
@@ -147,7 +163,9 @@ def test_safety_capability_registers_and_releases_event_listener() -> None:
 
     assemble_capabilities(registry, ctx)
     assert bus.waterfall(
-        "tool/pre_execute", _req("tap", {"target_description": "确认支付"})
+        "tool/pre_execute",
+        _req("tap", {"target_description": "确认支付"}),
+        terminal=lambda x: x,
     ) is REJECT
 
     class OffCfg:
@@ -155,7 +173,7 @@ def test_safety_capability_registers_and_releases_event_listener() -> None:
 
     assemble_capabilities(build_capability_registry(OffCfg()), ctx)
     request = _req("tap", {"target_description": "确认支付"})
-    assert bus.waterfall("tool/pre_execute", request) is request
+    assert bus.waterfall("tool/pre_execute", request, terminal=lambda x: x) is request
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +197,10 @@ def test_model_pre_request_bridge_listener_replaces_messages() -> None:
     bus = EventBus()
     mw = _ModelPreRequestBridgeMiddleware(bus)
     messages = [{"type": "text", "text": "hello"}]
-    bus.on("model/pre_request", lambda msgs: [*msgs, {"type": "text", "text": "extra"}])
+    bus.on(
+        "model/pre_request",
+        lambda msgs, next: [*msgs, {"type": "text", "text": "extra"}],  # noqa: A002
+    )
 
     result = mw.before_model({"messages": messages}, None)
 

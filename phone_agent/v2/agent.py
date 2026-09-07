@@ -187,7 +187,9 @@ class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
 
     def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
         messages = state.get("messages") or []
-        result = self._event_bus.waterfall("model/pre_request", messages)
+        result = self._event_bus.waterfall(
+            "model/pre_request", messages, terminal=lambda x: x
+        )
         if result is messages:
             return None
         return {"messages": result}

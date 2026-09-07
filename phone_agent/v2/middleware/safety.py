@@ -637,11 +637,12 @@ class SafetyWarningMiddleware(AgentMiddleware):
 
     def wrap_tool_call(self, request, handler):  # noqa: ANN001
         if self._event_bus is not None:
-            decision = self._event_bus.waterfall(TOOL_PRE_EXECUTE, request)
+            decision = self._event_bus.waterfall(
+                TOOL_PRE_EXECUTE, request, terminal=handler
+            )
             if decision is REJECT:
                 return self._reject_message(request)
-            request = decision
-            return handler(request)
+            return decision
         warning = self._warn_message(request)
         if warning is not None:
             return warning
@@ -649,11 +650,12 @@ class SafetyWarningMiddleware(AgentMiddleware):
 
     async def awrap_tool_call(self, request, handler):  # noqa: ANN001
         if self._event_bus is not None:
-            decision = self._event_bus.waterfall(TOOL_PRE_EXECUTE, request)
+            decision = self._event_bus.waterfall(
+                TOOL_PRE_EXECUTE, request, terminal=handler
+            )
             if decision is REJECT:
                 return self._reject_message(request)
-            request = decision
-            return await handler(request)
+            return decision
         warning = self._warn_message(request)
         if warning is not None:
             return warning
@@ -674,18 +676,18 @@ class SafetyPreExecuteListener:
         self.config = config
         self._reviewer = reviewer
 
-    def __call__(self, request: Any) -> Any:
+    def __call__(self, request: Any, next: Callable[[Any], Any]) -> Any:
         name, args = _extract_call(request)
         if name not in ACTUATION_GATED_TOOLS:
-            return request
+            return next(request)
         if _confirmed_irreversible(args):
-            return request
+            return next(request)
         verdict = classify_tool_call(
             request, self.session, self.config, reviewer=self._reviewer
         )
         if verdict.should_gate:
             return REJECT
-        return request
+        return next(request)
 
 
 def _default_notify(message: str) -> None:

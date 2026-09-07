@@ -20,12 +20,15 @@ Payload contracts for the first plugin events:
 ``TOOL_PRE_EXECUTE`` / ``"tool/pre_execute"``
     Applied with :meth:`EventBus.waterfall`. Payload is the tool-call object
     seen by middleware: tool ``name``, ``args``, and session-facing request
-    context. Listeners may return a replacement payload or ``REJECT`` to
-    short-circuit execution.
+    context. Listeners receive ``(payload, next)``; calling ``next(payload)``
+    delegates to downstream listeners and ultimately to the terminal
+    execution function. Returning without calling ``next`` short-circuits the
+    chain. ``REJECT`` is the policy-rejection sentinel.
 
 ``MODEL_PRE_REQUEST`` / ``"model/pre_request"``
     Applied with :meth:`EventBus.waterfall`. Payload is a copy of the model
-    request messages list. Listeners may return a replacement list.
+    request messages list. Listeners receive ``(payload, next)`` and may
+    return a replacement list, optionally wrapping the result of ``next``.
 """
 
 from __future__ import annotations
@@ -61,6 +64,7 @@ class _Reject:
 REJECT = _Reject()
 
 Listener = Callable[[Any], Any]
+WaterfallListener = Callable[[Any, Callable[[Any], Any]], Any]
 Disposer = Callable[[], None]
 
 _LOGGER = logging.getLogger(__name__)
@@ -83,9 +87,18 @@ class EventBus:
         self._listeners: dict[str, list[Listener]] = {}
 
     def on(
-        self, event: str, listener: Listener, *, prepend: bool = False
+        self,
+        event: str,
+        listener: Listener | WaterfallListener,
+        *,
+        prepend: bool = False,
     ) -> Disposer:
-        """Register ``listener`` and return an idempotent disposer."""
+        """Register ``listener`` and return an idempotent disposer.
+
+        ``emit``/``serial`` listeners receive ``(payload)``. ``waterfall``
+        listeners receive ``(payload, next)`` where ``next`` continues the
+        chain and returns the value produced by the rest of the waterfall.
+        """
 
         event = validate_event_name(event)
         if not callable(listener):
@@ -125,16 +138,34 @@ class EventBus:
             except Exception:  # noqa: BLE001 - observation events are fail-open
                 _LOGGER.exception("event listener failed during emit: %s", event)
 
-    def waterfall(self, event: str, payload: Any) -> Any:
-        """Pass ``payload`` through listeners; ``REJECT`` short-circuits."""
+    def waterfall(
+        self, event: str, payload: Any, terminal: Callable[[Any], Any]
+    ) -> Any:
+        """Pass ``payload`` through listeners; ``REJECT`` short-circuits.
+
+        Each listener is called as ``listener(payload, next)`` where ``next``
+        is a callable that continues the chain. Calling ``next(payload)``
+        delegates to downstream listeners and returns the value produced by
+        the rest of the chain (including ``terminal``). Returning without
+        calling ``next`` short-circuits the chain. ``REJECT`` is the policy-
+        rejection sentinel; callers treat it the same as a short-circuit for
+        execution purposes.
+        """
 
         event = validate_event_name(event)
-        current = payload
-        for listener in tuple(self._listeners.get(event, ())):
-            current = listener(current)
-            if current is REJECT:
-                return REJECT
-        return current
+        listeners = tuple(self._listeners.get(event, ()))
+
+        def make_next(index: int) -> Callable[[Any], Any]:
+            if index >= len(listeners):
+                return terminal
+            listener = listeners[index]
+
+            def _next(current_payload: Any) -> Any:
+                return listener(current_payload, make_next(index + 1))
+
+            return _next
+
+        return make_next(0)(payload)
 
     def serial(self, event: str, payload: Any) -> list[Any]:
         """Run listeners in order and collect their return values."""
@@ -153,5 +184,6 @@ __all__ = [
     "RUN_END",
     "RUN_START",
     "TOOL_PRE_EXECUTE",
+    "WaterfallListener",
     "validate_event_name",
 ]
