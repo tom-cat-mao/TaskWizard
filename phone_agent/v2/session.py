@@ -24,6 +24,7 @@ from phone_agent.grounding.provider import (
     ScreenBinding,
 )
 from phone_agent.v2.coords import convert_relative_to_absolute
+from phone_agent.v2.events import EventBus
 from phone_agent.v2.locate_scope import (
     ScopeCrop,
     build_scope_crop,
@@ -194,6 +195,9 @@ class PhoneSession:
         # ledger after constructing the session; the slot always exists for side
         # calls and duck-typed integrations to probe safely.
         self.usage_ledger: "UsageLedger | None" = None
+        # Event bus for observe-only lifecycle notifications. Wired by the agent
+        # after construction; absent in duck-typed test doubles.
+        self.event_bus: EventBus | None = None
         # App-KB is an optional enhancement. Keep stable public slots but defer
         # imports and filesystem creation until sync or prompt lookup needs it.
         self.app_store: "AppKnowledgeStore | None" = None
@@ -710,7 +714,7 @@ class PhoneSession:
         self._last_locate_app = "unknown"
         # screen_hash: short sha256 of the screenshot payload, audit/binding only.
         digest = screen_hash if screen_hash is not None else self._hash_screenshot(shot)
-        return Observation(
+        observation = Observation(
             screenshot_b64=shot.base64_data,
             width=int(shot.width),
             height=int(shot.height),
@@ -725,6 +729,21 @@ class PhoneSession:
             parse_summary=sample.parse_summary,
             windows=sample.windows,
         )
+        bus = getattr(self, "event_bus", None)
+        if bus is not None:
+            try:
+                bus.emit(
+                    "observe",
+                    {
+                        "epoch": observation.epoch,
+                        "screen_seq": observation.screen_seq,
+                        "marks_count": len(observation.marks),
+                        "marks_failure_code": observation.marks_failure_code,
+                    },
+                )
+            except Exception:  # noqa: BLE001 - event bus must never alter observation semantics
+                pass
+        return observation
 
     def _invalidate_batch(self) -> None:
         """Drop every current-batch mark (no stale authority after a failure)."""

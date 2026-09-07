@@ -61,6 +61,7 @@ from phone_agent.v2.middleware._tokens import (
     estimate_context_tokens,
     estimate_message_tokens,
 )
+from phone_agent.v2.events import EventBus, REJECT, TOOL_PRE_EXECUTE
 
 # Deviation (§9.1): policy.py has no sensitive-app table, so launch_app targets
 # are matched against this curated CN+EN keyword set for banking/payment apps
@@ -582,12 +583,14 @@ class SafetyWarningMiddleware(AgentMiddleware):
         *,
         reviewer: Callable[[str, str], bool] | None = None,
         notify: Callable[[str], None] | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         super().__init__()
         self.session = session
         self.config = config
         self._reviewer = reviewer
         self._notify = notify if notify is not None else _default_notify
+        self._event_bus = event_bus
         self.warning_count = 0
 
     def _warn_message(self, request: Any) -> ToolMessage | None:
@@ -618,17 +621,71 @@ class SafetyWarningMiddleware(AgentMiddleware):
             status="error",
         )
 
+    def _reject_message(self, request: Any) -> ToolMessage:
+        warning = self._warn_message(request)
+        if warning is not None:
+            return warning
+        name, _args = _extract_call(request)
+        tool_call = getattr(request, "tool_call", {}) or {}
+        call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
+        return ToolMessage(
+            content=f"⚠️ 已拦截（未执行）：{name}\n工具调用被策略事件拒绝。",
+            tool_call_id=str(call_id or ""),
+            name=name,
+            status="error",
+        )
+
     def wrap_tool_call(self, request, handler):  # noqa: ANN001
+        if self._event_bus is not None:
+            decision = self._event_bus.waterfall(TOOL_PRE_EXECUTE, request)
+            if decision is REJECT:
+                return self._reject_message(request)
+            request = decision
+            return handler(request)
         warning = self._warn_message(request)
         if warning is not None:
             return warning
         return handler(request)
 
     async def awrap_tool_call(self, request, handler):  # noqa: ANN001
+        if self._event_bus is not None:
+            decision = self._event_bus.waterfall(TOOL_PRE_EXECUTE, request)
+            if decision is REJECT:
+                return self._reject_message(request)
+            request = decision
+            return await handler(request)
         warning = self._warn_message(request)
         if warning is not None:
             return warning
         return await handler(request)
+
+
+class SafetyPreExecuteListener:
+    """Default ``tool/pre_execute`` listener for the warning safety policy."""
+
+    def __init__(
+        self,
+        session: Any | None,
+        config: Any | None,
+        *,
+        reviewer: Callable[[str, str], bool] | None = None,
+    ) -> None:
+        self.session = session
+        self.config = config
+        self._reviewer = reviewer
+
+    def __call__(self, request: Any) -> Any:
+        name, args = _extract_call(request)
+        if name not in ACTUATION_GATED_TOOLS:
+            return request
+        if _confirmed_irreversible(args):
+            return request
+        verdict = classify_tool_call(
+            request, self.session, self.config, reviewer=self._reviewer
+        )
+        if verdict.should_gate:
+            return REJECT
+        return request
 
 
 def _default_notify(message: str) -> None:
@@ -638,7 +695,10 @@ def _default_notify(message: str) -> None:
 
 
 def build_safety_warning_middleware(
-    session: Any | None = None, config: Any | None = None
+    session: Any | None = None,
+    config: Any | None = None,
+    *,
+    event_bus: EventBus | None = None,
 ) -> SafetyWarningMiddleware | None:
     """Build the warning middleware for ``wary``/``reviewer`` mode, else ``None``.
 
@@ -653,7 +713,9 @@ def build_safety_warning_middleware(
     reviewer = (
         build_safety_reviewer(config, session=session) if mode == "reviewer" else None
     )
-    return SafetyWarningMiddleware(session, config, reviewer=reviewer)
+    return SafetyWarningMiddleware(
+        session, config, reviewer=reviewer, event_bus=event_bus
+    )
 
 
 def build_hitl_middleware(session: Any | None = None, config: Any | None = None):
@@ -709,7 +771,10 @@ def build_control_hitl_middleware():
 
 
 def build_capability_safety_middleware(
-    session: Any | None = None, config: Any | None = None
+    session: Any | None = None,
+    config: Any | None = None,
+    *,
+    event_bus: EventBus | None = None,
 ):
     """Build the mode-specific safety product mounted by the safety cap.
 
@@ -720,7 +785,24 @@ def build_capability_safety_middleware(
     mode = _safety_mode(config)
     if mode == "hard":
         return build_hitl_middleware(session, config)
-    return build_safety_warning_middleware(session, config)
+    return build_safety_warning_middleware(session, config, event_bus=event_bus)
+
+
+def register_default_safety_listener(
+    event_bus: EventBus,
+    session: Any | None = None,
+    config: Any | None = None,
+):
+    """Register the default warning-flow safety listener on ``event_bus``."""
+
+    mode = _safety_mode(config)
+    if mode not in {"wary", "reviewer"}:
+        return None
+    reviewer = (
+        build_safety_reviewer(config, session=session) if mode == "reviewer" else None
+    )
+    listener = SafetyPreExecuteListener(session, config, reviewer=reviewer)
+    return event_bus.on(TOOL_PRE_EXECUTE, listener)
 
 
 __all__ = [
@@ -731,7 +813,9 @@ __all__ = [
     "build_hitl_middleware",
     "build_control_hitl_middleware",
     "build_capability_safety_middleware",
+    "register_default_safety_listener",
     "SafetyWarningMiddleware",
+    "SafetyPreExecuteListener",
     "build_safety_warning_middleware",
     "format_warning",
     "SENSITIVE_APP_KEYWORDS",
