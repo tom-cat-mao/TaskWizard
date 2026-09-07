@@ -25,6 +25,7 @@ from typing import Any, Mapping
 
 from langchain.agents.middleware import AgentMiddleware
 
+from phone_agent.v2.events import REJECT
 from phone_agent.v2.middleware._redact import (
     redact_text as _redact_context_text,
     redact_value_no_base64,
@@ -292,8 +293,24 @@ class TraceMiddleware(AgentMiddleware):
         )
         return response
 
-    # --- tool call ----------------------------------------------------------
+    # --- tool call (tool/execute listener) ----------------------------------
     def wrap_tool_call(self, request, handler):  # noqa: ANN001
+        """Pass-through: tool execution is handled by ``on_tool_execute``."""
+        return handler(request)
+
+    async def awrap_tool_call(self, request, handler):  # noqa: ANN001
+        return await handler(request)
+
+    def on_tool_execute(self, request, next):  # noqa: ANN001
+        """Onion listener: records tool_call, delegates, then records tool_result.
+
+        The listener is registered on the event bus by the core harness; it sees
+        whatever the inner listeners/terminal return, including REJECT or a
+        warning ToolMessage from safety, so every model-visible result is paired
+        with a tool_call record (WP-D2). The experience sink is independent of
+        ``enabled`` and is always notified.
+        """
+
         tool_call = getattr(request, "tool_call", {}) or {}
         name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""
         args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
@@ -309,7 +326,7 @@ class TraceMiddleware(AgentMiddleware):
         launched_before = len(getattr(self._session, "launched_apps", []) or [])
         error: str | None = None
         try:
-            result = handler(request)
+            result = next(request)
         except Exception as exc:  # noqa: BLE001 - trace then re-raise
             error = f"{type(exc).__name__}: {exc}"
             self._write(
@@ -328,58 +345,25 @@ class TraceMiddleware(AgentMiddleware):
                 name, args, error=exc, launched_before=launched_before
             )
             raise
-        content = getattr(result, "content", None)
-        self._record_successful_launch(name, content)
-        artifact = _tool_artifact(result)
-        self._write(
-            {
-                "event": "tool_result",
-                "step": self._step,
-                "tool": name,
-                "latency_ms": int((time.perf_counter() - started) * 1000),
-                "result": _redact_value(content) if content is not None else None,
-                "artifact": _redact_value(artifact) if artifact is not None else None,
-                "error": None,
-            }
-        )
-        self._write_experience(name, result, args=args, launched_before=launched_before)
-        self._write_alias_evidence(name, args, result, launched_before=launched_before)
-        return result
-
-    async def awrap_tool_call(self, request, handler):  # noqa: ANN001
-        tool_call = getattr(request, "tool_call", {}) or {}
-        name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""
-        args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
-        self._write(
-            {
-                "event": "tool_call",
-                "step": self._step,
-                "tool": name,
-                "args_redacted": redact_args(args),
-            }
-        )
-        started = time.perf_counter()
-        launched_before = len(getattr(self._session, "launched_apps", []) or [])
-        try:
-            result = await handler(request)
-        except Exception as exc:  # noqa: BLE001 - trace then re-raise
-            error = f"{type(exc).__name__}: {exc}"
+        if result is REJECT:
+            content = f"⚠️ 已拦截（未执行）：{name}\n工具调用被策略事件拒绝。"
             self._write(
                 {
                     "event": "tool_result",
                     "step": self._step,
                     "tool": name,
                     "latency_ms": int((time.perf_counter() - started) * 1000),
-                    "error": _redact_text(error),
+                    "result": _redact_text(content),
+                    "error": None,
                 }
             )
             self._write_experience(
-                name, error=exc, args=args, launched_before=launched_before
+                name, result=content, args=args, launched_before=launched_before
             )
             self._write_alias_evidence(
-                name, args, error=exc, launched_before=launched_before
+                name, args, result=content, launched_before=launched_before
             )
-            raise
+            return result
         content = getattr(result, "content", None)
         self._record_successful_launch(name, content)
         artifact = _tool_artifact(result)

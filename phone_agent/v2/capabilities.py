@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import re
 from typing import Any, Protocol, runtime_checkable
 
-from phone_agent.v2.events import MODEL_PRE_REQUEST
+from phone_agent.v2.events import MODEL_PRE_REQUEST, TOOL_EXECUTE
 
 CapabilityHook = Callable[..., None]
 PromptProvider = Callable[..., Any]
@@ -527,17 +527,27 @@ def _apply_taskdoc(ctx: CapabilityAssemblyContext) -> None:
 
 def _apply_safety(ctx: CapabilityAssemblyContext) -> None:
     bus = ctx.service("event_bus")
-    if bus is not None:
-        from phone_agent.v2.middleware.safety import register_default_safety_listener
+    if bus is None:
+        return
+    from phone_agent.v2.middleware.safety import (
+        build_capability_safety_listener,
+        register_default_safety_listener,
+    )
 
-        disposer = register_default_safety_listener(
-            bus,
-            ctx.service("session"),
-            ctx.service("config"),
-        )
-        if callable(disposer):
+    session = ctx.service("session")
+    config = ctx.service("config")
+    mode = getattr(config, "safety_mode", "wary")
+    if mode in {"wary", "reviewer"}:
+        pair = register_default_safety_listener(bus, session, config)
+        if pair is not None:
+            listener, disposer = pair
+            ctx.set_service("_safety_warning_listener", listener)
             ctx.set_service("_safety_event_disposer", disposer)
-    _register_factory(ctx, "safety_middleware_factory", "register_middleware")
+    elif mode == "hard":
+        listener = build_capability_safety_listener(session, config)
+        if listener is not None:
+            disposer = bus.on(TOOL_EXECUTE, listener)
+            ctx.set_service("_safety_event_disposer", disposer)
 
 
 def _apply_budget(ctx: CapabilityAssemblyContext) -> None:
@@ -618,7 +628,8 @@ def _owned_release(cap_id: str) -> CapabilityHook:
             disposer = ctx.service("_safety_event_disposer")
             if callable(disposer):
                 disposer()
-                ctx.set_service("_safety_event_disposer", None)
+            ctx.set_service("_safety_event_disposer", None)
+            ctx.set_service("_safety_warning_listener", None)
         if cap_id == "taskdoc":
             disposer = ctx.service("taskdoc_event_disposer")
             if callable(disposer):

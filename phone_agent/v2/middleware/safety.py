@@ -48,7 +48,6 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
 
 from phone_agent.config.policy import (
@@ -61,7 +60,7 @@ from phone_agent.v2.middleware._tokens import (
     estimate_context_tokens,
     estimate_message_tokens,
 )
-from phone_agent.v2.events import EventBus, REJECT, TOOL_PRE_EXECUTE
+from phone_agent.v2.events import EventBus, TOOL_EXECUTE
 
 # Deviation (§9.1): policy.py has no sensitive-app table, so launch_app targets
 # are matched against this curated CN+EN keyword set for banking/payment apps
@@ -561,19 +560,19 @@ def _describe_target(name: str, args: dict[str, Any]) -> str:
     return f"({mark})" if mark else ""
 
 
-class SafetyWarningMiddleware(AgentMiddleware):
-    """Warning-flow safety gate (U2 §1): warn-not-execute, confirm-to-act.
+class SafetyWarningListener:
+    """Warning-flow safety listener for ``tool/execute`` (U2 §1).
 
-    In ``wary``/``reviewer`` mode this middleware wraps every tool call. When
-    :func:`classify_tool_call` flags a risky execution call AND the model did not
-    pass ``confirm_irreversible=true``, the call is **short-circuited**: no device
-    action runs, and a warning :class:`ToolMessage` (built by
-    :func:`format_warning`) is returned as the tool result. A non-blocking notice
-    is also printed to stdout (harness-side awareness, no desktop popup). The
-    model resends with ``confirm_irreversible=true`` to actually execute.
+    In ``wary``/``reviewer`` mode this listener is registered on the tool/execute
+    waterfall. When :func:`classify_tool_call` flags a risky execution call AND the
+    model did not pass ``confirm_irreversible=true``, the call is **short-circuited**:
+    no device action runs, and a warning :class:`ToolMessage` (built by
+    :func:`format_warning`) is returned as the tool result. A non-blocking notice is
+    also printed to stdout. The model resends with ``confirm_irreversible=true`` to
+    actually execute.
 
     This never touches ``ask_user``/``take_over`` (control interrupts owned by the
-    HITL middleware) nor non-actuation tools; it is a pure pass-through for them.
+    HITL listener) nor non-actuation tools; it is a pure pass-through for them.
     """
 
     def __init__(
@@ -583,15 +582,14 @@ class SafetyWarningMiddleware(AgentMiddleware):
         *,
         reviewer: Callable[[str, str], bool] | None = None,
         notify: Callable[[str], None] | None = None,
-        event_bus: EventBus | None = None,
     ) -> None:
-        super().__init__()
         self.session = session
         self.config = config
         self._reviewer = reviewer
         self._notify = notify if notify is not None else _default_notify
-        self._event_bus = event_bus
         self.warning_count = 0
+        # Backward-compat attribute: the warning listener does not HITL-interrupt.
+        self.interrupt_on: dict[str, Any] = {}
 
     def _warn_message(self, request: Any) -> ToolMessage | None:
         """Return a warning ToolMessage if the call must be blocked, else ``None``."""
@@ -621,73 +619,15 @@ class SafetyWarningMiddleware(AgentMiddleware):
             status="error",
         )
 
-    def _reject_message(self, request: Any) -> ToolMessage:
-        warning = self._warn_message(request)
-        if warning is not None:
-            return warning
-        name, _args = _extract_call(request)
-        tool_call = getattr(request, "tool_call", {}) or {}
-        call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
-        return ToolMessage(
-            content=f"⚠️ 已拦截（未执行）：{name}\n工具调用被策略事件拒绝。",
-            tool_call_id=str(call_id or ""),
-            name=name,
-            status="error",
-        )
-
-    def wrap_tool_call(self, request, handler):  # noqa: ANN001
-        if self._event_bus is not None:
-            decision = self._event_bus.waterfall(
-                TOOL_PRE_EXECUTE, request, terminal=handler
-            )
-            if decision is REJECT:
-                return self._reject_message(request)
-            return decision
-        warning = self._warn_message(request)
-        if warning is not None:
-            return warning
-        return handler(request)
-
-    async def awrap_tool_call(self, request, handler):  # noqa: ANN001
-        if self._event_bus is not None:
-            decision = self._event_bus.waterfall(
-                TOOL_PRE_EXECUTE, request, terminal=handler
-            )
-            if decision is REJECT:
-                return self._reject_message(request)
-            return decision
-        warning = self._warn_message(request)
-        if warning is not None:
-            return warning
-        return await handler(request)
-
-
-class SafetyPreExecuteListener:
-    """Default ``tool/pre_execute`` listener for the warning safety policy."""
-
-    def __init__(
-        self,
-        session: Any | None,
-        config: Any | None,
-        *,
-        reviewer: Callable[[str, str], bool] | None = None,
-    ) -> None:
-        self.session = session
-        self.config = config
-        self._reviewer = reviewer
-
     def __call__(self, request: Any, next: Callable[[Any], Any]) -> Any:
-        name, args = _extract_call(request)
-        if name not in ACTUATION_GATED_TOOLS:
-            return next(request)
-        if _confirmed_irreversible(args):
-            return next(request)
-        verdict = classify_tool_call(
-            request, self.session, self.config, reviewer=self._reviewer
-        )
-        if verdict.should_gate:
-            return REJECT
+        warning = self._warn_message(request)
+        if warning is not None:
+            return warning
         return next(request)
+
+
+class SafetyPreExecuteListener(SafetyWarningListener):
+    """Default ``tool/execute`` listener for the warning safety policy."""
 
 
 def _default_notify(message: str) -> None:
@@ -696,17 +636,14 @@ def _default_notify(message: str) -> None:
     print(message, flush=True)
 
 
-def build_safety_warning_middleware(
+def build_safety_warning_listener(
     session: Any | None = None,
     config: Any | None = None,
-    *,
-    event_bus: EventBus | None = None,
-) -> SafetyWarningMiddleware | None:
-    """Build the warning middleware for ``wary``/``reviewer`` mode, else ``None``.
+) -> SafetyWarningListener | None:
+    """Build the warning listener for ``wary``/``reviewer`` mode, else ``None``.
 
-    ``off``/``hard`` mode returns ``None`` (``off`` has no gate; ``hard`` uses the
-    legacy HITL interrupt instead of the warning flow). In ``reviewer`` mode a
-    lazily built second-model reviewer is attached for soft-candidate precision.
+    ``off``/``hard`` mode returns ``None``. In ``reviewer`` mode a lazily built
+    second-model reviewer is attached for soft-candidate precision.
     """
 
     mode = _safety_mode(config)
@@ -715,37 +652,137 @@ def build_safety_warning_middleware(
     reviewer = (
         build_safety_reviewer(config, session=session) if mode == "reviewer" else None
     )
-    return SafetyWarningMiddleware(
-        session, config, reviewer=reviewer, event_bus=event_bus
-    )
+    return SafetyWarningListener(session, config, reviewer=reviewer)
+
+
+class ControlHitlListener:
+    """Tool/execute listener for human-in-the-loop interrupts.
+
+    Replaces the legacy ``HumanInTheLoopMiddleware`` for the v2 thin loop. The
+    listener calls :func:`langgraph.types.interrupt` when a configured tool is
+    invoked, then processes the human decision:
+
+    * ``approve`` -> delegate to ``next`` (execute the tool).
+    * ``reject``  -> return a rejection :class:`ToolMessage`.
+    * ``respond`` -> return the human's message as a :class:`ToolMessage`.
+
+    The listener is registered on the same ``tool/execute`` waterfall as trace,
+    diagnostic and safety; its relative position is determined by registration
+    order.
+    """
+
+    def __init__(
+        self,
+        interrupt_on: dict[str, Any] | None = None,
+    ) -> None:
+        self.interrupt_on = interrupt_on or {
+            "ask_user": {"allowed_decisions": ["respond"]},
+            "take_over": {"allowed_decisions": ["approve", "reject"]},
+        }
+
+    @staticmethod
+    def _tool_call_id(request: Any) -> str:
+        tool_call = getattr(request, "tool_call", None) or {}
+        if isinstance(tool_call, dict):
+            return str(tool_call.get("id") or "")
+        return str(getattr(tool_call, "id", "") or "")
+
+    def __call__(self, request: Any, next: Callable[[Any], Any]) -> Any:
+        from langchain.agents.middleware.human_in_the_loop import (
+            ActionRequest,
+            HITLRequest,
+            ReviewConfig,
+        )
+        from langgraph.types import interrupt
+
+        name, args = _extract_call(request)
+        if name not in self.interrupt_on:
+            return next(request)
+        config = self.interrupt_on[name]
+        when = config.get("when")
+        if when is not None and not when(request):
+            return next(request)
+
+        description = config.get("description")
+        if callable(description):
+            description = description(request)
+        elif description is None:
+            description = f"Tool execution requires approval\n\nTool: {name}\nArgs: {args}"
+
+        action_request = ActionRequest(
+            name=name,
+            args=args,
+            description=description,
+        )
+        review_config = ReviewConfig(
+            action_name=name,
+            allowed_decisions=config["allowed_decisions"],
+        )
+        hitl_request = HITLRequest(
+            action_requests=[action_request],
+            review_configs=[review_config],
+        )
+
+        resume_payload = interrupt(hitl_request)
+        decisions = resume_payload.get("decisions", [])
+        if not decisions:
+            raise ValueError("HITL interrupt returned no decisions")
+        decision = decisions[0]
+        decision_type = decision.get("type")
+        allowed = config["allowed_decisions"]
+        call_id = self._tool_call_id(request)
+
+        if decision_type == "approve" and "approve" in allowed:
+            return next(request)
+        if decision_type == "respond" and "respond" in allowed:
+            return ToolMessage(
+                content=str(decision.get("message", "")),
+                tool_call_id=call_id,
+                name=name,
+                status="success",
+            )
+        if decision_type == "reject" and "reject" in allowed:
+            reason = decision.get("message")
+            if reason:
+                content = (
+                    f"User rejected the tool call for `{name}` with reason: {reason}"
+                )
+            else:
+                content = (
+                    f"User rejected the tool call for `{name}` with id "
+                    f"{call_id}. The tool was not executed. Do not retry this tool "
+                    "call unless the user explicitly requests it."
+                )
+            return ToolMessage(
+                content=content,
+                tool_call_id=call_id,
+                name=name,
+                status="error",
+            )
+        raise ValueError(
+            f"Unexpected human decision: {decision}. "
+            f"Decision type '{decision_type}' is not allowed for tool '{name}'. "
+            f"Expected one of {allowed}."
+        )
 
 
 def build_hitl_middleware(session: Any | None = None, config: Any | None = None):
-    """Build the ``HumanInTheLoopMiddleware`` for v2 control + legacy hard mode.
+    """Build a HITL listener for v2 control + legacy hard mode.
 
-    Two responsibilities, split by safety mode (U2 §5):
+    Backward-compat factory: returns a :class:`ControlHitlListener` with the same
+    ``interrupt_on`` shape the old ``HumanInTheLoopMiddleware`` exposed, so tests
+    and external callers can still inspect ``listener.interrupt_on``.
 
-    * ``ask_user`` / ``take_over`` **always** interrupt, in every mode — these are
-      control interrupts (the human answers / takes over), never softened.
-    * Actuation tools (``tap``/``long_press``/``type_text``/``launch_app``)
-      interrupt for ``approve``/``reject`` **only in ``hard`` mode** (the legacy
-      unattended-run HITL). In ``wary``/``reviewer``/``off`` mode they carry no
-      ``when`` predicate here — the warning flow (:class:`SafetyWarningMiddleware`)
-      owns risk handling for those modes instead.
-
-    ``config`` is optional for backward compatibility: ``build_hitl_middleware()``
-    and ``build_hitl_middleware(session)`` resolve to the default ``wary`` mode
-    (actuation tools not interrupted here; only ask_user/take_over).
+    * ``ask_user`` / ``take_over`` always interrupt.
+    * Actuation tools interrupt for ``approve``/``reject`` only in ``hard`` mode.
     """
-    from langchain.agents.middleware import HumanInTheLoopMiddleware
 
     mode = _safety_mode(config)
     interrupt_on: dict[str, Any] = {}
 
     if mode == "hard":
-        reviewer = None  # hard mode keeps the classic hard-signal gate, no reviewer
         def _gate(req: Any) -> bool:
-            return classify_tool_call(req, session, config, reviewer=reviewer).should_gate
+            return classify_tool_call(req, session, config, reviewer=None).should_gate
 
         for tool in ACTUATION_GATED_TOOLS:
             interrupt_on[tool] = {
@@ -756,38 +793,56 @@ def build_hitl_middleware(session: Any | None = None, config: Any | None = None)
     interrupt_on["ask_user"] = {"allowed_decisions": ["respond"]}
     interrupt_on["take_over"] = {"allowed_decisions": ["approve", "reject"]}
 
-    return HumanInTheLoopMiddleware(interrupt_on=interrupt_on)
+    return ControlHitlListener(interrupt_on=interrupt_on)
 
 
 def build_control_hitl_middleware():
-    """Build the mode-independent ask_user/take_over interrupt layer."""
+    """Build the mode-independent ask_user/take_over interrupt listener."""
 
-    from langchain.agents.middleware import HumanInTheLoopMiddleware
-
-    return HumanInTheLoopMiddleware(
-        interrupt_on={
-            "ask_user": {"allowed_decisions": ["respond"]},
-            "take_over": {"allowed_decisions": ["approve", "reject"]},
-        }
-    )
+    return ControlHitlListener()
 
 
-def build_capability_safety_middleware(
+def build_safety_hard_hitl_listener(
     session: Any | None = None,
     config: Any | None = None,
-    *,
-    event_bus: EventBus | None = None,
-):
-    """Build the mode-specific safety product mounted by the safety cap.
+) -> ControlHitlListener | None:
+    """Build the hard-mode actuation HITL listener registered by the safety cap.
 
-    Hard mode returns the legacy combined HITL layer so it can replace the core
-    control-only slot without changing the observable middleware sequence.
+    Unlike :func:`build_hitl_middleware`, this listener does **not** include
+    ``ask_user``/``take_over``; those are handled by the core control listener.
+    """
+
+    mode = _safety_mode(config)
+    if mode != "hard":
+        return None
+
+    def _gate(req: Any) -> bool:
+        return classify_tool_call(req, session, config, reviewer=None).should_gate
+
+    interrupt_on: dict[str, Any] = {}
+    for tool in ACTUATION_GATED_TOOLS:
+        interrupt_on[tool] = {
+            "when": _gate,
+            "allowed_decisions": ["approve", "reject"],
+        }
+    return ControlHitlListener(interrupt_on=interrupt_on)
+
+
+def build_capability_safety_listener(
+    session: Any | None = None,
+    config: Any | None = None,
+):
+    """Build the mode-specific safety listener mounted by the safety cap.
+
+    * ``wary``/``reviewer`` -> warning listener.
+    * ``hard`` -> actuation HITL listener.
+    * ``off`` -> ``None``.
     """
 
     mode = _safety_mode(config)
     if mode == "hard":
-        return build_hitl_middleware(session, config)
-    return build_safety_warning_middleware(session, config, event_bus=event_bus)
+        return build_safety_hard_hitl_listener(session, config)
+    return build_safety_warning_listener(session, config)
 
 
 def register_default_safety_listener(
@@ -795,7 +850,11 @@ def register_default_safety_listener(
     session: Any | None = None,
     config: Any | None = None,
 ):
-    """Register the default warning-flow safety listener on ``event_bus``."""
+    """Register the default warning-flow safety listener on ``event_bus``.
+
+    Returns ``(listener, disposer)`` so callers can access ``warning_count`` and
+    release the listener on capability teardown.
+    """
 
     mode = _safety_mode(config)
     if mode not in {"wary", "reviewer"}:
@@ -804,7 +863,8 @@ def register_default_safety_listener(
         build_safety_reviewer(config, session=session) if mode == "reviewer" else None
     )
     listener = SafetyPreExecuteListener(session, config, reviewer=reviewer)
-    return event_bus.on(TOOL_PRE_EXECUTE, listener)
+    disposer = event_bus.on(TOOL_EXECUTE, listener)
+    return listener, disposer
 
 
 __all__ = [
@@ -814,11 +874,13 @@ __all__ = [
     "build_safety_reviewer",
     "build_hitl_middleware",
     "build_control_hitl_middleware",
-    "build_capability_safety_middleware",
+    "build_capability_safety_listener",
+    "build_safety_hard_hitl_listener",
+    "build_safety_warning_listener",
     "register_default_safety_listener",
-    "SafetyWarningMiddleware",
+    "ControlHitlListener",
+    "SafetyWarningListener",
     "SafetyPreExecuteListener",
-    "build_safety_warning_middleware",
     "format_warning",
     "SENSITIVE_APP_KEYWORDS",
     "ACTUATION_GATED_TOOLS",

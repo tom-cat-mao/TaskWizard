@@ -37,14 +37,14 @@ Design (``outputs/design-council/ROUND2-D1.md`` §1, extended by A5):
   only by the live-diagnosis skill.
 * Mounted at order 70, outside the safety wrapper at order 90, so
   ``before_model`` observes the post-image-prune + post-TaskDoc context,
-  ``wrap_model_call`` sees the model's own turn, and ``wrap_tool_call`` records
+  ``wrap_model_call`` sees the model's own turn, and ``on_tool_execute`` records
   the result returned by safety — including warning ToolMessages when a flagged
   execution call is short-circuited, not the raw tool execution result.
 
 Emits one JSONL line per event to ``<evidence_dir>/<run_id>.evidence.jsonl``.
 ``hitl_decision`` events are written by the driver layer (the skill's logging
 HITL handler), not here — a HITL interrupt unwinds the graph, so
-``wrap_tool_call`` never sees the human verdict. ``result_class`` (§2 taxonomy)
+``on_tool_execute`` never sees the human verdict. ``result_class`` (§2 taxonomy)
 is likewise computed at analysis time, not written here.
 """
 
@@ -579,7 +579,7 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
             pass
         return response
 
-    # -- wrap_tool_call: tool_invoke + tool_observation --------------------
+    # -- on_tool_execute: tool_invoke + tool_observation -------------------
     def _emit_tool_invoke(self, name: str, args: Any) -> None:
         self._write(
             {
@@ -616,38 +616,21 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
         )
 
     def wrap_tool_call(self, request, handler):  # noqa: ANN001
+        """Pass-through: tool execution is handled by ``on_tool_execute``."""
         if not self.enabled:
             return handler(request)
-        tool_call = getattr(request, "tool_call", {}) or {}
-        name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""
-        args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
-        try:
-            self._emit_tool_invoke(name, args)
-        except Exception:  # noqa: BLE001
-            pass
-        started = time.perf_counter()
-        try:
-            result = handler(request)
-        except Exception as exc:  # noqa: BLE001 - record then re-raise
-            latency_ms = int((time.perf_counter() - started) * 1000)
-            try:
-                self._emit_tool_observation(
-                    name, None, latency_ms, f"{type(exc).__name__}: {exc}"
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            raise
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        try:
-            content = getattr(result, "content", None)
-            self._emit_tool_observation(name, content, latency_ms, None)
-        except Exception:  # noqa: BLE001
-            pass
-        return result
+        return handler(request)
 
     async def awrap_tool_call(self, request, handler):  # noqa: ANN001
         if not self.enabled:
             return await handler(request)
+        return await handler(request)
+
+    def on_tool_execute(self, request, next):  # noqa: ANN001
+        """Onion listener: emits tool_invoke, delegates, then tool_observation."""
+
+        if not self.enabled:
+            return next(request)
         tool_call = getattr(request, "tool_call", {}) or {}
         name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""
         args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
@@ -657,8 +640,8 @@ class DiagnosticEvidenceMiddleware(AgentMiddleware):
             pass
         started = time.perf_counter()
         try:
-            result = await handler(request)
-        except Exception as exc:  # noqa: BLE001
+            result = next(request)
+        except Exception as exc:  # noqa: BLE001 - record then re-raise
             latency_ms = int((time.perf_counter() - started) * 1000)
             try:
                 self._emit_tool_observation(

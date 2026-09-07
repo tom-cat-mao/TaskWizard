@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -17,13 +18,15 @@ from phone_agent.v2.capabilities import (
 from phone_agent.v2.events import (
     RUN_END,
     RUN_START,
+    TOOL_EXECUTE,
     EventBus,
     OBSERVE,
     REJECT,
     validate_event_name,
 )
-from phone_agent.v2.middleware.safety import SafetyWarningMiddleware
+from phone_agent.v2.middleware.safety import SafetyWarningListener
 from phone_agent.v2.middleware.taskdoc import TaskDocInjector
+from phone_agent.v2.middleware.trace import TraceMiddleware
 
 
 def test_event_name_validation() -> None:
@@ -132,17 +135,21 @@ def _req(name: str, args: dict):
     return SimpleNamespace(tool_call={"name": name, "args": args, "id": "call_1"})
 
 
-def test_safety_warning_middleware_uses_event_bus_listener() -> None:
+def test_safety_warning_listener_short_circuits_on_tool_execute() -> None:
     bus = EventBus()
-    mw = SafetyWarningMiddleware(None, _Cfg(), notify=lambda _message: None, event_bus=bus)
-    bus.on("tool/pre_execute", lambda payload, next: REJECT)  # noqa: A002
+    listener = SafetyWarningListener(None, _Cfg(), notify=lambda _message: None)
+    bus.on(TOOL_EXECUTE, listener)
     executed = {"n": 0}
 
     def handler(request):
         executed["n"] += 1
         return ToolMessage(content="executed", tool_call_id="call_1", name="tap")
 
-    result = mw.wrap_tool_call(_req("tap", {"target_description": "确认支付"}), handler)
+    result = bus.waterfall(
+        TOOL_EXECUTE,
+        _req("tap", {"target_description": "确认支付"}),
+        terminal=handler,
+    )
 
     assert executed["n"] == 0
     assert isinstance(result, ToolMessage)
@@ -157,26 +164,104 @@ def test_safety_capability_registers_and_releases_event_listener() -> None:
             "event_bus": bus,
             "session": None,
             "config": _Cfg(),
-            "safety_middleware_factory": lambda: SafetyWarningMiddleware(
-                None, _Cfg(), notify=lambda _message: None, event_bus=bus
-            ),
         }
     )
     registry = build_capability_registry(_Cfg())
 
     assemble_capabilities(registry, ctx)
-    assert bus.waterfall(
-        "tool/pre_execute",
+    result = bus.waterfall(
+        TOOL_EXECUTE,
         _req("tap", {"target_description": "确认支付"}),
         terminal=lambda x: x,
-    ) is REJECT
+    )
+    assert isinstance(result, ToolMessage)
+    assert "confirm_irreversible=true" in result.content
 
     class OffCfg:
         safety_mode = "off"
 
     assemble_capabilities(build_capability_registry(OffCfg()), ctx)
     request = _req("tap", {"target_description": "确认支付"})
-    assert bus.waterfall("tool/pre_execute", request, terminal=lambda x: x) is request
+    assert bus.waterfall(TOOL_EXECUTE, request, terminal=lambda x: x) is request
+
+
+# ---------------------------------------------------------------------------
+# E2: tool/execute listener invariants
+# ---------------------------------------------------------------------------
+
+
+def test_tool_execute_listener_order_is_registration_order_outer_to_inner():
+    """First registered listener is outermost (onion order)."""
+
+    bus = EventBus()
+    order: list[str] = []
+
+    def trace_listener(request, next):  # noqa: A002 - next is the onion contract
+        order.append("trace")
+        return next(request)
+
+    def safety_listener(request, next):  # noqa: A002
+        order.append("safety")
+        return "short-circuited"
+
+    bus.on(TOOL_EXECUTE, trace_listener)
+    bus.on(TOOL_EXECUTE, safety_listener)
+    result = bus.waterfall(TOOL_EXECUTE, {}, terminal=lambda x: "terminal")
+
+    assert order == ["trace", "safety"]
+    assert result == "short-circuited"
+
+
+def test_trace_pairs_rejected_call_with_tool_result(tmp_path) -> None:
+    """A listener returning REJECT is still recorded as a tool_result by trace."""
+
+    bus = EventBus()
+    trace = TraceMiddleware("run-reject", trace_dir=str(tmp_path), enabled=True)
+    bus.on(TOOL_EXECUTE, trace.on_tool_execute)
+    bus.on(TOOL_EXECUTE, lambda request, next: REJECT)  # noqa: A002
+
+    bus.waterfall(TOOL_EXECUTE, _req("tap", {}), terminal=lambda x: x)
+
+    raw = (tmp_path / "run-reject.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in raw.splitlines()]
+    calls = [e for e in events if e["event"] == "tool_call"]
+    results = [e for e in events if e["event"] == "tool_result"]
+    assert len(calls) == 1
+    assert len(results) == 1
+    assert results[0]["tool"] == "tap"
+    assert "已拦截" in str(results[0].get("result") or "")
+
+
+def test_diagnostic_observes_warning_result(tmp_path) -> None:
+    """Diagnostic's tool_observation records a safety warning ToolMessage."""
+
+    from phone_agent.v2.middleware.diagnostic import DiagnosticEvidenceMiddleware
+    from phone_agent.v2.middleware.safety import SafetyWarningListener
+
+    bus = EventBus()
+    trace = TraceMiddleware("run-diag", trace_dir=str(tmp_path), enabled=True)
+    diag = DiagnosticEvidenceMiddleware(
+        "run-diag", evidence_dir=str(tmp_path / "evidence"), enabled=True
+    )
+    safety = SafetyWarningListener(None, _Cfg(), notify=lambda _message: None)
+    bus.on(TOOL_EXECUTE, trace.on_tool_execute)
+    bus.on(TOOL_EXECUTE, diag.on_tool_execute)
+    bus.on(TOOL_EXECUTE, safety)
+
+    result = bus.waterfall(
+        TOOL_EXECUTE,
+        _req("tap", {"target_description": "确认支付"}),
+        terminal=lambda x: x,
+    )
+
+    assert isinstance(result, ToolMessage)
+    raw = (tmp_path / "evidence" / "run-diag.evidence.jsonl").read_text(
+        encoding="utf-8"
+    )
+    events = [json.loads(line) for line in raw.splitlines()]
+    observations = [e for e in events if e["event"] == "tool_observation"]
+    assert observations
+    assert "confirm_irreversible=true" in str(observations[0]["result_text"])
 
 
 # ---------------------------------------------------------------------------
