@@ -28,7 +28,6 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from phone_agent.v2.capabilities import (
     CapabilityAssemblyContext,
-    MiddlewareReplacement,
     PromptBlock,
     assemble_capabilities,
     build_capability_registry,
@@ -425,10 +424,7 @@ class ThinPhoneAgent:
         from phone_agent.v2.usage import UsageLedger
         from phone_agent.v2.middleware.budget import build_budget_middleware
         from phone_agent.v2.middleware.images import ContextPrunerService
-        from phone_agent.v2.middleware.safety import (
-            build_capability_safety_middleware,
-            build_control_hitl_middleware,
-        )
+        from phone_agent.v2.middleware.safety import build_control_hitl_middleware
         from phone_agent.v2.middleware.trace import build_trace_middleware
 
         if checkpointer is None:
@@ -553,18 +549,6 @@ class ThinPhoneAgent:
                 "taskdoc_middleware_factory": taskdoc_middleware_factory,
                 "taskdoc_tool_factory": taskdoc_tool_factory,
                 "taskdoc_run_start": self._taskdoc_run_start,
-                "safety_middleware_factory": lambda: (
-                    MiddlewareReplacement(
-                        build_capability_safety_middleware(
-                            self.session, config, event_bus=self.event_bus
-                        ),
-                        "control_hitl",
-                    )
-                    if getattr(config, "safety_mode", "wary") == "hard"
-                    else build_capability_safety_middleware(
-                        self.session, config, event_bus=self.event_bus
-                    )
-                ),
                 "budget_middleware_factory": budget_middleware_factory,
                 "compact_middleware_factory": compact_middleware_factory,
                 "finish_verify_tool_factory": finish_verify_tool_factory,
@@ -599,15 +583,47 @@ class ThinPhoneAgent:
         for index, tool in enumerate(base_tools):
             self._capability_ctx.register_core_tool(tool, order=index)
 
-        self._capability_ctx.register_core_middleware(
-            build_control_hitl_middleware(),
-            order=0,
-            replace_key="control_hitl",
-        )
+        # Diagnostic evidence stream (live-diagnosis skill). Created before the
+        # tool/execute bridge so its listener can be registered between trace and
+        # control HITL. Default OFF, zero-cost; guarded so a missing module degrades
+        # to a plain thin loop.
+        self._diagnostic = None
+        if getattr(config, "diagnostic_evidence", False):
+            try:
+                from phone_agent.v2.middleware.diagnostic import (
+                    build_diagnostic_middleware,
+                )
+
+                self._diagnostic = build_diagnostic_middleware(
+                    run_id=self.run_id,
+                    evidence_dir=getattr(
+                        config,
+                        "diagnostic_evidence_dir",
+                        "outputs/live-diagnosis/.evidence",
+                    ),
+                    session=self.session,
+                    enabled=True,
+                    unredacted=bool(getattr(config, "diagnostic_unredacted", False)),
+                )
+            except Exception:  # noqa: BLE001 - optional increment; never block bring-up
+                self._diagnostic = None
+        self.evidence_path = getattr(self._diagnostic, "evidence_path", None)
+
         self._capability_ctx.register_core_middleware(
             _ToolExecuteBridgeMiddleware(self.event_bus),
-            order=1,
+            order=0,
         )
+        # Tool/execute listeners are registered in nested order (first = outermost):
+        # trace -> diagnostic -> control HITL. The safety capability adds its
+        # listener last during assembly, making it the innermost onion layer.
+        self.event_bus.on(TOOL_EXECUTE, self._trace.on_tool_execute)
+        if self._diagnostic is not None:
+            self.event_bus.on(TOOL_EXECUTE, self._diagnostic.on_tool_execute)
+            self._capability_ctx.register_core_middleware(
+                self._diagnostic, order=70
+            )
+        self._control_hitl = build_control_hitl_middleware()
+        self.event_bus.on(TOOL_EXECUTE, self._control_hitl)
         self._capability_ctx.register_core_middleware(
             _ModelPreRequestBridgeMiddleware(self.event_bus),
             order=45,
@@ -628,35 +644,6 @@ class ThinPhoneAgent:
         self._capability_ctx.add_core_run_hook(
             "start", self._capability_snapshot_run_start, order=30
         )
-
-        # Diagnostic evidence stream (live-diagnosis skill). Appended LAST so its
-        # before_model sees the post-image-prune + post-TaskDoc context and its
-        # wrap_tool_call is innermost (raw tool return). Default OFF, zero-cost;
-        # guarded like taskdoc so a missing module degrades to a plain thin loop.
-        self._diagnostic = None
-        if getattr(config, "diagnostic_evidence", False):
-            try:
-                from phone_agent.v2.middleware.diagnostic import (
-                    build_diagnostic_middleware,
-                )
-
-                self._diagnostic = build_diagnostic_middleware(
-                    run_id=self.run_id,
-                    evidence_dir=getattr(
-                        config,
-                        "diagnostic_evidence_dir",
-                        "outputs/live-diagnosis/.evidence",
-                    ),
-                    session=self.session,
-                    enabled=True,
-                    unredacted=bool(getattr(config, "diagnostic_unredacted", False)),
-                )
-                self._capability_ctx.register_core_middleware(
-                    self._diagnostic, order=70
-                )
-            except Exception:  # noqa: BLE001 - optional increment; never block bring-up
-                self._diagnostic = None
-        self.evidence_path = getattr(self._diagnostic, "evidence_path", None)
 
         # Optional add-ons may observe the run without coupling the core to a UI
         # or transport. Place them outside the final safety wrapper so a blocked
@@ -681,13 +668,7 @@ class ThinPhoneAgent:
             MODEL_PRE_REQUEST, self._model_call_limiter.on_pre_request
         )
 
-        safety_product = self._owned_capability_product("safety", "middleware")
-        self._safety_warning = (
-            safety_product
-            if safety_product is not None
-            and hasattr(safety_product, "warning_count")
-            else None
-        )
+        self._safety_warning = self._capability_ctx.service("_safety_warning_listener")
 
         from phone_agent.v2.prompts import get_system_prompt
 
