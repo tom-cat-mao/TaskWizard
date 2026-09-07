@@ -632,15 +632,14 @@ def test_injection_gate_matrix(tmp_path):
         auto_procedure.lesson_id: True,
         review_procedure.lesson_id: False,
     }
+    # lesson_injectable 是谓词（procedure 通道用 auto_approved 放行）；
+    # rule 注入通道只选 kind=rule，过程卡不泄漏为单行 rule（WF3 修复）。
     assert {item.lesson_id: lesson_injectable(item) for item in lessons} == expected
 
     selected = select_lessons_for_injection(
         lessons_dir, device_scope="device:serial-1", max_items=10, max_tokens=800
     )
-    assert {item.lesson_id for item in selected} == {
-        approved_rule.lesson_id,
-        auto_procedure.lesson_id,
-    }
+    assert {item.lesson_id for item in selected} == {approved_rule.lesson_id}
 
 
 def test_demote_lands_procedure_in_needs_review_and_rule_in_proposed(tmp_path):

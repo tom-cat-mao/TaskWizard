@@ -789,6 +789,9 @@ def select_lessons_for_injection(
         lesson
         for lesson in lessons
         if lesson_injectable(lesson)
+        # Procedures inject through the procedure card channel only (their own
+        # budget and format); the rule mirror must not leak them as one-liners.
+        and lesson.kind == "rule"
         and lesson.scope["device"] in {None, local_device or None}
         # App and app-version scope cannot be established at run start.
         and lesson.scope["app"] is None

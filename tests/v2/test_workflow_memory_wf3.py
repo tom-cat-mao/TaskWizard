@@ -741,3 +741,35 @@ def test_run_audits_both_injection_points_in_trace_and_episode(tmp_path, monkeyp
         if PROCEDURE_CARD_PREFIX in str(getattr(message, "content", ""))
     )
     assert ids[WEATHER] in str(card.content)
+
+
+def test_rule_injection_channel_excludes_procedure_cards(tmp_path: Path) -> None:
+    """Regression: an auto_approved procedure must not leak into the rule
+    mirror as a one-liner (it has its own channel, budget and format)."""
+    import json
+
+    from phone_agent.v2.evolution import select_lessons_for_injection
+
+    lessons = tmp_path / "lessons"
+    lessons.mkdir()
+    rule = {
+        "lesson_id": "les_" + "1" * 16, "schema_v": 1, "version": 1,
+        "status": "approved", "text": "权限弹窗一律选仅本次",
+        "scope": {"device": None, "app": None, "app_version": None},
+        "evidence": [{"run_id": "r1", "note": "ok"}], "support_count": 1,
+        "task_keys": ["open_app"], "conflicts": [], "created_ts": 1.0,
+        "source": "distill", "kind": "rule",
+    }
+    card = dict(rule) | {
+        "lesson_id": "les_" + "2" * 16, "status": "auto_approved",
+        "text": "美团系下单到结算", "kind": "procedure",
+        "app_scope": "general", "steps": ["搜索", "选店", "结算前停手"],
+        "pitfalls": None,
+    }
+    (lessons / "lessons.json").write_text(
+        json.dumps([rule, card], ensure_ascii=False), encoding="utf-8"
+    )
+    selected = select_lessons_for_injection(
+        str(lessons), device_scope=None, max_items=3, max_tokens=800
+    )
+    assert [item.text for item in selected] == ["权限弹窗一律选仅本次"]
