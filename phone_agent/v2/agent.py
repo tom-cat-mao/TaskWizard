@@ -43,6 +43,61 @@ class RunResult:
     trace_path: str | None = None
 
 
+class _ExperienceService:
+    """Read-only facade over the current run's experience writer (WP-PLUGIN-A).
+
+    The writer is opened at run start and cleared between runs, so the facade
+    resolves it live rather than capturing a stale handle at assembly time.
+    """
+
+    def __init__(self, agent: "ThinPhoneAgent") -> None:
+        self._agent = agent
+
+    @property
+    def writer(self) -> Any:
+        return getattr(self._agent, "_experience_writer", None)
+
+    def load_episodes(self) -> dict[str, Any]:
+        writer = self.writer
+        if writer is None:
+            return {}
+        from phone_agent.v2.experience import load_episodes
+
+        return load_episodes(getattr(writer, "root", "memory/experience"))
+
+
+class _RecallService:
+    """Read-only facade over the approved-lesson selector + run-start recall.
+
+    The agent's recall prompt block consumes this facade instead of closing
+    over private agent internals, so a plugin can replace the recall capability
+    without the prompt path reaching into a specific implementation.
+    """
+
+    def __init__(self, agent: "ThinPhoneAgent") -> None:
+        self._agent = agent
+
+    def lesson_prompt_block(self) -> "PromptBlock | None":
+        return self._agent._render_lesson_prompt_block()
+
+    def selected_lessons(self) -> list[Any]:
+        return list(getattr(self._agent, "_run_injected_lessons", []) or [])
+
+    def shadow_candidates(self) -> list[Any]:
+        return list(getattr(self._agent, "_shadow_candidates", []) or [])
+
+
+class _AppKbService:
+    """Facade over the live App knowledge store owned by the session."""
+
+    def __init__(self, agent: "ThinPhoneAgent") -> None:
+        self._agent = agent
+
+    @property
+    def store(self) -> Any:
+        return getattr(getattr(self._agent, "session", None), "app_store", None)
+
+
 def _marks_digest_lines(marks: Any, max_items: int = 40) -> str:
     """Render ``mark_id | role | text | center`` lines (mirrors session digest).
 
@@ -280,6 +335,12 @@ class ThinPhoneAgent:
                 "recall_run_start": self._recall_run_start,
                 "recall_run_end": self._recall_run_end,
                 "recall_prompt_provider": self._recall_prompt_block,
+                # WP-PLUGIN-A service factories: each capability publishes a
+                # live handle/facade under its ``provides`` key so plugins can
+                # discover it via ``ctx.service(...)`` and release removes it.
+                "experience_service_factory": lambda: _ExperienceService(self),
+                "recall_service_factory": lambda: _RecallService(self),
+                "app_kb_service_factory": lambda: _AppKbService(self),
             }
         )
 
@@ -461,6 +522,15 @@ class ThinPhoneAgent:
         return PromptBlock("\n".join(lines), placement="system_message")
 
     def _recall_prompt_block(self) -> PromptBlock | None:
+        # Consume the recall capability through its published service handle
+        # rather than reaching into private agent state (WP-PLUGIN-A). When the
+        # recall capability is off/replaced the service is absent, so fall back
+        # to the local renderer (which returns nothing without injection).
+        ctx = getattr(self, "_capability_ctx", None)
+        service = ctx.service("recall") if ctx is not None else None
+        getter = getattr(service, "lesson_prompt_block", None)
+        if callable(getter):
+            return getter()
         return self._render_lesson_prompt_block()
 
     def _app_kb_prompt_block(self) -> PromptBlock | None:

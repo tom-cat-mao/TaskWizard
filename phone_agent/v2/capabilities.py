@@ -22,7 +22,13 @@ CapabilityHook = Callable[..., None]
 PromptProvider = Callable[..., Any]
 RunHook = Callable[..., Any]
 CliHandler = Callable[..., Any]
+# Plugin API compatibility gate shared with the external plugin loader (Phase C).
+# External capabilities declare ``REQUIRES_API`` and are refused at startup when
+# it does not match this integer.  Bumped only on a breaking seam change.
+PLUGIN_API_VERSION = 1
 _CAPABILITY_ID = re.compile(r"^[a-z][a-z0-9_]*$")
+# A ``provides`` service key follows the same grammar as a capability id.
+_SERVICE_NAME = _CAPABILITY_ID
 _RUN_HOOK_WHEN = frozenset({"start", "end"})
 
 # Preserve the pre-WP-C2 middleware ordering while allowing each capability to
@@ -65,6 +71,8 @@ class CapabilityContext(Protocol):
 
     def add_cli_command(self, name: str, handler: CliHandler) -> None: ...
 
+    def register_service(self, name: str, value: Any) -> None: ...
+
 
 @dataclass(frozen=True)
 class PromptBlock:
@@ -88,6 +96,7 @@ class CapabilitySpec:
     deps: tuple[str, ...] = ()
     apply: CapabilityHook | None = None
     release: CapabilityHook | None = None
+    provides: str | None = None
 
     def __post_init__(self) -> None:
         if not _CAPABILITY_ID.fullmatch(self.cap_id):
@@ -99,6 +108,8 @@ class CapabilitySpec:
         for dependency in self.deps:
             if not _CAPABILITY_ID.fullmatch(dependency):
                 raise ValueError(f"invalid dependency id: {dependency!r}")
+        if self.provides is not None and not _SERVICE_NAME.fullmatch(self.provides):
+            raise ValueError(f"invalid provides service key: {self.provides!r}")
         if self.apply is not None and not callable(self.apply):
             raise TypeError("capability apply hook must be callable")
         if self.release is not None and not callable(self.release):
@@ -207,6 +218,10 @@ class CapabilityAssemblyContext:
         self._cli_commands: list[_Mount] = []
         self._mounted: dict[str, tuple[str, CapabilitySpec]] = {}
         self._capability_order: dict[str, int] = {}
+        # Capability-owned services share the harness service namespace but are
+        # tracked by owner so release removes them with zero residue and a
+        # second mounted owner registering the same key fails visibly.
+        self._service_owners: dict[str, str] = {}
 
     @property
     def current_cap_id(self) -> str | None:
@@ -291,6 +306,28 @@ class CapabilityAssemblyContext:
             (clean, handler),
             100 + self._capability_order.get(self._owner(), 0),
         )
+
+    def register_service(self, name: str, value: Any) -> None:
+        """Publish a capability-owned service into the shared namespace.
+
+        The service is read back through :meth:`service` like any harness
+        factory.  Ownership is recorded under the applying ``cap_id`` so
+        :meth:`release_capability` removes it with zero residue.  Two mounted
+        capabilities registering the same key is a fail-visible conflict.
+        """
+
+        owner = self._owner()
+        clean = str(name).strip()
+        if not _SERVICE_NAME.fullmatch(clean):
+            raise ValueError(f"invalid service name: {name!r}")
+        existing_owner = self._service_owners.get(clean)
+        if existing_owner is not None and existing_owner != owner:
+            raise ValueError(
+                f"service {clean!r} already registered by capability "
+                f"{existing_owner!r}"
+            )
+        self._services[clean] = value
+        self._service_owners[clean] = owner
 
     # Core harness products use the same ordered collections, but cannot be
     # released by a capability because their owner is outside the cap_id space.
@@ -395,6 +432,13 @@ class CapabilityAssemblyContext:
         self._cli_commands = [
             item for item in self._cli_commands if item.owner != cap_id
         ]
+        for name in [
+            name
+            for name, owner in self._service_owners.items()
+            if owner == cap_id
+        ]:
+            self._service_owners.pop(name, None)
+            self._services.pop(name, None)
         self._mounted.pop(cap_id, None)
 
 
@@ -431,6 +475,25 @@ def _register_prompt(ctx: CapabilityAssemblyContext, service: str) -> None:
     provider = ctx.service(service)
     if callable(provider):
         ctx.add_prompt_block(provider)
+
+
+def _register_service(
+    ctx: CapabilityAssemblyContext, factory: str, name: str
+) -> None:
+    """Mount one capability-owned service from a harness-supplied factory.
+
+    The factory produces the live handle/facade; a missing factory or a ``None``
+    result leaves the service unregistered (a declared ``provides`` then fails
+    visibly during assembly).
+    """
+
+    build = ctx.service(factory)
+    if not callable(build):
+        return
+    value = build()
+    if value is None:
+        return
+    ctx.register_service(name, value)
 
 
 def _register_cli(ctx: CapabilityAssemblyContext, names: Sequence[str]) -> None:
@@ -488,6 +551,7 @@ def _apply_app_kb(ctx: CapabilityAssemblyContext) -> None:
     _register_service_hook(ctx, "start", "app_kb_run_start")
     _register_prompt(ctx, "app_kb_prompt_provider")
     _register_cli(ctx, ("learn_alias", "forget_alias"))
+    _register_service(ctx, "app_kb_service_factory", "app_kb")
 
 
 def _apply_dream(ctx: CapabilityAssemblyContext) -> None:
@@ -498,11 +562,13 @@ def _apply_dream(ctx: CapabilityAssemblyContext) -> None:
 def _apply_experience(ctx: CapabilityAssemblyContext) -> None:
     _register_service_hook(ctx, "start", "experience_run_start")
     _register_service_hook(ctx, "end", "experience_run_end")
+    _register_service(ctx, "experience_service_factory", "experience")
 
 
 def _apply_recall(ctx: CapabilityAssemblyContext) -> None:
     _register_service_hook(ctx, "start", "recall_run_start")
     _register_service_hook(ctx, "end", "recall_run_end")
+    _register_service(ctx, "recall_service_factory", "recall")
     _register_prompt(ctx, "recall_prompt_provider")
     _register_cli(
         ctx,
@@ -581,6 +647,15 @@ def assemble_capabilities(
             with ctx.applying(spec.cap_id):
                 if active_spec.apply is not None:
                     active_spec.apply(ctx)
+                # A declared service must actually be mounted by this capability
+                # so a "declared but never wired" seam fails loudly, not silently.
+                if active_spec.provides is not None and (
+                    ctx._service_owners.get(active_spec.provides) != spec.cap_id
+                ):
+                    raise ValueError(
+                        f"capability {spec.cap_id!r} declares provides="
+                        f"{active_spec.provides!r} but registered no such service"
+                    )
         except Exception:
             ctx.release_capability(spec.cap_id)
             raise
@@ -671,6 +746,7 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
 
 
 __all__ = [
+    "PLUGIN_API_VERSION",
     "CapabilityAssemblyContext",
     "CapabilityContext",
     "CapabilityRegistry",
