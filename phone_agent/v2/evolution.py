@@ -821,6 +821,9 @@ def _build_distill_messages(
             "scope 的 device/app 只能逐字选自输入，app_version 必须为 null。"
             "evidence 只能引用输入 run_id；support_count 必须等于去重 evidence 数；"
             "task_keys 只能选输入 task_key。没有足够证据支撑的规则时输出 []。"
+            "候选的 evidence 必须锚定失败：要么同时引用失败与成功 run 且至少一次失败早于成功"
+            "（先踩坑后绕开），要么引用 ≥2 次同一失败原因且失败过程相似（可复现的坑）；"
+            "仅引用成功 run 的候选会被丢弃。"
         )
     )
     human = HumanMessage(
@@ -863,8 +866,23 @@ def _strict_json_loads(text: str) -> Any:
     )
 
 
+def _effective_tool_prefix(
+    ledger: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    """Return the first three effective tool names, excluding wait/read_screen."""
+
+    filtered = [
+        str(entry.get("tool", "unknown"))
+        for entry in ledger
+        if str(entry.get("tool", "unknown")) not in {"wait", "read_screen"}
+    ]
+    return tuple(filtered[:3])
+
+
 def _has_distill_evidence(
-    candidate: LessonCandidate, group: Sequence[Mapping[str, Any]]
+    candidate: LessonCandidate,
+    group: Sequence[Mapping[str, Any]],
+    tool_prefixes: Mapping[str, Sequence[str]],
 ) -> bool:
     """Require the candidate's own citations to prove a supported pattern."""
 
@@ -876,12 +894,19 @@ def _has_distill_evidence(
         return min(float(item.get("ts_end", 0.0)) for item in failures) < max(
             float(item.get("ts_end", 0.0)) for item in successes
         )
-    failure_reasons = Counter(_single_line(item.get("reason")) for item in failures)
-    return any(reason and count >= 2 for reason, count in failure_reasons.items())
+    failure_signatures: Counter[tuple[str, tuple[str, ...]]] = Counter()
+    for item in failures:
+        reason = _single_line(item.get("reason"))
+        prefix = tuple(tool_prefixes.get(str(item["run_id"]), ()))
+        if reason and prefix:
+            failure_signatures[(reason, prefix)] += 1
+    return any(count >= 2 for count in failure_signatures.values())
 
 
 def _validate_model_candidates(
-    response: Any, group: Sequence[Mapping[str, Any]]
+    response: Any,
+    group: Sequence[Mapping[str, Any]],
+    ledgers: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> list[LessonCandidate]:
     payload = _strict_json_loads(_response_text(response))
     if not isinstance(payload, list):
@@ -890,48 +915,55 @@ def _validate_model_candidates(
     episode_by_id = {str(item["run_id"]): item for item in group}
     allowed_tasks = {_task_key(item) for item in group}
     scope_values = _scope_values(group)
+    tool_prefixes = {
+        run_id: _effective_tool_prefix(entries)
+        for run_id, entries in ledgers.items()
+    }
     candidates: list[LessonCandidate] = []
     for raw in payload:
-        candidate = LessonCandidate.from_dict(raw)
-        if candidate.status != "proposed" or candidate.version != 1:
-            raise ValueError("distilled lessons must be proposed version 1")
-        evidence_ids = {item["run_id"] for item in candidate.evidence}
-        if not evidence_ids or not evidence_ids <= allowed_runs:
-            raise ValueError("candidate evidence must reference this group")
-        if not _has_distill_evidence(candidate, group):
-            raise ValueError("candidate citations do not prove an eligible pattern")
-        cited = [item for item in group if str(item["run_id"]) in evidence_ids]
-        cited_tasks = {_task_key(item) for item in cited}
-        if not set(candidate.task_keys) <= allowed_tasks:
-            raise ValueError("candidate task_keys must come from this group")
-        if not set(candidate.task_keys) <= cited_tasks:
-            raise ValueError("candidate task_keys must be supported by its evidence")
-        if candidate.scope["device"] not in {None, *scope_values["devices"]}:
-            raise ValueError("candidate device scope was not observed")
-        if candidate.scope["app"] not in {None, *scope_values["apps"]}:
-            raise ValueError("candidate app scope was not observed")
-        if candidate.scope["app_version"] is not None:
-            raise ValueError("episode schema contains no app_version evidence")
-        canonical_evidence = []
-        for item in candidate.evidence:
-            episode = episode_by_id[item["run_id"]]
-            outcome = "success" if bool(episode.get("success")) else "failure"
-            reason = _single_line(episode.get("reason"))[:120]
-            canonical_evidence.append(
-                {
-                    "run_id": item["run_id"],
-                    "note": f"{outcome}:{reason}" if reason else outcome,
-                }
+        try:
+            candidate = LessonCandidate.from_dict(raw)
+            if candidate.status != "proposed" or candidate.version != 1:
+                continue
+            evidence_ids = {item["run_id"] for item in candidate.evidence}
+            if not evidence_ids or not evidence_ids <= allowed_runs:
+                continue
+            if not _has_distill_evidence(candidate, group, tool_prefixes):
+                continue
+            cited = [item for item in group if str(item["run_id"]) in evidence_ids]
+            cited_tasks = {_task_key(item) for item in cited}
+            if not set(candidate.task_keys) <= allowed_tasks:
+                continue
+            if not set(candidate.task_keys) <= cited_tasks:
+                continue
+            if candidate.scope["device"] not in {None, *scope_values["devices"]}:
+                continue
+            if candidate.scope["app"] not in {None, *scope_values["apps"]}:
+                continue
+            if candidate.scope["app_version"] is not None:
+                continue
+            canonical_evidence = []
+            for item in candidate.evidence:
+                episode = episode_by_id[item["run_id"]]
+                outcome = "success" if bool(episode.get("success")) else "failure"
+                reason = _single_line(episode.get("reason"))[:120]
+                canonical_evidence.append(
+                    {
+                        "run_id": item["run_id"],
+                        "note": f"{outcome}:{reason}" if reason else outcome,
+                    }
+                )
+            candidate = replace(
+                candidate,
+                lesson_id=make_lesson_id(candidate.text, candidate.scope),
+                evidence=sorted(canonical_evidence, key=lambda item: item["run_id"]),
+                task_keys=sorted(candidate.task_keys),
+                conflicts=sorted(candidate.conflicts),
+                created_ts=time.time(),
             )
-        candidate = replace(
-            candidate,
-            lesson_id=make_lesson_id(candidate.text, candidate.scope),
-            evidence=sorted(canonical_evidence, key=lambda item: item["run_id"]),
-            task_keys=sorted(candidate.task_keys),
-            conflicts=sorted(candidate.conflicts),
-            created_ts=time.time(),
-        )
-        candidates.append(candidate)
+            candidates.append(candidate)
+        except (TypeError, ValueError):
+            continue
     return candidates
 
 
@@ -987,6 +1019,7 @@ def _distill_batch(
     ledger: UsageLedger,
     store: LessonStore,
     token_budget: int | None,
+    ledgers: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> tuple[int, list[LessonCandidate]]:
     """Run one batch through the model and persist whatever it supports."""
 
@@ -1003,11 +1036,11 @@ def _distill_batch(
     if token_budget is not None and ledger.total > token_budget:
         return 1, []
     try:
-        candidates = _validate_model_candidates(response, batch)
+        candidates = _validate_model_candidates(response, batch, ledgers)
     except (TypeError, ValueError, json.JSONDecodeError):
         return 1, []
     if not candidates:
-        return 1, []
+        return 0, []
     proposed: list[LessonCandidate] = []
     for candidate in candidates:
         evaluation = evaluate_promotion(
@@ -1078,6 +1111,7 @@ def distill_lessons(
                     ledger=active_ledger,
                     store=store,
                     token_budget=token_budget,
+                    ledgers=ledgers,
                 )
     finally:
         _write_distill_watermark(
