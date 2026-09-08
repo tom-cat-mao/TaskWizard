@@ -382,7 +382,7 @@ class ProcedureCardInjector:
                 card_block = block
         rules: tuple[tuple[str, str], ...] = ()
         if with_rules:
-            rules = tuple(self._select_app_rules(package))
+            rules = tuple(self._select_app_rules(package, goal))
         if card_block is None and not rules:
             return None
         return _Delivery(
@@ -393,7 +393,7 @@ class ProcedureCardInjector:
             rules=rules,
         )
 
-    def _select_app_rules(self, package: str) -> list[tuple[str, str]]:
+    def _select_app_rules(self, package: str, goal: str) -> list[tuple[str, str]]:
         """Read-only app-rule snapshot rendered as one-liners (fail-open)."""
 
         try:
@@ -403,6 +403,7 @@ class ProcedureCardInjector:
                 getattr(self.config, "lessons_dir", "memory/lessons"),
                 app_package=package,
                 device_scope=self._device_id(),
+                goal_text=goal or None,
             )
         except Exception:  # noqa: BLE001 - app-rule delivery is fail-open
             return []

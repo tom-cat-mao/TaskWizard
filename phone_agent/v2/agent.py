@@ -913,7 +913,9 @@ class ThinPhoneAgent:
         suffix = str(getattr(self, "_app_kb_prompt_suffix", ""))
         return PromptBlock(suffix, placement="system_suffix") if suffix else None
 
-    def _prepare_lesson_injection(self, device_scope: str) -> None:
+    def _prepare_lesson_injection(
+        self, device_scope: str, goal_text: str = ""
+    ) -> None:
         """Freeze one approved-only L0 lesson snapshot for this run."""
 
         self._run_injected_lessons: list[Any] = []
@@ -927,6 +929,7 @@ class ThinPhoneAgent:
                 device_scope=device_scope,
                 max_items=getattr(self.config, "lesson_inject_max", 3),
                 max_tokens=getattr(self.config, "lesson_inject_tokens", 800),
+                goal_text=goal_text or None,
             )
             revoked = set(getattr(self, "_revoked_lesson_ids", set()))
             self._run_injected_lessons = [
@@ -1086,7 +1089,9 @@ class ThinPhoneAgent:
             and getattr(self.config, "memory_rag", "off") == "on"
         ):
             state["device_scope"] = self._experience_device_scope()
-        self._prepare_lesson_injection(str(state["device_scope"]))
+        self._prepare_lesson_injection(
+            str(state["device_scope"]), goal_text=str(state.get("task", ""))
+        )
         self._prepare_procedure_injection(str(state["task"]))
 
     def _recall_run_end(self, state: dict[str, Any]) -> None:
@@ -1535,7 +1540,9 @@ class ThinPhoneAgent:
                 or getattr(self.config, "memory_rag", "off") == "on"
             ):
                 run_state["device_scope"] = self._experience_device_scope()
-            self._prepare_lesson_injection(str(run_state["device_scope"]))
+            self._prepare_lesson_injection(
+                str(run_state["device_scope"]), goal_text=str(run_state.get("task", ""))
+            )
         device_scope = str(run_state["device_scope"])
         self._emit_run_event(RUN_START, run_state)
         # Reset per-run one-shot flags so a reused agent behaves like a fresh run
