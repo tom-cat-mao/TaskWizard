@@ -184,7 +184,9 @@ def test_app_launched_event_is_registerable_and_carries_package_payload():
     session._launched_this_run = set()
 
     assert session.emit_app_launched(WECHAT) is True
-    assert seen == [{"package": WECHAT, "device_id": "serial-1"}]
+    assert seen == [
+        {"package": WECHAT, "device_id": "serial-1", "source": "launch_app"}
+    ]
     # One event per package per run: a re-launch of the same app is silent.
     assert session.emit_app_launched(WECHAT) is False
     assert session.emit_app_launched(FOOD) is True
@@ -240,7 +242,9 @@ def test_launch_app_success_emits_once_per_package(tmp_path):
     assert _text(first).startswith(f"OK. launched wechat ({WECHAT})")
     # The device launched twice, but the event fires once per package per run.
     assert len(session.launched_apps) == 2
-    assert seen == [{"package": WECHAT, "device_id": "serial-1"}]
+    assert seen == [
+        {"package": WECHAT, "device_id": "serial-1", "source": "launch_app"}
+    ]
     assert _text(failed).startswith("unknown app")
     assert len(seen) == 1
 
