@@ -47,6 +47,8 @@ App 名解析默认 `PHONE_AGENT_RESOLVER_DECISION_MODE=typed`：lexical / pinyi
 `PHONE_AGENT_ALIAS_OVERWRITE=on|off` 控制 dream 的错误别名覆盖（默认 `on`）；`PHONE_AGENT_ALIAS_OVERWRITE_NOTES` 是逗号分隔的明确自述词表，默认 `开错,不对,不是,错了,wrong app`。事件只保存命中的词，不保存完整模型 note。
 `PHONE_AGENT_DELIVERABLE=on|off` 控制 `deliverable` 能力（默认 `on`）；开启后模型可把文档成果写入 `PHONE_AGENT_DELIVERABLE_DIR/<run_id>.html`（默认 `outputs/deliverables`），只能创建或全量更新本 run 的 UTF-8 单页 HTML，大小上限 256 KiB。成功路径会进入 episode 的可选 `deliverable_path` 字段，生产 trace 只记录 HTML 字节数，不记录正文。
 
+**模型提供方插件（models.json）**：默认零配置——所有角色都走 `.env` 里的 `PHONE_AGENT_MODEL` 网关，行为与旧版逐字段一致。需要多提供方/多模型时放一个 `models.json`（项目级 `.taskwizard.models.json` 或用户级 `~/.taskwizard/models.json`，`PHONE_AGENT_MODELS_FILE` 可显式指定，pi 风格两层合并）：声明 `providers`（`api: openai-completions | anthropic-messages | google-generative-ai`、`baseUrl`、`apiKey: "$ENV_VAR"`、每模型 `contextWindow/maxTokens/samplingParams/thinkingLevelMap`），之后角色环境变量（`PHONE_AGENT_MODEL`、`PHONE_AGENT_MEMORY_MODEL`、`PHONE_AGENT_VERIFIER_MODEL`、`PHONE_AGENT_SAFETY_REVIEWER_MODEL`；distill 沿用 memory 回落链）都可以写成 `provider:model` 把某个角色路由到第二模型，例如让 actor 留在本地网关、让 memory/verifier 走 `claude:claude-sonnet-4-5`。`PHONE_AGENT_THINKING=off|minimal|low|medium|high` 按模型声明的 `thinkingLevelMap` 翻译为各家思考配置，不支持的静默省略。`--list-models` 打印当前生效的提供方注册表。第三方插件也可以在装配期注册自己的 provider。未识别的 model 名落到默认 gateway 合成条目；未识别的 provider 快速失败并给出可见错误。
+
 ```bash
 .venv/bin/python main_v2.py "打开设置进入 WLAN" --device-id <serial>
 .venv/bin/python main_v2.py "在飞猪查询 10 月 2 日上海飞桃仙的最低价机票" --max-steps 40
@@ -55,6 +57,7 @@ App 名解析默认 `PHONE_AGENT_RESOLVER_DECISION_MODE=typed`：lexical / pinyi
 .venv/bin/python main_v2.py --learn-alias "小红书=com.xingin.xhs"  # 写入最高信任 user 别名
 .venv/bin/python main_v2.py --forget-alias "小红书"                # 删除该名称的 user/learned 别名
 .venv/bin/python main_v2.py --rebuild-vec  # 从 episode/App-KB 全量重建语义索引
+.venv/bin/python main_v2.py --list-models  # 打印生效的模型提供方注册表
 .venv/bin/python main_v2.py --distill     # 离线蒸馏，自判分级落 auto_approved / needs_review
 .venv/bin/python main_v2.py --review-lessons
 .venv/bin/python main_v2.py --approve-lesson <lesson-id>

@@ -24,6 +24,8 @@
 | 观测加固 | FLAG_SECURE 黑屏检测、观测静置（全局 + 按动作可选 settle_ms） |
 | 控制台 | 步骤时间线、钉帧回看、任务板/应用库/记忆/产出页、软停止、每轮配置覆盖 |
 | 实机诊断 | 诊断 skill：证据流 + 截图落盘 + 逐步回放 HTML 报告 + 源码归因 + 录屏；解析路/召回对照/别名生命周期维度 |
+| 模型提供方插件 | models.json 两层注册表（项目/用户/`PHONE_AGENT_MODELS_FILE`），`openai-completions`/`anthropic-messages`/`google-generative-ai` 三种 API 构建器；五角色 `provider:model` 路由（actor/memory/verifier/safety_reviewer/distill 回落链不变）；`PHONE_AGENT_THINKING` 按 `thinkingLevelMap` 翻译各家思考配置；`--list-models`；零配置与旧版逐字段一致；第三方插件可注册 provider |
+| 上下文与记忆加固 | model/pre_request 瀑布改为纯全列表变换（桥接器统一铸唯一 RemoveMessage，杜绝监听器 RemoveMessage 吃掉摘要/任务板）；token 计量算工具调用参数 + CJK 感知 + 无 usage 时 input+output 全计；compact 窗口计入 schema/output 预留；蒸馏游标 `(ts_end, run_id)` 失败可重试（3 次放弃留痕）；撤销后同 id 重提自动降格；规则按渲染行成本装箱；过程卡投递前对权威 lesson 视图复检（撤销/版本不一致即抑制）；replay 口径正名（app_grounded_hit_rate、重叠 run 不前视、calibrate 不自动改常数）；任务板结构预算（字段长度上限 + 渲染截断） |
 
 ## 进行中
 
@@ -37,6 +39,6 @@
 | prefix-cache 优化（任务板版本化 + 图片批量折叠） | 评审文档已备，待批准后开工 |
 | marks 可操作性进执行（op=blocked 执行前 fail-closed） | 待窗口分组真机验证后开工 |
 | 产出物进语义索引（攻略可复用召回） | 待产出物积累 |
-| 强弱模型路由 | 按任务复杂度分流，降成本 |
+| 强弱模型路由 | 按任务复杂度分流，降成本。角色级路由已由模型提供方插件交付（每角色 `provider:model`）；按任务复杂度动态分流仍是远期 |
 
 演进原则：先记录、再影子验证、蒸馏自判分级 + 人工 CLI 纠正；注入有上限、可撤销；记忆不旁路安全与验收。
