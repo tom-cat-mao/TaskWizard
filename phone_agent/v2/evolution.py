@@ -66,9 +66,11 @@ LESSON_STATUSES = frozenset(
         "superseded",
     }
 )
-# States a distiller may file a new proposal in.  ``auto_approved`` is reached
-# only by a graded procedure card (WP-WF1) and is the sole proposal state that
-# is injectable without a human decision.
+# States a distiller may file a new candidate in.  A graded candidate of either
+# kind (rule or procedure card) may land in ``auto_approved`` when the grader
+# is confident, and ``needs_review`` is the fail-open state — never injectable
+# without a human decision.  Distillation itself never emits ``proposed``; that
+# state only survives for legacy records and human supersessions.
 _PROPOSAL_STATUSES = frozenset({"proposed", "needs_review", "auto_approved"})
 _APPROVABLE_STATUSES = frozenset({"proposed", "needs_review"})
 _DEMOTABLE_STATUSES = frozenset({"approved", "auto_approved"})
@@ -485,7 +487,10 @@ class LessonStore:
 
         candidate = LessonCandidate.from_dict(candidate.to_dict())
         if candidate.status not in _PROPOSAL_STATUSES:
-            raise ValueError("new lesson candidates must be proposed")
+            raise ValueError(
+                "a new lesson candidate must be filed as proposed,"
+                " needs_review, or auto_approved"
+            )
         with self._lock:
             prior = self._lessons.get(candidate.lesson_id)
             if prior is None:
@@ -573,10 +578,10 @@ class LessonStore:
         """Withdraw an injectable lesson, keeping its version.
 
         This is the evidence-loss counterpart of :meth:`approve`: a lesson whose
-        cited episodes no longer satisfy Rule-of-3 stops being injectable and
-        needs another human approval — including an ``auto_approved`` procedure
-        card, which lands in ``needs_review`` instead of ``proposed``.
-        Revoked lessons are never reinstated.
+        cited episodes left the episode view (archived or folded) stops being
+        injectable and needs another human approval — including an
+        ``auto_approved`` procedure card, which lands in ``needs_review``
+        instead of ``proposed``.  Revoked lessons are never reinstated.
         """
 
         clean_reason = _single_line(reason)
@@ -917,12 +922,14 @@ def emergency_revoke_lesson(
 
 @dataclass(frozen=True)
 class PromotionEvaluation:
-    eligible: bool
+    """Reference facts about a promotion, plus the annotated candidate.
+
+    Nothing here gates anything: the harness only reports objective numbers
+    (``reasons``) so a human reviewer or a dream demotion note can see them.
+    """
+
     candidate: LessonCandidate
     reasons: tuple[str, ...]
-
-    def __bool__(self) -> bool:
-        return self.eligible
 
 
 def _semantic_signature(text: str) -> tuple[int, str]:
@@ -969,12 +976,13 @@ def evaluate_promotion(
     *,
     approved_lessons: Sequence[LessonCandidate] = (),
 ) -> PromotionEvaluation:
-    """Apply Rule-of-3 and conservative same-scope contradiction detection.
+    """Report the Rule-of-3 reference facts and same-scope contradictions.
 
-    This is the **human** gate only (``--approve-lesson`` and dream's
-    evidence-loss demotion).  Distillation never routes through it any more: a
-    batch's status comes from the self-grading call, and the numbers below are
-    reported to that grader through the fact sheet instead of blocking.
+    A pure fact generator, never a gate: distillation routes status through the
+    self-grading call, the human CLI approves unconditionally, and dream only
+    triggers on :func:`evidence_loss_reason`.  Numbers below (support count,
+    task spread, injectable contradictions) reach the grader through the fact
+    sheet and the reviewer through ``reasons``; none of them blocks anything.
     """
 
     reasons = [
@@ -1011,7 +1019,32 @@ def evaluate_promotion(
             reasons.append(f"approved_conflict:{approved.lesson_id}@v{approved.version}")
     reasons = list(dict.fromkeys(reasons))
     evaluated = replace(candidate, conflicts=reasons, status="proposed")
-    return PromotionEvaluation(not reasons, evaluated, tuple(reasons))
+    return PromotionEvaluation(evaluated, tuple(reasons))
+
+
+def evidence_loss_reason(
+    candidate: LessonCandidate,
+    episodes: Sequence[Mapping[str, Any]],
+) -> str | None:
+    """Return the one objective fact dream may act on: lost cited runs.
+
+    Dream's automatic demotion is evidence loss and nothing else — a cited run
+    that left the current episode view because it was archived or folded.  Every
+    other number (support count, task spread, contradictions) is a semantic
+    judgment that belongs to the model grader or the human CLI, so it stays out
+    of the trigger even though it still shows up in the demotion reason text.
+    """
+
+    episode_ids = {
+        str(item.get("run_id"))
+        for item in episodes
+        if item.get("type") == "episode_outcome" and item.get("run_id")
+    }
+    evidence_ids = {item["run_id"] for item in candidate.evidence}
+    verified_support = len(evidence_ids & episode_ids)
+    if verified_support >= candidate.support_count:
+        return None
+    return f"rule:verified_evidence={verified_support}<{candidate.support_count}"
 
 
 def _task_key(episode: Mapping[str, Any]) -> str:
@@ -1957,12 +1990,15 @@ def _distill_batch(
     for candidate in candidates:
         metadata = grading.get(candidate.lesson_id)
         # The verdict is the grader's; there is no harness-evaluated status any
-        # more, only fail-open ``needs_review`` when the grade is unusable.
-        graded = (
-            candidate
-            if metadata is None or metadata["grade"] == candidate.status
-            else replace(candidate, status=metadata["grade"])
-        )
+        # more.  A missing or unusable grade fails open onto ``needs_review``
+        # (which never injects) instead of keeping the distiller's tentative
+        # status, so distillation can never emit ``proposed``.
+        if metadata is None:
+            graded = replace(candidate, status="needs_review")
+        elif metadata["grade"] == candidate.status:
+            graded = candidate
+        else:
+            graded = replace(candidate, status=metadata["grade"])
         prior = store.get(graded.lesson_id)
         saved = store.propose(
             graded,
@@ -2065,17 +2101,11 @@ def build_distill_model(config: Any) -> Any:
     return build_chat_model(active_config)
 
 
-def approve_if_eligible(
-    store: LessonStore,
-    lesson_id: str,
-    episodes: Sequence[Mapping[str, Any]],
-) -> LessonCandidate:
+def approve_lesson(store: LessonStore, lesson_id: str) -> LessonCandidate:
     """Approve one human-selected lesson unconditionally.
 
-    Post-DISTILL-AUTO the human CLI is a correction channel, not a gate:
-    Rule-of-3 lives only in the distill fact sheet, so promotion never
-    hard-blocks on support counts. `episodes` is accepted for signature
-    compatibility and is unused.
+    The human CLI is a correction channel, not a gate: Rule-of-3 lives only in
+    the distill fact sheet, so promotion never hard-blocks on support counts.
     """
 
     candidate = store.get(lesson_id)
@@ -2101,10 +2131,11 @@ __all__ = [
     "LessonStore",
     "OPTIONAL_LESSON_FIELDS",
     "PromotionEvaluation",
-    "approve_if_eligible",
+    "approve_lesson",
     "build_distill_model",
     "distill_lessons",
     "evaluate_promotion",
+    "evidence_loss_reason",
     "lesson_injectable",
     "load_lessons",
     "make_lesson_id",

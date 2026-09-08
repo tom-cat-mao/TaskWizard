@@ -17,7 +17,8 @@ from phone_agent.v2.evolution import (
     LESSON_EVENT_TYPES,
     LessonCandidate,
     LessonStore,
-    approve_if_eligible,
+    approve_lesson,
+    evidence_loss_reason,
     distill_lessons,
     evaluate_promotion,
 )
@@ -481,7 +482,7 @@ def test_distill_prompt_shows_full_goal_and_steps_ledger(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("evidence_count", "task_keys", "conflicts", "eligible"),
+    ("evidence_count", "task_keys", "conflicts", "quiet"),
     [
         (3, ["open_app", "search_flight"], [], True),
         (2, ["open_app", "search_flight"], [], False),
@@ -489,9 +490,7 @@ def test_distill_prompt_shows_full_goal_and_steps_ledger(tmp_path):
         (3, ["open_app", "search_flight"], ["model_conflict"], False),
     ],
 )
-def test_rule_of_three_boundary_matrix(
-    evidence_count, task_keys, conflicts, eligible
-):
+def test_promotion_reference_facts_matrix(evidence_count, task_keys, conflicts, quiet):
     candidate = _candidate(
         evidence_count=evidence_count,
         task_keys=task_keys,
@@ -508,14 +507,36 @@ def test_rule_of_three_boundary_matrix(
         for index in range(evidence_count)
     ]
 
+    # The evaluation is a reference-fact generator, never a gate.
     evaluation = evaluate_promotion(candidate, episodes)
 
-    assert evaluation.eligible is eligible
+    assert bool(evaluation.reasons) is (not quiet)
     assert evaluation.candidate.status == "proposed"
-    assert bool(evaluation.candidate.conflicts) is (not eligible)
+    assert bool(evaluation.candidate.conflicts) is (not quiet)
 
 
-def test_same_scope_opposite_approved_lesson_blocks_promotion():
+def test_evidence_loss_reason_only_fires_on_missing_cited_runs():
+    candidate = _candidate(evidence_count=2)
+    episodes = [
+        _episode(
+            f"run-{index}",
+            success=bool(index),
+            goal="打开应用" if index != 1 else "查询机票",
+            reason="failed" if index == 0 else "finished",
+            ts=index + 1,
+        )
+        for index in range(2)
+    ]
+
+    # Evidence intact: a support count below 3 is not evidence loss.
+    assert evidence_loss_reason(candidate, episodes) is None
+    assert evidence_loss_reason(candidate, episodes[:1]) == (
+        "rule:verified_evidence=1<2"
+    )
+    assert evidence_loss_reason(candidate, []) == "rule:verified_evidence=0<2"
+
+
+def test_same_scope_opposite_approved_lesson_is_reported_as_a_fact():
     candidate = _candidate(text="在示例应用中应该先确认页面稳定再继续")
     approved = replace(
         candidate,
@@ -538,7 +559,7 @@ def test_same_scope_opposite_approved_lesson_blocks_promotion():
         candidate, episodes, approved_lessons=[approved]
     )
 
-    assert not evaluation.eligible
+    # A contradiction is a fact for the reviewer, not a verdict.
     assert evaluation.reasons == ("approved_conflict:les_abcdef123456@v1",)
 
 
@@ -548,7 +569,7 @@ def test_human_approve_and_revoke_write_events(tmp_path):
 
     # Human CLI is a correction channel, not a gate: approval succeeds even
     # with zero supporting episodes (no Rule-of-3 hard block).
-    assert approve_if_eligible(store, candidate.lesson_id, []).status == "approved"
+    assert approve_lesson(store, candidate.lesson_id).status == "approved"
     assert store.revoke(candidate.lesson_id, "人工撤销").status == "revoked"
     raw = store.events_path.read_text(encoding="utf-8")
     assert "lesson_approved" in raw

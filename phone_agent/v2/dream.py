@@ -441,23 +441,26 @@ def reconcile_lessons(
     lessons_dir: str | os.PathLike[str],
     episodes: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Return injectable lessons to review once their evidence stops qualifying.
+    """Return injectable lessons whose cited episodes left the episode view.
 
     ``episodes`` must be the *current* materialized episode view (see
     :func:`phone_agent.v2.experience.load_episodes`), never the raw event log:
     archived and folded episodes are absent from that view, so a lesson whose
     cited runs were folded into an aggregate has lost the evidence that
-    approved it.  Re-running the same gate that blocked promotion keeps
-    approval and withdrawal symmetric.  Only injectable lessons are
-    reconsidered — ``approved`` (any kind) and ``auto_approved`` procedure
-    cards — a revoked lesson stays revoked because there is deliberately no
-    automatic reinstatement path, and a demoted lesson must be approved again
-    by a human before it can be injected.
+    approved it.  That evidence loss is the **only** automatic withdrawal
+    trigger — support counts, task spread and contradictions are semantic
+    judgments that belong to the grading model and the human CLI, so they never
+    demote a lesson on their own and only appear in the demotion reason text.
+    Only injectable lessons are reconsidered — ``approved`` (any kind) and
+    ``auto_approved`` procedure cards — a revoked lesson stays revoked because
+    there is deliberately no automatic reinstatement path, and a demoted lesson
+    must be approved again by a human before it can be injected.
     """
 
     from phone_agent.v2.evolution import (
         LessonStore,
         evaluate_promotion,
+        evidence_loss_reason,
         lesson_injectable,
     )
 
@@ -467,14 +470,14 @@ def reconcile_lessons(
     ]
     demoted: list[dict[str, Any]] = []
     for lesson in approved:
-        evaluation = evaluate_promotion(lesson, episodes, approved_lessons=approved)
-        if evaluation.eligible:
+        if evidence_loss_reason(lesson, episodes) is None:
             continue
-        reasons = list(evaluation.reasons)
+        # The rest of the Rule-of-3 facts ride along as reference text only.
+        reasons = list(evaluate_promotion(lesson, episodes).reasons)
         try:
             store.demote(
                 lesson.lesson_id,
-                "evidence no longer eligible: " + ";".join(reasons),
+                "cited episodes left the episode view: " + ";".join(reasons),
             )
         except (KeyError, ValueError):  # state moved under us; fail open
             continue

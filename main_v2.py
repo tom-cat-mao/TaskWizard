@@ -61,7 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
     maintenance.add_argument(
         "--distill",
         action="store_true",
-        help="distill episode outcomes into proposed lessons (offline)",
+        help=(
+            "distill episode outcomes into lessons graded auto_approved/"
+            " needs_review (offline)"
+        ),
     )
     maintenance.add_argument(
         "--review-lessons",
@@ -71,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     maintenance.add_argument(
         "--approve-lesson",
         metavar="ID",
-        help="approve one Rule-of-3-qualified lesson",
+        help="approve one lesson (human correction channel, never a gate)",
     )
     maintenance.add_argument(
         "--revoke-lesson",
@@ -172,14 +175,9 @@ def _lesson_store(config: V2Config) -> Any:
 
 
 def _approve_lesson(config: V2Config, lesson_id: str) -> dict[str, Any]:
-    from phone_agent.v2.evolution import approve_if_eligible, read_episode_outcomes
+    from phone_agent.v2.evolution import approve_lesson
 
-    candidate = approve_if_eligible(
-        _lesson_store(config),
-        lesson_id,
-        read_episode_outcomes(config.experience_dir),
-    )
-    return candidate.to_dict()
+    return approve_lesson(_lesson_store(config), lesson_id).to_dict()
 
 
 def _review_lessons(config: V2Config) -> dict[str, int]:
@@ -198,17 +196,13 @@ def _review_lessons(config: V2Config) -> dict[str, int]:
         *store.lessons(status="proposed"),
         *store.lessons(status="needs_review"),
     ]:
-        evaluation = evaluate_promotion(
-            candidate,
-            episodes,
-            approved_lessons=store.lessons(status="approved"),
-        )
-        # Print the stored record: Rule-of-3 evaluation rewrites the status to
-        # proposed, which would hide a needs_review procedure card.
+        # Print the stored record: evaluate_promotion rewrites the status,
+        # which would hide a needs_review procedure card.
         print(json.dumps(candidate.to_dict(), ensure_ascii=False, indent=2))
+        evaluation = evaluate_promotion(candidate, episodes)
         if evaluation.reasons:
             print(
-                "rule_of_3: "
+                "fact_reference: "
                 + json.dumps(list(evaluation.reasons), ensure_ascii=False, sort_keys=True)
             )
         grading = metadata.get(candidate.lesson_id)
@@ -226,9 +220,8 @@ def _review_lessons(config: V2Config) -> dict[str, int]:
         verdict = input("[a]pprove / [r]evoke / [s]kip: ").strip().lower()
         reviewed += 1
         if verdict in {"a", "approve"}:
-            if not evaluation.eligible:
-                print("blocked: " + ", ".join(evaluation.reasons), file=sys.stderr)
-                continue
+            # Human correction channel, not a gate: the reference facts above
+            # never block an explicit approval.
             store.approve(candidate.lesson_id)
             approved += 1
         elif verdict in {"r", "revoke"}:
