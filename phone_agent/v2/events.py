@@ -18,11 +18,17 @@ Payload contracts for the plugin events:
     ``marks_failure_code``.
 
 ``APP_LAUNCHED`` / ``"app/launched"``
-    Observed with :meth:`EventBus.emit` after a device-confirmed
-    ``launch_app`` success. Payload is
-    ``{"package": <resolved package name>, "device_id": <device serial>}``.
-    Emitted at most once per package per run; the emission point is fail-open
-    (WP-WF3 procedure-card injection point two listens on it).
+    Observed with :meth:`EventBus.emit` from two sources (WP-WF4-A scheme C):
+    a device-confirmed ``launch_app`` success (``source="launch_app"``), or a
+    committed observation whose foreground package changed to a
+    not-yet-announced package (``source="foreground"``; system packages —
+    shell, permission/installer dialogs, launcher family — never announce).
+    Payload is
+    ``{"package": <resolved package name>, "device_id": <device serial>,
+    "source": <"launch_app" | "foreground">}``.
+    Emitted at most once per package per run (both sources share the dedupe
+    set); the emission point is fail-open (WP-WF3 procedure-card injection
+    point two listens on it).
 
 ``TOOL_PRE_EXECUTE`` / ``"tool/pre_execute"``
     Applied with :meth:`EventBus.waterfall`. Payload is the tool-call object

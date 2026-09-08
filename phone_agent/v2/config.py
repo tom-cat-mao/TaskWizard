@@ -172,6 +172,11 @@ class V2Config:
     # (rather than adds to) observe_settle_ms.
     black_screen_detect: bool = True
     observe_settle_ms: int = 300
+    # WP-WF4-A: additive blocklist for foreground-source ``app/launched``
+    # announcements (comma-separated env). Extends the built-in minimal filter
+    # (shell, permission/installer dialogs, launcher-family packages). The
+    # device-confirmed launch_app path is never filtered.
+    foreground_event_blocked_packages: tuple[str, ...] = ()
     # local App-KB (device labels + persistent aliases). PhoneSession opens the
     # store lazily so disabling it performs no filesystem writes.
     memory_dir: str = "memory"
@@ -418,6 +423,13 @@ class V2Config:
                 == "on"
             ),
             observe_settle_ms=_env_int("PHONE_AGENT_OBSERVE_SETTLE_MS", 300),
+            foreground_event_blocked_packages=tuple(
+                item.strip()
+                for item in _env_str(
+                    "PHONE_AGENT_FOREGROUND_EVENT_BLOCKED_PACKAGES", ""
+                ).split(",")
+                if item.strip()
+            ),
             memory_dir=_env_str("PHONE_AGENT_MEMORY_DIR", "memory"),
             runs_dir=_env_str("PHONE_AGENT_RUNS_DIR", "memory/runs"),
             app_kb_enabled=_env_bool_default_true("PHONE_AGENT_APP_KB", True),
