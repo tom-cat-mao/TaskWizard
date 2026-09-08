@@ -125,7 +125,7 @@ def warned_agent(tmp_path, monkeypatch):
     model = _ScriptedModel(responses=responses)
 
     model_mod = types.ModuleType("phone_agent.v2.model")
-    model_mod.build_chat_model = lambda config: model
+    model_mod.build_chat_model = lambda config, *args, **kwargs: model
     session_mod = types.ModuleType("phone_agent.v2.session")
     session_mod.PhoneSession = lambda config: session
     tools_mod = types.ModuleType("phone_agent.v2.tools")

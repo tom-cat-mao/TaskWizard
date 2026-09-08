@@ -22,7 +22,7 @@ egress to the verifier model.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 from phone_agent.config.policy import DEFAULT_SAFETY_POLICY, SafetyPolicyRegistry
@@ -181,12 +181,9 @@ def _build_verifier_messages(session: Any, config: Any) -> list[Any]:
 def _build_verifier_model(config: Any) -> Any:
     """Build the verifier chat model (``verifier_model`` or the main model)."""
 
-    from phone_agent.v2.model import build_chat_model
+    from phone_agent.v2.model import build_role_model
 
-    model_name = getattr(config, "verifier_model", None)
-    if model_name:
-        config = replace(config, model_name=model_name)
-    return build_chat_model(config)
+    return build_role_model(config, role="verifier")
 
 
 def _content_text(resp: Any) -> str:

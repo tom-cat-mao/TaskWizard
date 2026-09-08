@@ -460,7 +460,20 @@ class ThinPhoneAgent:
         self.session.event_bus = self.event_bus
         self.usage_ledger = UsageLedger()
         self.session.usage_ledger = self.usage_ledger
-        self.model = build_chat_model(config)
+        # S4 provider registry: assembled once here (built-in gateway +
+        # models.json), reused by the actor build below, the ``providers``
+        # capability (ctx service ``provider_registry``), and every auxiliary
+        # role build via the ``_provider_registry`` side channel on config.
+        # Fail-open: an unusable models.json yields None and every role build
+        # degrades to the legacy single-gateway path.
+        from phone_agent.v2.providers import build_provider_registry
+
+        self.provider_registry = build_provider_registry(config)
+        try:
+            config._provider_registry = self.provider_registry
+        except Exception:  # noqa: BLE001 - side channel is best-effort
+            pass
+        self.model = build_chat_model(config, role="actor", registry=self.provider_registry)
         build_base_tools = getattr(tools_module, "build_base_tools", None)
         native_tool_assembly = callable(build_base_tools)
 

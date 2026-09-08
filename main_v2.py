@@ -98,6 +98,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="remove global learned/user aliases for a name",
     )
+    maintenance.add_argument(
+        "--list-models",
+        action="store_true",
+        help="list the provider/model registry (S4) instead of running a phone task",
+    )
     return parser
 
 
@@ -268,7 +273,32 @@ def _maintenance_requested(args: argparse.Namespace) -> bool:
         or args.supersede_lesson
         or getattr(args, "learn_alias", None) is not None
         or getattr(args, "forget_alias", None) is not None
+        or getattr(args, "list_models", False)
     )
+
+
+def _list_models(config: V2Config) -> int:
+    """Print the assembled provider/model registry (S4 debugging aid)."""
+
+    from phone_agent.v2.providers import build_provider_registry
+
+    registry = build_provider_registry(config)
+    if registry is None:
+        print(
+            "error: provider registry unavailable (malformed models.json?)",
+            file=sys.stderr,
+        )
+        return 1
+    for provider_id in registry.list_providers():
+        provider = registry.get(provider_id)
+        marker = "*" if provider_id == registry.default_provider else " "
+        head = f"{marker} {provider_id} ({provider.api})"
+        if provider.base_url:
+            head += f" {provider.base_url}"
+        print(head)
+        for model_id in registry.list_models(provider_id):
+            print(f"    {provider_id}:{model_id}")
+    return 0
 
 
 def _maintenance_command(args: argparse.Namespace) -> str | None:
@@ -569,6 +599,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("task description cannot be combined with a maintenance command")
 
     config = V2Config.from_env(_overrides_from_args(args))
+    if getattr(args, "list_models", False):
+        return _list_models(config)
     command_name = _maintenance_command(args)
     if command_name is not None:
         handler = _build_cli_capability_context(config).cli_commands.get(command_name)

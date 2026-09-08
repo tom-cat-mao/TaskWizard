@@ -2409,11 +2409,9 @@ def distill_lessons(
 def build_distill_model(config: Any) -> Any:
     """Build memory_model when configured, otherwise the main model."""
 
-    from phone_agent.v2.model import build_chat_model
+    from phone_agent.v2.model import build_role_model
 
-    name = getattr(config, "memory_model", None)
-    active_config = replace(config, model_name=name) if name else config
-    return build_chat_model(active_config)
+    return build_role_model(config, role="distill")
 
 
 def approve_lesson(store: LessonStore, lesson_id: str) -> LessonCandidate:
