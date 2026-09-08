@@ -280,6 +280,8 @@ def test_model_pre_request_bridge_no_listener_is_identity() -> None:
 
 
 def test_model_pre_request_bridge_listener_replaces_messages() -> None:
+    from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
     from phone_agent.v2.agent import _ModelPreRequestBridgeMiddleware
 
     bus = EventBus()
@@ -292,9 +294,13 @@ def test_model_pre_request_bridge_listener_replaces_messages() -> None:
 
     result = mw.before_model({"messages": messages}, None)
 
-    assert result == {
-        "messages": [*messages, {"type": "text", "text": "extra"}]
-    }
+    # Full-list contract: the bridge alone mints the single legal LangGraph
+    # update — one REMOVE_ALL sentinel followed by the complete transformed list.
+    assert result is not None
+    update_messages = result["messages"]
+    assert isinstance(update_messages[0], RemoveMessage)
+    assert update_messages[0].id == REMOVE_ALL_MESSAGES
+    assert update_messages[1:] == [*messages, {"type": "text", "text": "extra"}]
 
 
 def test_run_start_event_emitted(tmp_path, monkeypatch) -> None:
@@ -408,17 +414,17 @@ def test_taskdoc_listener_refreshes_one_block_per_call() -> None:
 
     second = bus.waterfall("model/pre_request", first, terminal=lambda x: x)
 
-    # The second call removes the stale copy and appends exactly one fresh block.
-    removals = [m for m in second if isinstance(m, RemoveMessage)]
-    assert len(removals) == 1
-    assert removals[0].id == first_id
-    # After accounting for the removal, only the freshly pinned block remains.
+    # Full-list contract (S1): the listener drops the stale copy by id and
+    # appends exactly one fresh block — no RemoveMessage ever travels in the
+    # waterfall payload (the bridge alone mints the LangGraph removal).
+    assert not any(isinstance(m, RemoveMessage) for m in second)
+    assert all((getattr(m, "id") or "") != first_id for m in second)
     taskdoc_ids = {
         (getattr(m, "id") or "")
         for m in second
         if (getattr(m, "id") or "").startswith("__taskdoc__")
     }
-    assert taskdoc_ids == {first_id, second[-1].id}
+    assert taskdoc_ids == {second[-1].id}
     assert second[-1].id != first_id
 
 

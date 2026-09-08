@@ -24,7 +24,13 @@ from typing import Any, Callable, Mapping
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import hook_config
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from phone_agent.v2.capabilities import (
     CapabilityAssemblyContext,
@@ -188,8 +194,14 @@ def _first_observation_content(
 class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
     """Bridge ``model/pre_request`` event listeners into the middleware stack.
 
-    Listeners registered on the event bus may return a replacement messages
-    list; when no listener changes the payload this middleware is a no-op.
+    The waterfall contract is **full message list in, full message list out**:
+    listeners transform the transcript and never emit ``RemoveMessage``. The
+    bridge mints the single legal LangGraph update — one ``REMOVE_ALL``
+    sentinel followed by the complete transformed list — so ``add_messages``
+    replaces state verbatim with the chain's output. A listener that leaked a
+    ``RemoveMessage`` into the payload would survive ``add_messages``
+    (``right[remove_all_idx + 1:]`` is taken verbatim, no further removals are
+    resolved) and kill the next model call at the wire converter.
     """
 
     def __init__(self, event_bus: EventBus) -> None:
@@ -204,16 +216,20 @@ class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
         )
         if result is messages:
             return None
-        # Circuit-breaker sentinels become a graph jump. A listener may also return
-        # a dict that already carries ``jump_to="end"`` plus optional messages.
+        # Circuit-breaker sentinels become a graph jump. A listener may also
+        # return a dict that already carries ``jump_to="end"`` plus optional
+        # messages (the hard budget ceiling) — pass it through unchanged.
         if result is JUMP_END:
             return {"jump_to": "end"}
         if isinstance(result, dict):
             if result.get("jump_to") == "end":
                 return result
-            if "messages" in result:
-                return result
-        return {"messages": result}
+            if "messages" not in result:
+                return None
+            # Legacy-shaped update dict without a jump: normalize to the full
+            # message list it carries and run it through the same single mint.
+            result = result["messages"] or []
+        return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *result]}
 
     @hook_config(can_jump_to=["end"])
     async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001

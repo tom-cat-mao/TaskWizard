@@ -30,7 +30,11 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import hook_config
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 
-from phone_agent.v2.middleware._tokens import estimate_message_tokens, usage_tokens
+from phone_agent.v2.middleware._tokens import (
+    estimate_context_tokens,
+    estimate_message_tokens,
+    usage_tokens,
+)
 from phone_agent.v2.pins import TASKDOC_ID_PREFIX
 
 if TYPE_CHECKING:
@@ -129,7 +133,14 @@ class BudgetMiddleware(AgentMiddleware):
         return None
 
     def _accumulate(self, messages: list[Any]) -> None:
-        """Add the newest AI turn's usage to the cumulative counter (once)."""
+        """Add one model turn's usage to the cumulative counter (once).
+
+        Real ``usage_metadata`` stays authoritative. When a call reports none,
+        the fallback counts the whole turn — the full request input (every
+        message before the newest ``AIMessage``) plus the newest ``AIMessage``
+        (output) — so a gateway that omits usage cannot make the hard cost
+        ceiling meaningless.
+        """
 
         newest = self._newest_ai(messages)
         if newest is None:
@@ -139,13 +150,33 @@ class BudgetMiddleware(AgentMiddleware):
         # to always counting the newest — after_model runs once per model call.
         if msg_id is not None and msg_id == self._counted_id:
             return
-        estimate = estimate_message_tokens(newest)
+        estimate = self._turn_estimate(messages, newest)
         if self.ledger is not None:
             self.ledger.record("actor", newest, estimate_tokens=estimate)
         else:
             reported = usage_tokens(newest)
             self._used_tokens += reported if reported is not None else estimate
         self._counted_id = msg_id
+
+    def _turn_estimate(self, messages: list[Any], newest: AIMessage) -> int:
+        """Estimate one model turn as request-input + output tokens.
+
+        When the newest ``AIMessage`` carries real usage this returns the
+        legacy output-only estimate (the ledger prefers the reported value
+        anyway); otherwise it estimates the full request input (everything
+        before the newest AI turn) plus the output message itself.
+        """
+
+        if usage_tokens(newest) is not None:
+            return estimate_message_tokens(newest)
+        end = len(messages) - 1
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index] is newest:
+                end = index
+                break
+        return estimate_context_tokens(messages[:end]) + estimate_message_tokens(
+            newest
+        )
 
     def _warn_text(self) -> str:
         template = _WARN_TEXT.get(self.lang, _WARN_TEXT["cn"])
@@ -220,8 +251,10 @@ class BudgetMiddleware(AgentMiddleware):
     def on_pre_request(self, messages: list[Any], next: Any) -> Any:
         """Adapter for the ``model/pre_request`` waterfall.
 
-        Mirrors ``before_model``: warn mirrors are forwarded to downstream
-        listeners; the hard ceiling short-circuits with ``jump_to="end"``.
+        Mirrors ``before_model`` under the full-list contract: the warn mirror
+        is **appended** to the transformed transcript (a same-turn T2 fold and
+        the TaskDoc refresh must survive), while the hard ceiling
+        short-circuits with ``jump_to="end"``.
         """
 
         result = self.before_model({"messages": messages}, None)
@@ -230,7 +263,7 @@ class BudgetMiddleware(AgentMiddleware):
         if isinstance(result, dict) and result.get("jump_to") == "end":
             return result
         if isinstance(result, dict) and "messages" in result:
-            return next(result["messages"])
+            return next(list(messages) + list(result["messages"]))
         return next(messages)
 
     def on_model_request(self, request: Any, next: Any) -> Any:

@@ -292,6 +292,13 @@ class V2Config:
     compact_warn_ratio: float = 0.75
     compact_trigger_ratio: float = 0.92
     context_window: int | None = None
+    # Request-overhead reserves (S1 context hardening): the transcript estimate
+    # sees message contents only — the serialized tool schemas sent with every
+    # request and the tokens the next model reply needs are invisible to it.
+    # Both reserves are added to the estimated context size before the T1/T2
+    # ratio comparison so compaction fires before the real request overflows.
+    compact_schema_reserve: int = 3000
+    compact_output_reserve: int = 2000
     # context hygiene (S1 §1.4/§2): rolling image + OBS-marks pruning windows
     image_keep: int = 2
     obs_marks_keep: int = 2
@@ -555,6 +562,12 @@ class V2Config:
             ),
             context_window=(
                 _env_int("PHONE_AGENT_CONTEXT_WINDOW", 0) or None
+            ),
+            compact_schema_reserve=_env_int(
+                "PHONE_AGENT_COMPACT_SCHEMA_RESERVE", 3000
+            ),
+            compact_output_reserve=_env_int(
+                "PHONE_AGENT_COMPACT_OUTPUT_RESERVE", 2000
             ),
             image_keep=_env_int("PHONE_AGENT_IMAGE_KEEP", 2),
             obs_marks_keep=_env_int("PHONE_AGENT_OBS_MARKS_KEEP", 2),

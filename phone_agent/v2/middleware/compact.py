@@ -9,7 +9,8 @@ block). It sits **before** the pruner in the middleware order so it collapses
 whole turns first and the pruner then trims what remains.
 
 Two thresholds, both measured as an estimate of the current context tokens
-(``len // 4`` for text + 1500 per image, :mod:`._tokens`) against the inferred
+(script-aware text estimate + 1500 per image, :mod:`._tokens`, padded with the
+``schema_reserve`` + ``output_reserve`` request overhead) against the inferred
 context window:
 
 * **T1 warn** (``compact_warn_ratio``, default 0.75) — inject a single
@@ -44,6 +45,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from phone_agent.v2.middleware._tokens import (
     estimate_context_tokens,
@@ -237,6 +239,8 @@ class CompactMiddleware(AgentMiddleware):
         keep_ratio: float = 0.5,
         max_ptl_retries: int = 3,
         min_fold_messages: int = 4,
+        schema_reserve: int = 3000,
+        output_reserve: int = 2000,
         lang: str = "cn",
     ) -> None:
         super().__init__()
@@ -254,6 +258,12 @@ class CompactMiddleware(AgentMiddleware):
             self.keep_ratio = self.warn_ratio * 0.6
         self.max_ptl_retries = max(1, int(max_ptl_retries))
         self.min_fold_messages = max(1, int(min_fold_messages))
+        # Request-overhead reserves (S1 context hardening): the transcript
+        # estimate only sees message contents — the serialized tool schemas
+        # riding every request and the tokens the next reply needs are
+        # invisible here. Both pad the T1/T2 comparison (see ``before_model``).
+        self.schema_reserve = max(0, int(schema_reserve))
+        self.output_reserve = max(0, int(output_reserve))
         self.lang = lang
         self.window = infer_context_window(
             getattr(config, "model_name", None),
@@ -273,15 +283,29 @@ class CompactMiddleware(AgentMiddleware):
     def on_pre_request(self, messages: list[Any], next: Any) -> Any:
         """Adapter for the ``model/pre_request`` waterfall.
 
-        ``before_model`` already invokes the pruner as its first step (C1), so
-        the listener simply forwards the result to downstream listeners.
+        The waterfall contract is **full message list in, full message list
+        out**: no ``RemoveMessage`` ever travels downstream (the pre-request
+        bridge alone mints the single legal LangGraph ``REMOVE_ALL`` update).
+        ``before_model`` keeps returning the legacy reducer delta for the
+        LangChain-middleware path, so this adapter strips the sentinel head and
+        forwards the full rebuilt transcript; additive updates (T1 warn) are
+        appended to the incoming list instead of replacing it.
         """
 
         update = self.before_model({"messages": messages}, None)
         if update is None:
             return next(messages)
+        if isinstance(update, dict) and update.get("jump_to") == "end":
+            return update
         if isinstance(update, dict) and "messages" in update:
-            return next(update["messages"])
+            update_messages = list(update["messages"])
+            if update_messages and isinstance(update_messages[0], RemoveMessage):
+                # T2 fold: the sentinel head marks a full transcript
+                # replacement — forward the rebuilt transcript as-is.
+                return next(update_messages[1:])
+            # Additive update (T1 warn): extend the full list, never replace it
+            # (a same-turn T2 fold upstream must survive).
+            return next(list(messages) + update_messages)
         return next(messages)
 
     # -- thresholds --------------------------------------------------------
@@ -296,15 +320,19 @@ class CompactMiddleware(AgentMiddleware):
         if self._pruner is not None:
             self._pruner.prune(messages)
         total = estimate_context_tokens(messages)
+        # The estimate sees message contents only. Pad the comparison with the
+        # serialized tool-schema overhead and the next reply's output reserve so
+        # T1/T2 fire before the real request overflows the window.
+        effective = total + self.schema_reserve + self.output_reserve
 
-        if total >= self.window * self.trigger_ratio:
+        if effective >= self.window * self.trigger_ratio:
             update = self._force_compact(messages)
             if update is not None:
                 return update
             # Fold could not run (nothing to fold / summariser failed): fall
             # through so the T1 warn can still fire.
 
-        if not self._warned and total >= self.window * self.warn_ratio:
+        if not self._warned and effective >= self.window * self.warn_ratio:
             self._warned = True
             return {"messages": [SystemMessage(content=self._warn_text())]}
         return None
@@ -342,8 +370,10 @@ class CompactMiddleware(AgentMiddleware):
             fresh_hint,
             *pinned,
         ]
-        from langgraph.graph.message import REMOVE_ALL_MESSAGES
-
+        # Legacy reducer delta for the LangChain-middleware path. The
+        # ``model/pre_request`` adapter (``on_pre_request``) strips this
+        # sentinel head and forwards the full rebuilt list downstream; the
+        # pre-request bridge alone mints the LangGraph update.
         return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *rebuilt]}
 
     def _partition(
@@ -631,6 +661,8 @@ def build_compact_middleware(
         pruner=pruner,
         warn_ratio=getattr(config, "compact_warn_ratio", 0.75),
         trigger_ratio=getattr(config, "compact_trigger_ratio", 0.92),
+        schema_reserve=getattr(config, "compact_schema_reserve", 3000),
+        output_reserve=getattr(config, "compact_output_reserve", 2000),
         lang=getattr(config, "lang", "cn"),
     )
 
