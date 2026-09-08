@@ -430,6 +430,7 @@ class ThinPhoneAgent:
         from phone_agent.v2.usage import UsageLedger
         from phone_agent.v2.middleware.budget import build_budget_middleware
         from phone_agent.v2.middleware.images import ContextPrunerService
+        from phone_agent.v2.middleware.procedure import build_procedure_injector
         from phone_agent.v2.middleware.safety import build_control_hitl_middleware
         from phone_agent.v2.middleware.trace import build_trace_middleware
 
@@ -463,6 +464,15 @@ class ThinPhoneAgent:
             self._trace, "record_event", None
         )
         self.trace_path = self._trace.trace_path
+        # WP-WF3 procedure-card channel (run-start general card + post-launch
+        # app card). Mounted on the event bus by the recall capability; inert
+        # when that capability is off and fail-open throughout.
+        self._procedure_injector = build_procedure_injector(
+            config,
+            session=self.session,
+            trace=self._trace,
+            embedder_factory=self._recall_embedder_instance,
+        )
 
         def taskdoc_middleware_factory():
             from phone_agent.v2.middleware.taskdoc import build_taskdoc_middleware
@@ -555,6 +565,10 @@ class ThinPhoneAgent:
                 "recall_run_start": self._recall_run_start,
                 "recall_run_end": self._recall_run_end,
                 "recall_prompt_provider": self._recall_prompt_block,
+                # WP-WF3: the procedure card rides its own prompt provider and
+                # its own budget; the recall capability mounts both listeners.
+                "procedure_prompt_provider": self._procedure_prompt_block,
+                "procedure_injector": self._procedure_injector,
                 # WP-PLUGIN-A service factories: each capability publishes a
                 # live handle/facade under its ``provides`` key so plugins can
                 # discover it via ``ctx.service(...)`` and release removes it.
@@ -878,6 +892,23 @@ class ThinPhoneAgent:
             return getter()
         return self._render_lesson_prompt_block()
 
+    def _procedure_prompt_block(self) -> PromptBlock | None:
+        """Run-start general procedure card (its own 1-card/300-token budget).
+
+        Mounted beside — never instead of — the rule mirror: the two blocks are
+        separate ``PromptBlock``s with independent quotas.
+        """
+
+        injector = getattr(self, "_procedure_injector", None)
+        block = getattr(injector, "run_start_block", None) if injector else None
+        if not block:
+            return None
+        revoked = set(getattr(self, "_revoked_lesson_ids", set()))
+        selection = getattr(injector, "run_start_selection", None)
+        if selection is not None and str(selection.lesson_id) in revoked:
+            return None
+        return PromptBlock(block, placement="system_message")
+
     def _app_kb_prompt_block(self) -> PromptBlock | None:
         suffix = str(getattr(self, "_app_kb_prompt_suffix", ""))
         return PromptBlock(suffix, placement="system_suffix") if suffix else None
@@ -920,6 +951,21 @@ class ThinPhoneAgent:
         except Exception:  # noqa: BLE001 - trace failure cannot block injection/run
             pass
 
+    def _prepare_procedure_injection(self, task: str) -> None:
+        """Select the run-start general procedure card (WP-WF3 point one).
+
+        Injection only happens in ``on`` mode; the injector owns every failure
+        internally, so a missing index simply leaves the block empty.
+        """
+
+        injector = getattr(self, "_procedure_injector", None)
+        if injector is None:
+            return
+        try:
+            injector.run_start(task)
+        except Exception:  # noqa: BLE001 - procedure injection is fail-open
+            return
+
     def revoke_lesson(self, lesson_id: str) -> bool:
         """Emergency-revoke one lesson and exclude it from future injection.
 
@@ -944,6 +990,13 @@ class ThinPhoneAgent:
         except Exception:  # noqa: BLE001 - emergency control must not stop the run
             return False
         self._revoked_lesson_ids.add(clean_id)
+        # A revoked procedure card must not reach a later injection point
+        # (pending post-launch card, or a launch that has not happened yet).
+        revoke_procedure = getattr(
+            getattr(self, "_procedure_injector", None), "revoke", None
+        )
+        if callable(revoke_procedure):
+            revoke_procedure(clean_id)
         try:
             record = getattr(self._trace, "record_event", None)
             if callable(record):
@@ -1034,6 +1087,7 @@ class ThinPhoneAgent:
         ):
             state["device_scope"] = self._experience_device_scope()
         self._prepare_lesson_injection(str(state["device_scope"]))
+        self._prepare_procedure_injection(str(state["task"]))
 
     def _recall_run_end(self, state: dict[str, Any]) -> None:
         if (
@@ -1143,10 +1197,32 @@ class ThinPhoneAgent:
             except Exception:  # noqa: BLE001 - capability side planes are fail-open
                 continue
 
+    def _recall_embedder_instance(self) -> Any:
+        """Return this run's cached embedding adapter for the recall index."""
+
+        from phone_agent.v2.recall import MlxEmbedder
+
+        model_id = getattr(
+            self.config,
+            "embed_model",
+            "Qwen/Qwen3-Embedding-0.6B",
+        )
+        embed_dim = getattr(self.config, "embed_dim", 1024)
+        embedder = getattr(self, "_recall_embedder", None)
+        if (
+            embedder is None
+            or embedder.model_id != model_id
+            or embedder.dimension != embed_dim
+        ):
+            embedder = MlxEmbedder(model_id, embed_dim)
+            self._recall_embedder = embedder
+        return embedder
+
     def _shadow_recall_start(self, task: str) -> None:
         """Retrieve trace-only candidates without touching actor context."""
 
         self._shadow_candidates: list[dict[str, Any]] = []
+        self._shadow_procedure = None
         self._shadow_recall_ready = False
         reset = getattr(self._trace, "reset_run_observations", None)
         if callable(reset):
@@ -1156,7 +1232,7 @@ class ThinPhoneAgent:
 
         trace_payload: dict[str, Any] = {"mode": "shadow", "candidates": []}
         try:
-            from phone_agent.v2.recall import MlxEmbedder, VecIndex
+            from phone_agent.v2.recall import VecIndex
 
             serial = getattr(self.config, "device_id", None)
             if not serial:
@@ -1166,20 +1242,7 @@ class ThinPhoneAgent:
                 trace_payload["status"] = "skipped"
                 trace_payload["reason"] = "device_scope_unavailable"
             else:
-                model_id = getattr(
-                    self.config,
-                    "embed_model",
-                    "Qwen/Qwen3-Embedding-0.6B",
-                )
-                embed_dim = getattr(self.config, "embed_dim", 1024)
-                embedder = getattr(self, "_recall_embedder", None)
-                if (
-                    embedder is None
-                    or embedder.model_id != model_id
-                    or embedder.dimension != embed_dim
-                ):
-                    embedder = MlxEmbedder(model_id, embed_dim)
-                    self._recall_embedder = embedder
+                embedder = self._recall_embedder_instance()
                 with VecIndex(
                     getattr(self.config, "vec_db", "memory/vec.db"),
                     embedder=embedder,
@@ -1193,6 +1256,17 @@ class ThinPhoneAgent:
                             self.config, "recall_decay_lambda", 0.02
                         ),
                     )
+                    # WP-WF2a: the procedure channel stays shadow — select the
+                    # card (no app known at run start, so general cards only)
+                    # and let run-end record the outcome in recall_stats. Its
+                    # failures are contained so they cannot downgrade the
+                    # episode/alias recall status above.
+                    try:
+                        self._shadow_procedure = index.select_procedure(
+                            task, app_package=None, device_id=serial
+                        )
+                    except Exception:  # noqa: BLE001 - procedure channel is fail-open
+                        self._shadow_procedure = None
                 self._shadow_recall_ready = True
                 trace_payload["status"] = "ok"
                 trace_payload["candidates"] = [
@@ -1215,40 +1289,54 @@ class ThinPhoneAgent:
     def _shadow_recall_finish(self) -> None:
         """Evaluate trace-only recall against confirmed launch receipts."""
 
-        if not getattr(self, "_shadow_recall_ready", False):
+        selection = getattr(self, "_shadow_procedure", None)
+        if not getattr(self, "_shadow_recall_ready", False) and selection is None:
             return
         try:
             from pathlib import Path
 
-            from phone_agent.v2.recall import evaluate_recall, update_recall_stats
+            from phone_agent.v2.recall import (
+                evaluate_recall,
+                update_procedure_recall_stats,
+                update_recall_stats,
+            )
 
-            actual_apps = getattr(self._trace, "launched_apps", set())
-            evaluation = evaluate_recall(self._shadow_candidates, actual_apps)
             stats_path = (
                 Path(getattr(self.config, "memory_dir", "memory"))
                 / "experience/recall_stats.json"
             )
-            stats = update_recall_stats(stats_path, evaluation, run_id=self.run_id)
-            record = getattr(self._trace, "record_event", None)
-            if callable(record):
-                record(
-                    "recall_evaluation",
-                    evaluation=evaluation,
-                    cumulative={
-                        "evaluations": stats["evaluations"],
-                        "hit_rate": stats["hit_rate"],
-                        "hit_at_1": stats["hit_at_1"],
-                        "conditional_hit_rate": stats["conditional_hit_rate"],
-                        "contaminated_run_rate": stats[
-                            "contaminated_run_rate"
-                        ],
-                        "package_precision": stats["package_precision"],
-                        "package_recall": stats["package_recall"],
-                        "precision_at_k": stats["precision_at_k"],
-                        "recall_at_k": stats["recall_at_k"],
-                        # Compatibility for the unchanged web/app.py reader.
-                        "false_hit_rate": stats["false_hit_rate"],
-                    },
+            if getattr(self, "_shadow_recall_ready", False):
+                actual_apps = getattr(self._trace, "launched_apps", set())
+                evaluation = evaluate_recall(self._shadow_candidates, actual_apps)
+                stats = update_recall_stats(
+                    stats_path, evaluation, run_id=self.run_id
+                )
+                record = getattr(self._trace, "record_event", None)
+                if callable(record):
+                    record(
+                        "recall_evaluation",
+                        evaluation=evaluation,
+                        cumulative={
+                            "evaluations": stats["evaluations"],
+                            "hit_rate": stats["hit_rate"],
+                            "hit_at_1": stats["hit_at_1"],
+                            "conditional_hit_rate": stats["conditional_hit_rate"],
+                            "contaminated_run_rate": stats[
+                                "contaminated_run_rate"
+                            ],
+                            "package_precision": stats["package_precision"],
+                            "package_recall": stats["package_recall"],
+                            "precision_at_k": stats["precision_at_k"],
+                            "recall_at_k": stats["recall_at_k"],
+                            # Compatibility for the unchanged web/app.py reader.
+                            "false_hit_rate": stats["false_hit_rate"],
+                        },
+                    )
+            if selection is not None:
+                # The procedure channel records every run it observed, zero
+                # recall included: that neutrality is the measurement.
+                update_procedure_recall_stats(
+                    stats_path, selection, run_id=self.run_id
                 )
         except Exception:  # noqa: BLE001 - shadow evaluation never changes run outcome
             pass
@@ -1400,6 +1488,11 @@ class ThinPhoneAgent:
             reset_implicit_alias(self.run_id)
         self._actually_injected_lesson_ids = []
         self._deliverable_path = None
+        reset_procedures = getattr(
+            getattr(self, "_procedure_injector", None), "reset", None
+        )
+        if callable(reset_procedures):
+            reset_procedures()
         run_state: dict[str, Any] = {
             "task": task,
             "ts_start": ts_start,
@@ -1415,6 +1508,7 @@ class ThinPhoneAgent:
             except Exception:  # noqa: BLE001 - duck-typed sessions may be immutable
                 pass
             self._shadow_candidates = []
+            self._shadow_procedure = None
             self._shadow_recall_ready = False
             self._run_injected_lessons = []
             self._app_kb_prompt_suffix = ""
@@ -1463,6 +1557,9 @@ class ThinPhoneAgent:
         try:
             self.session.launched_apps = []
             self.session.finish_verifier = "skipped"
+            reset_launched = getattr(self.session, "reset_launched_events", None)
+            if callable(reset_launched):
+                reset_launched()
         except Exception:  # noqa: BLE001 - duck-typed sessions may be immutable
             pass
         if getattr(self, "_safety_warning", None) is not None:
@@ -1548,6 +1645,29 @@ class ThinPhoneAgent:
                     serial = None
         return f"device:{serial or 'unknown'}"
 
+    def _injected_procedure_ids(self) -> list[str]:
+        """Procedure-card ids this run handed to the model (WP-WF3 audit)."""
+
+        injector = getattr(self, "_procedure_injector", None)
+        ids = getattr(injector, "injected_ids", None)
+        return [str(lesson_id) for lesson_id in ids or () if str(lesson_id)]
+
+    def _episode_injected_lesson_ids(self) -> list[str]:
+        """Rule ids for the episode audit: run-start mirror + app rules (C3)."""
+
+        ids = [
+            str(lesson_id)
+            for lesson_id in getattr(self, "_actually_injected_lesson_ids", [])
+            or ()
+            if str(lesson_id)
+        ]
+        injector = getattr(self, "_procedure_injector", None)
+        for rule_id in getattr(injector, "injected_rule_ids", None) or ():
+            clean = str(rule_id)
+            if clean and clean not in ids:
+                ids.append(clean)
+        return ids
+
     def _append_experience_outcome(
         self,
         task: str,
@@ -1609,12 +1729,8 @@ class ThinPhoneAgent:
                 takeover=takeover,
                 verifier=getattr(self.session, "finish_verifier", "skipped"),
                 capabilities=dict(getattr(self, "_run_capabilities", {})),
-                injected_lessons=[
-                    lesson_id
-                    for lesson_id in getattr(
-                        self, "_actually_injected_lesson_ids", []
-                    )
-                ],
+                injected_lessons=self._episode_injected_lesson_ids(),
+                injected_procedures=self._injected_procedure_ids(),
                 deliverable_path=getattr(self, "_deliverable_path", None),
             )
         except Exception:  # noqa: BLE001 - persistence cannot alter run semantics

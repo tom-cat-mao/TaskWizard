@@ -1,15 +1,30 @@
-"""Rebuildable semantic recall for experience episodes and App-KB aliases.
+"""Rebuildable semantic recall for experience episodes, App-KB aliases, and
+procedure cards.
 
 The runtime contract is deliberately observe-only in ``shadow`` mode: this
 module can retrieve and evaluate candidates, but it never constructs model
 messages or mutates the actor context.  Episode JSONL is consumed directly so
 the shared WP-I1 schema remains owned by the experience plane.
+
+WP-WF2a adds a third namespace, ``procedure``, over the injectable procedure
+cards produced by the WP-WF1 lesson pipeline (see ``WORKFLOW-MEMORY-DESIGN.md``
+§4/§5).  Matching is deterministic hard filters (app package equality, device
+scope) followed by a single embedding top-1; the selector only *selects* — the
+two injection points and the prompt wiring land in WP-WF3.
+
+Recall hardening keeps that fail-open contract but makes it observable: the
+shared embedder is warmed on a daemon thread at capability mount (``on``/
+``shadow`` only), and every selection-path exception is recorded — one
+``recall_selection_error`` trace event plus a per-namespace counter in
+``recall_stats.json`` — before the caller's fail-open return.  Neither changes
+a selection result, a run outcome, or the meaning of an existing stats field.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -25,14 +40,43 @@ from typing import Any, Protocol
 
 
 DEFAULT_EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
-_NAMESPACES = frozenset({"episode", "app_alias"})
+_NAMESPACES = frozenset({"episode", "app_alias", "procedure"})
+# Device scope value that matches every device; mirrors the App-KB alias usage.
+_GLOBAL_DEVICE_SCOPE = "global"
+# WP-WF2a procedure-recall knobs.  The threshold is a module constant (not a
+# config key) because WP-WF2b scans it offline in replay; the injection budget
+# is deliberately separate from the rule budget (3 items / 800 tokens).
+PROCEDURE_MIN_SCORE = 0.30  # calibrated on real episodes (20 runs, 2 cards) via
+# `replay --channel procedure --sweep --calibrate`: knee at highest coverage
+# (0.30) whose relevance clears 0.60 (0.667); tau>=0.45 reaches relevance 1.0
+# but coverage drops to 0.20.
+PROCEDURE_MAX_ITEMS = 1
+PROCEDURE_MAX_TOKENS = 300
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]+|[\u3400-\u9fff]+")
 _LAUNCH_RE = re.compile(
     r"\blaunched\s+.*\(([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)\)\s*$",
     re.IGNORECASE,
 )
+# The recall side plane must fail open *visibly*.  A selection-path exception
+# is recorded (one trace event plus a per-namespace counter in the shadow
+# scorecard) before the caller's fail-open return, and the embedder loads its
+# model off the run's critical path at capability mount time.  Neither the
+# warm-up nor the recording may change a selection result or block a run.
+WARMUP_TEXT = "warmup"
+RECALL_SELECTION_ERROR = "recall_selection_error"
+# One observe-only counter per namespace; existing stats keys are never
+# rewritten (the schema-v2 scorecard is only extended).
+SELECTION_ERROR_KEYS = {
+    "episode": "episode_errors",
+    "app_alias": "app_alias_errors",
+    "procedure": "procedure_errors",
+}
 _STATS_LOCK = threading.Lock()
 _INDEX_LOCK = threading.RLock()
+_SELECTION_OBSERVER_LOCK = threading.Lock()
+# Observers receive ``(namespace, error_type)`` — never a stack trace, message,
+# or any caller-controlled string, so the audit plane stays redaction-safe.
+_selection_error_observers: list[Callable[[str, str], None]] = []
 
 
 class Embedder(Protocol):
@@ -107,7 +151,10 @@ class MlxEmbedder:
         self._model: Any | None = None
         self._processor: Any | None = None
         self._generate: Any | None = None
-        self._lock = threading.Lock()
+        # Reentrant: ``embed`` holds it across load + generate so a background
+        # warm-up and the run's own call can never load MLX twice or run two
+        # generate calls at once (that race segfaults the process).
+        self._lock = threading.RLock()
 
     @property
     def loaded(self) -> bool:
@@ -132,17 +179,79 @@ class MlxEmbedder:
         inputs = [str(text) for text in texts]
         if not inputs:
             return []
-        self._ensure_loaded()
-        output = self._generate(self._model, self._processor, texts=inputs)
-        embeddings = getattr(output, "text_embeds", output)
-        rows = embeddings.tolist()
-        if rows and isinstance(rows[0], (int, float)):
-            rows = [rows]
-        if len(rows) != len(inputs):
-            raise ValueError(
-                f"embedder returned {len(rows)} vectors for {len(inputs)} texts"
-            )
+        with self._lock:
+            self._ensure_loaded()
+            output = self._generate(self._model, self._processor, texts=inputs)
+            embeddings = getattr(output, "text_embeds", output)
+            rows = embeddings.tolist()
+            if rows and isinstance(rows[0], (int, float)):
+                rows = [rows]
+            if len(rows) != len(inputs):
+                raise ValueError(
+                    f"embedder returned {len(rows)} vectors for {len(inputs)} texts"
+                )
         return [_normalize(row, dimension=self.dimension) for row in rows]
+
+
+def embedder_needs_warmup(embedder: Any) -> bool:
+    """Whether a background warm-up embed is worth running for ``embedder``.
+
+    The deterministic test/office embedder has nothing to load, and an adapter
+    that reports itself loaded is already warm; only a lazy real model
+    benefits from paying the load cost off the run's critical path.
+    """
+
+    if isinstance(embedder, HashEmbedder):
+        return False
+    return getattr(embedder, "loaded", None) is not True
+
+
+def resolve_embedder_factory(candidate: Any) -> Callable[[], Any] | None:
+    """Duck-type the run's shared embedder factory out of a mounted object.
+
+    The recall capability mounts objects it does not own (currently the WP-WF3
+    procedure injector), so it reads the factory through a public attribute
+    when one exists and falls back to the private name rather than adding a
+    new harness service.  Warm-up is skipped when no factory is reachable.
+    """
+
+    for name in ("embedder_factory", "_embedder_factory"):
+        attribute = getattr(candidate, name, None)
+        if callable(attribute):
+            return attribute
+    return None
+
+
+def warmup_embedder(
+    embedder_factory: Callable[[], Any] | None,
+    *,
+    text: str = WARMUP_TEXT,
+) -> threading.Thread | None:
+    """Run one trivial embed on a daemon thread (fail-open, fire-and-forget).
+
+    The MLX stack loads its model on the first ``embed()``; doing that at
+    capability mount keeps the load off the first recall/selection of the run.
+    A failure is recorded like any other selection-path failure and never
+    reaches the caller.
+    """
+
+    if not callable(embedder_factory):
+        return None
+
+    def run() -> None:
+        try:
+            embedder = embedder_factory()
+            if embedder is None or not embedder_needs_warmup(embedder):
+                return
+            embedder.embed([text])
+        except Exception as exc:  # noqa: BLE001 - warm-up is fail-open
+            note_selection_error("embedder", exc)
+
+    thread = threading.Thread(
+        target=run, name="recall-embedder-warmup", daemon=True
+    )
+    thread.start()
+    return thread
 
 
 def read_episode_events(events_path: str | Path) -> list[dict[str, Any]]:
@@ -419,6 +528,192 @@ def _mention_occurs(term: str, query: str) -> bool:
     from phone_agent.v2.names import mention_occurs
 
     return mention_occurs(term, query)
+
+
+def _procedure_device_scopes(device_id: str | None) -> tuple[str, ...]:
+    """Return the device_scope values a procedure row may carry to match."""
+
+    serial = " ".join(str(device_id or "").split()).removeprefix("device:")
+    if not serial or serial == "unknown":
+        return (_GLOBAL_DEVICE_SCOPE,)
+    return (serial, _GLOBAL_DEVICE_SCOPE)
+
+
+def _procedure_app_matches(app_scope: str | None, app_package: str | None) -> bool:
+    """Deterministic app gate: package equality, or general cards with no app.
+
+    App matching never uses embeddings, so a wrong injection is bounded to
+    "the wrong card inside the right app".
+    """
+
+    if app_package:
+        return str(app_scope or "") == app_package
+    from phone_agent.v2.evolution import GENERAL_APP_SCOPE
+
+    return str(app_scope or "") == GENERAL_APP_SCOPE
+
+
+def _procedure_document(lesson: Any) -> str:
+    """Return the retrieval document: card title plus a steps summary."""
+
+    title = str(getattr(lesson, "text", "") or "").strip()
+    steps = [str(step).strip() for step in getattr(lesson, "steps", ()) or ()]
+    steps = [step for step in steps if step]
+    return " | ".join([title, *steps]) if steps else title
+
+
+def _procedure_source_hash(lesson: Any) -> str:
+    payload = {
+        "lesson_id": str(getattr(lesson, "lesson_id", "")),
+        "version": int(getattr(lesson, "version", 1)),
+        "status": str(getattr(lesson, "status", "")),
+        "kind": str(getattr(lesson, "kind", "")),
+        "app_scope": getattr(lesson, "app_scope", None),
+        "device_scope": (getattr(lesson, "scope", {}) or {}).get("device"),
+        "document": _procedure_document(lesson),
+        "pitfalls": getattr(lesson, "pitfalls", None),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def load_procedure_lessons(
+    lessons_dir: str | Path = "memory/lessons",
+) -> list[Any]:
+    """Return the injectable procedure cards of the materialized lesson view.
+
+    Only the current-version view is read (never rebuilt) and only cards that
+    pass :func:`phone_agent.v2.evolution.lesson_injectable` are returned, so a
+    revoked or demoted card simply disappears from the recall namespace.  A
+    missing or damaged view fails open to no cards.
+    """
+
+    from phone_agent.v2.evolution import LessonCandidate, lesson_injectable
+
+    path = Path(lessons_dir) / "lessons.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    cards: list[Any] = []
+    for item in payload:
+        try:
+            lesson = LessonCandidate.from_dict(item)
+        except (TypeError, ValueError):
+            continue
+        if lesson.kind == "procedure" and lesson_injectable(lesson):
+            cards.append(lesson)
+    return cards
+
+
+@dataclass(frozen=True)
+class ProcedureSelection:
+    """Structured outcome of one procedure-card recall attempt.
+
+    ``candidates`` counts the rows surviving revocation plus the device gate and
+    ``filtered`` the rows additionally surviving the app gate, so a zero-recall
+    run stays a visible, attributable neutral state instead of silent absence.
+    """
+
+    lesson_id: str | None = None
+    title: str = ""
+    steps: tuple[str, ...] = ()
+    pitfalls: str | None = None
+    app_scope: str | None = None
+    device_scope: str | None = None
+    score: float = 0.0
+    candidates: int = 0
+    filtered: int = 0
+    reason: str = "no_cards"
+
+    @property
+    def selected(self) -> bool:
+        return bool(self.lesson_id)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "lesson_id": self.lesson_id,
+            "title": self.title,
+            "steps": list(self.steps),
+            "pitfalls": self.pitfalls,
+            "app_scope": self.app_scope,
+            "device_scope": self.device_scope,
+            "score": round(float(self.score), 6),
+            "candidates": int(self.candidates),
+            "filtered": int(self.filtered),
+            "reason": self.reason,
+            "selected": self.selected,
+        }
+
+
+def format_procedure_block(
+    selection: ProcedureSelection | Mapping[str, Any] | None,
+    *,
+    max_tokens: int = PROCEDURE_MAX_TOKENS,
+) -> str | None:
+    """Render at most one procedure card inside its own token budget.
+
+    The card is a non-binding reference: the block says so explicitly and names
+    the source lesson id.  Steps are appended in order and dropped (never
+    rewritten) once the budget is spent.  Pure function — no I/O, no index.
+    """
+
+    payload = (
+        selection.to_dict()
+        if isinstance(selection, ProcedureSelection)
+        else dict(selection or {})
+    )
+    lesson_id = str(payload.get("lesson_id") or "").strip()
+    if not lesson_id:
+        return None
+    from phone_agent.v2.evolution import GENERAL_APP_SCOPE
+    from phone_agent.v2.middleware._tokens import estimate_text_tokens
+
+    budget = int(max_tokens)
+    if budget <= 0:
+        return None
+    header = "[过程参考]（历史过程卡，仅供参考，不是规则；与当前世界状态冲突时以观测为准）"
+    title = str(payload.get("title") or "").strip()
+    scope = str(payload.get("app_scope") or GENERAL_APP_SCOPE)
+    lines = [header, f"{title}（来源 {lesson_id} · app {scope}）"]
+    truncated = False
+    for index, step in enumerate(payload.get("steps") or (), start=1):
+        candidate = f"{index}. {step}"
+        if estimate_text_tokens("\n".join([*lines, candidate])) > budget:
+            truncated = True
+            break
+        lines.append(candidate)
+    pitfalls = str(payload.get("pitfalls") or "").strip()
+    if pitfalls:
+        candidate = f"注意：{pitfalls}"
+        if estimate_text_tokens("\n".join([*lines, candidate])) <= budget:
+            lines.append(candidate)
+        else:
+            truncated = True
+    if truncated:
+        marker = "…（过程卡已按预算截断）"
+        if estimate_text_tokens("\n".join([*lines, marker])) <= budget:
+            lines.append(marker)
+    return "\n".join(lines)
+
+
+@contextmanager
+def _selection_scope(namespace: str):
+    """Record one selection phase's failure and re-raise it unchanged.
+
+    The fail-open return belongs to the caller (the shadow run-start path and
+    the procedure injector); the scope only makes the failure visible in the
+    trace and the scorecard before control leaves this module.
+    """
+
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
+        note_selection_error(namespace, exc)
+        raise
 
 
 class VecIndex:
@@ -771,6 +1066,162 @@ class VecIndex:
         indexed = self.index_alias_entries(entries, all_entries=entries)
         return {"app_aliases": indexed}
 
+    def index_procedure_lessons(self, lessons: Sequence[Any]) -> int:
+        """Upsert injectable procedure cards into the ``procedure`` namespace."""
+
+        indexed = 0
+        for lesson in lessons:
+            document = _procedure_document(lesson)
+            if not document:
+                continue
+            source_hash = _procedure_source_hash(lesson)
+            ref_id = str(getattr(lesson, "lesson_id", "")).strip()
+            if not ref_id:
+                continue
+            if self.source_hash("procedure", ref_id) == source_hash:
+                indexed += 1
+                continue
+            device_scope = (getattr(lesson, "scope", {}) or {}).get("device")
+            self.upsert(
+                namespace="procedure",
+                ref_id=ref_id,
+                text=document,
+                metadata={
+                    "device_scope": str(device_scope or "").strip()
+                    or _GLOBAL_DEVICE_SCOPE,
+                    "ts": getattr(lesson, "created_ts", 0.0),
+                    "generation": int(getattr(lesson, "version", 1)),
+                    "revoked": False,
+                    "lesson_id": ref_id,
+                    "status": str(getattr(lesson, "status", "")),
+                    "kind": str(getattr(lesson, "kind", "procedure")),
+                    # Belt-and-braces for the selector: the namespace is also
+                    # pruned on state change, but a stale row must never inject.
+                    "injectable": True,
+                    "title": str(getattr(lesson, "text", "")),
+                    "steps": list(getattr(lesson, "steps", ()) or ()),
+                    "pitfalls": getattr(lesson, "pitfalls", None),
+                    "app_scope": getattr(lesson, "app_scope", None),
+                    "source_hash": source_hash,
+                },
+            )
+            indexed += 1
+        return indexed
+
+    def sync_procedure_lessons(self, lessons: Sequence[Any]) -> dict[str, int]:
+        """Make the ``procedure`` namespace match the current lesson view.
+
+        Promotion to an injectable status upserts; revocation, demotion, or any
+        other loss of injectability removes the row because the source view no
+        longer lists the card.
+        """
+
+        indexed = self.index_procedure_lessons(lessons)
+        removed = self.delete_missing(
+            "procedure",
+            {str(getattr(lesson, "lesson_id", "")) for lesson in lessons},
+        )
+        return {"procedures": indexed, "removed_procedures": removed}
+
+    def select_procedure(
+        self,
+        goal_text: str,
+        *,
+        app_package: str | None = None,
+        device_id: str | None = None,
+        min_score: float = PROCEDURE_MIN_SCORE,
+    ) -> ProcedureSelection:
+        """Hard-filter then embedding top-1 one procedure card for a goal.
+
+        Hard filters: device scope (a card scoped to another device is never a
+        candidate) and exact ``app_scope`` equality — with no app known yet only
+        general cards survive.  The remaining pool is ranked by cosine against
+        the card document and the single best card is returned when it clears
+        ``min_score``; the channel quota is :data:`PROCEDURE_MAX_ITEMS` card
+        inside :data:`PROCEDURE_MAX_TOKENS` tokens, separate from rules.
+        """
+
+        query = str(goal_text or "").strip()
+        if not query:
+            return ProcedureSelection(reason="empty_query")
+        if not 0.0 <= float(min_score) <= 1.0:
+            raise ValueError("min_score must be between 0 and 1")
+        with _selection_scope("procedure"):
+            return self._select_procedure(
+                query,
+                app_package=app_package,
+                device_id=device_id,
+                min_score=min_score,
+            )
+
+    def _select_procedure(
+        self,
+        query: str,
+        *,
+        app_package: str | None,
+        device_id: str | None,
+        min_score: float,
+    ) -> ProcedureSelection:
+        from sqlite_vec import serialize_float32
+
+        query_vector = serialize_float32(self.embedder.embed([query])[0])
+        rows = self.connection.execute(
+            """
+            SELECT i.ref_id, i.device_scope, i.metadata_json,
+                   vec_distance_cosine(v.embedding, ?) AS vector_distance
+            FROM recall_items AS i
+            JOIN recall_vectors AS v ON v.rowid = i.id
+            WHERE i.namespace = 'procedure' AND i.embed_model = ? AND i.revoked = 0
+            """,
+            (query_vector, self.embedder.model_id),
+        ).fetchall()
+        if not rows:
+            return ProcedureSelection(reason="no_cards")
+
+        scopes = _procedure_device_scopes(device_id)
+        wanted_app = str(app_package or "").strip() or None
+        in_device = [row for row in rows if str(row["device_scope"]) in scopes]
+        if not in_device:
+            return ProcedureSelection(reason="device_scope_mismatch")
+
+        scored: list[tuple[float, str, Mapping[str, Any]]] = []
+        for row in in_device:
+            try:
+                metadata = json.loads(row["metadata_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if metadata.get("injectable") is not True:
+                continue
+            if not _procedure_app_matches(metadata.get("app_scope"), wanted_app):
+                continue
+            score = max(0.0, min(1.0, 1.0 - float(row["vector_distance"])))
+            scored.append((score, str(row["ref_id"]), metadata))
+        if not scored:
+            return ProcedureSelection(
+                candidates=len(in_device), reason="app_scope_mismatch"
+            )
+
+        score, ref_id, metadata = min(scored, key=lambda item: (-item[0], item[1]))
+        if score < min_score:
+            return ProcedureSelection(
+                candidates=len(in_device),
+                filtered=len(scored),
+                score=round(score, 6),
+                reason="below_threshold",
+            )
+        return ProcedureSelection(
+            lesson_id=ref_id,
+            title=str(metadata.get("title", "")),
+            steps=tuple(str(step) for step in metadata.get("steps", ()) or ()),
+            pitfalls=metadata.get("pitfalls"),
+            app_scope=metadata.get("app_scope"),
+            device_scope=str(metadata.get("device_scope") or "") or None,
+            score=round(score, 6),
+            candidates=len(in_device),
+            filtered=len(scored),
+            reason="hit",
+        )
+
     def recall(
         self,
         query: str,
@@ -793,18 +1244,41 @@ class VecIndex:
         if not query or not device_scope or top_k <= 0 or not selected:
             return []
         if any(namespace not in _NAMESPACES for namespace in selected):
-            raise ValueError("namespaces must contain only episode/app_alias")
+            raise ValueError("namespaces must contain only episode/app_alias/procedure")
         if not 0.0 <= min_score <= 1.0:
             raise ValueError("min_score must be between 0 and 1")
         if decay_lambda < 0.0:
             raise ValueError("decay_lambda must be non-negative")
-        app_candidates = (
-            self._mention_candidates(query, device_scope=device_scope)
-            if "app_alias" in selected
-            else []
-        )
+        app_candidates: list[dict[str, Any]] = []
+        if "app_alias" in selected:
+            with _selection_scope("app_alias"):
+                app_candidates = self._mention_candidates(
+                    query, device_scope=device_scope
+                )
         if "episode" not in selected:
             return app_candidates
+        with _selection_scope("episode"):
+            episodes = self._episode_candidates(
+                query,
+                device_scope=device_scope,
+                top_k=top_k,
+                min_score=min_score,
+                decay_lambda=decay_lambda,
+                now=now,
+            )
+        return [*app_candidates, *episodes]
+
+    def _episode_candidates(
+        self,
+        query: str,
+        *,
+        device_scope: str,
+        top_k: int,
+        min_score: float,
+        decay_lambda: float,
+        now: float | None,
+    ) -> list[dict[str, Any]]:
+        """Rank the semantic episode namespace for one already-validated query."""
 
         episode_count = self.connection.execute(
             "SELECT count(*) FROM recall_items "
@@ -812,7 +1286,7 @@ class VecIndex:
             (self.embedder.model_id,),
         ).fetchone()
         if not episode_count or int(episode_count[0]) == 0:
-            return app_candidates
+            return []
 
         from sqlite_vec import serialize_float32
 
@@ -884,13 +1358,27 @@ class VecIndex:
         episode_candidates.sort(
             key=lambda item: (-item["score"], -item["time_score"], item["ref_id"])
         )
-        return [*app_candidates, *episode_candidates[:top_k]]
+        return episode_candidates[:top_k]
 
     def app_name_vector_candidates(
         self, query: str, *, device_scope: str, top_k: int = 20
     ) -> list[dict[str, Any]]:
-        """Return App-KB vector neighbours for the names.py embedding route."""
+        """Return App-KB vector neighbours for the names.py embedding route.
 
+        The route runs inside :func:`_selection_scope` so a failure on this
+        path is recorded (trace event + ``app_alias_errors``) *before* the
+        caller's fail-open swallow — ``names.py`` catches and discards the
+        exception, so without the scope the failure would leave no evidence.
+        """
+
+        with _selection_scope("app_alias"):
+            return self._app_name_vector_candidates(
+                query, device_scope=device_scope, top_k=top_k
+            )
+
+    def _app_name_vector_candidates(
+        self, query: str, *, device_scope: str, top_k: int = 20
+    ) -> list[dict[str, Any]]:
         clean_query = str(query or "").strip()
         clean_scope = str(device_scope or "").strip()
         if not clean_query or not clean_scope or top_k <= 0:
@@ -1136,13 +1624,11 @@ def extract_launched_apps(content: Any) -> set[str]:
     return packages
 
 
-def update_recall_stats(
+def _accumulate_stats(
     stats_path: str | Path,
-    evaluation: Mapping[str, Any],
-    *,
-    run_id: str | None = None,
+    accumulate: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
-    """Atomically accumulate shadow metrics with stable, explicit denominators."""
+    """Atomically read-modify-write the shared shadow stats file."""
 
     path = Path(stats_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1154,39 +1640,137 @@ def update_recall_stats(
                 current = json.loads(path.read_text(encoding="utf-8"))
             except (FileNotFoundError, json.JSONDecodeError, TypeError):
                 current = {}
+            if not isinstance(current, dict):
+                current = {}
             # The v1 counters used incompatible ranking and false-hit
             # denominators. Start the schema-v2 scorecard clean instead of
             # blending irrecoverable historical meanings into the new rates.
             if current.get("schema_v") != 2:
                 current = {}
-            evaluations = int(current.get("evaluations", 0)) + 1
-            hits = int(current.get("hits", 0)) + int(bool(evaluation.get("hit")))
-            hit_at_1_count = int(current.get("hit_at_1_count", 0)) + int(
-                bool(evaluation.get("hit_at_1"))
+            updated = accumulate(dict(current))
+            updated["schema_v"] = 2
+            descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{path.name}.", dir=path.parent
             )
-            contaminated_runs = int(
-                current.get("contaminated_runs", current.get("false_hits", 0))
-            ) + int(
-                bool(
-                    evaluation.get(
-                        "contaminated_run", evaluation.get("false_hit")
-                    )
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump(updated, stream, ensure_ascii=False, indent=2, sort_keys=True)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temp_name, path)
+            finally:
+                if os.path.exists(temp_name):
+                    os.unlink(temp_name)
+            return updated
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def selection_error_key(namespace: str) -> str | None:
+    """Return the scorecard counter key for ``namespace`` (``None`` = untracked).
+
+    Only the three recall namespaces carry a counter; the embedder warm-up
+    reports a namespace of its own and stays trace-only.
+    """
+
+    return SELECTION_ERROR_KEYS.get(str(namespace).strip())
+
+
+def add_selection_error_observer(
+    observer: Callable[[str, str], None],
+) -> Callable[[], None]:
+    """Register one ``(namespace, error_type)`` observer, returning a disposer."""
+
+    if not callable(observer):
+        raise TypeError("selection error observer must be callable")
+    with _SELECTION_OBSERVER_LOCK:
+        _selection_error_observers.append(observer)
+
+    def dispose() -> None:
+        with _SELECTION_OBSERVER_LOCK:
+            try:
+                _selection_error_observers.remove(observer)
+            except ValueError:
+                return
+
+    return dispose
+
+
+def note_selection_error(namespace: str, error: BaseException | str) -> None:
+    """Notify observers of one selection-path failure; never raises.
+
+    Only the exception *type* (or a literal string) is published, so a failure
+    leaves no stack trace, message, or caller-controlled text in the trace.
+    """
+
+    error_type = error if isinstance(error, str) else type(error).__name__
+    for observer in tuple(_selection_error_observers):
+        try:
+            observer(str(namespace), str(error_type))
+        except Exception:  # noqa: BLE001 - observation is fail-open
+            continue
+
+
+def update_selection_error_stats(
+    stats_path: str | Path, namespace: str
+) -> dict[str, Any]:
+    """Increment the per-namespace error counter in ``recall_stats.json``.
+
+    Observe-only: existing fields are preserved and an untracked namespace
+    (e.g. the embedder warm-up) is a no-op.
+    """
+
+    key = selection_error_key(namespace)
+    if key is None:
+        return {}
+
+    def accumulate(current: dict[str, Any]) -> dict[str, Any]:
+        updated = dict(current)
+        updated[key] = int(current.get(key, 0)) + 1
+        return updated
+
+    return _accumulate_stats(stats_path, accumulate)
+
+
+def update_recall_stats(
+    stats_path: str | Path,
+    evaluation: Mapping[str, Any],
+    *,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Atomically accumulate shadow metrics with stable, explicit denominators."""
+
+    def accumulate(current: dict[str, Any]) -> dict[str, Any]:
+        evaluations = int(current.get("evaluations", 0)) + 1
+        hits = int(current.get("hits", 0)) + int(bool(evaluation.get("hit")))
+        hit_at_1_count = int(current.get("hit_at_1_count", 0)) + int(
+            bool(evaluation.get("hit_at_1"))
+        )
+        contaminated_runs = int(
+            current.get("contaminated_runs", current.get("false_hits", 0))
+        ) + int(
+            bool(
+                evaluation.get(
+                    "contaminated_run", evaluation.get("false_hit")
                 )
             )
-            recall_runs = int(current.get("recall_runs", 0)) + int(
-                bool(evaluation.get("recalled_apps"))
-            )
-            package_true_positives = int(
-                current.get("package_true_positives", 0)
-            ) + int(evaluation.get("package_true_positives", 0))
-            package_predictions = int(current.get("package_predictions", 0)) + int(
-                evaluation.get("package_predictions", 0)
-            )
-            package_actuals = int(current.get("package_actuals", 0)) + int(
-                evaluation.get("package_actuals", 0)
-            )
-            updated = {
-                "schema_v": 2,
+        )
+        recall_runs = int(current.get("recall_runs", 0)) + int(
+            bool(evaluation.get("recalled_apps"))
+        )
+        package_true_positives = int(
+            current.get("package_true_positives", 0)
+        ) + int(evaluation.get("package_true_positives", 0))
+        package_predictions = int(current.get("package_predictions", 0)) + int(
+            evaluation.get("package_predictions", 0)
+        )
+        package_actuals = int(current.get("package_actuals", 0)) + int(
+            evaluation.get("package_actuals", 0)
+        )
+        updated = dict(current)
+        updated.update(
+            {
                 "evaluations": evaluations,
                 "recall_runs": recall_runs,
                 "hits": hits,
@@ -1219,22 +1803,83 @@ def update_recall_stats(
                 "false_hit_rate": round(contaminated_runs / evaluations, 6),
                 "latest": {"run_id": run_id, **dict(evaluation)},
             }
-            descriptor, temp_name = tempfile.mkstemp(
-                prefix=f".{path.name}.", dir=path.parent
-            )
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                    json.dump(updated, stream, ensure_ascii=False, indent=2, sort_keys=True)
-                    stream.write("\n")
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temp_name, path)
-            finally:
-                if os.path.exists(temp_name):
-                    os.unlink(temp_name)
-            return updated
-        finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        )
+        return updated
+
+    return _accumulate_stats(stats_path, accumulate)
+
+
+def update_procedure_recall_stats(
+    stats_path: str | Path,
+    selection: "ProcedureSelection | Mapping[str, Any] | None",
+    *,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Accumulate one run's procedure-card recall outcome (candidates/hit/reason).
+
+    Zero recall is a visible neutral state, not a missing record: the candidate
+    and post-filter counts separate "too few cards" from "threshold too tight",
+    and the reason histogram keeps every run attributable.
+    """
+
+    payload = (
+        selection.to_dict()
+        if isinstance(selection, ProcedureSelection)
+        else dict(selection or {})
+    )
+    reason = str(payload.get("reason") or "unknown")
+
+    def accumulate(current: dict[str, Any]) -> dict[str, Any]:
+        runs = int(current.get("procedure_runs", 0)) + 1
+        hits = int(current.get("procedure_hits", 0)) + int(
+            bool(payload.get("lesson_id"))
+        )
+        candidates = int(current.get("procedure_candidates", 0)) + int(
+            payload.get("candidates", 0) or 0
+        )
+        filtered = int(current.get("procedure_filtered", 0)) + int(
+            payload.get("filtered", 0) or 0
+        )
+        reasons = dict(current.get("procedure_reasons", {}) or {})
+        reasons[reason] = int(reasons.get(reason, 0)) + 1
+        updated = dict(current)
+        updated.update(
+            {
+                "procedure_runs": runs,
+                "procedure_hits": hits,
+                "procedure_candidates": candidates,
+                "procedure_filtered": filtered,
+                "procedure_hit_rate": round(hits / runs, 6),
+                "procedure_reasons": reasons,
+                "latest_procedure": {"run_id": run_id, **payload},
+            }
+        )
+        return updated
+
+    return _accumulate_stats(stats_path, accumulate)
+
+
+def _sync_procedure_namespace(index: "VecIndex", lessons_dir: Any) -> dict[str, Any]:
+    """Sync the derived procedure namespace from the lesson view (fail-open).
+
+    A config without a lessons directory has no lesson pipeline at all, so the
+    report stays exactly as it was.
+    """
+
+    if not lessons_dir:
+        return {}
+    try:
+        return {
+            **index.sync_procedure_lessons(load_procedure_lessons(lessons_dir)),
+            "procedures_status": "updated",
+        }
+    except Exception as exc:  # noqa: BLE001 - derived index is fail-open
+        return {
+            "procedures": 0,
+            "removed_procedures": 0,
+            "procedures_status": "error",
+            "procedures_error": type(exc).__name__,
+        }
 
 
 def incremental_upsert(
@@ -1263,11 +1908,15 @@ def incremental_upsert(
                 alias_entries,
                 all_entries=all_alias_entries,
             )
+            procedures = _sync_procedure_namespace(
+                index, getattr(config, "lessons_dir", None)
+            )
     return {
         "status": "updated",
         "episode": int(episode_indexed),
         "episode_skipped": int(episode is not None and not episode_indexed),
         "app_aliases": aliases,
+        **procedures,
     }
 
 
@@ -1321,6 +1970,9 @@ def reconcile_index(
             indexed_aliases = index.index_alias_entries(
                 aliases, all_entries=aliases
             )
+            procedures = _sync_procedure_namespace(
+                index, getattr(config, "lessons_dir", None)
+            )
             total = index.count(embed_model=active_embedder.model_id)
     return {
         "status": "reconciled",
@@ -1328,6 +1980,7 @@ def reconcile_index(
         "app_aliases": indexed_aliases,
         "removed_episodes": removed_episodes,
         "removed_app_aliases": removed_aliases,
+        **procedures,
         "total": total,
     }
 
@@ -1377,6 +2030,9 @@ def rebuild_index(
             aliases = index.index_app_aliases(memory_dir=memory_dir, store=app_store)[
                 "app_aliases"
             ]
+            procedures = _sync_procedure_namespace(
+                index, getattr(config, "lessons_dir", None)
+            )
             total = index.count(embed_model=active_embedder.model_id)
     return {
         "status": "rebuilt",
@@ -1385,6 +2041,7 @@ def rebuild_index(
         "embed_dim": active_embedder.dimension,
         "episodes": episodes,
         "app_aliases": aliases,
+        **procedures,
         "total": total,
     }
 
@@ -1423,6 +2080,33 @@ def index_app_aliases(
             return index.index_app_aliases(memory_dir=memory_dir, store=store)
 
 
+def select_procedure(
+    goal_text: str,
+    *,
+    app_package: str | None = None,
+    device_id: str | None = None,
+    db_path: str | Path = "memory/vec.db",
+    embedder: Embedder | None = None,
+    embed_model: str = DEFAULT_EMBED_MODEL,
+    embed_dim: int = 1024,
+    min_score: float = PROCEDURE_MIN_SCORE,
+) -> ProcedureSelection:
+    """Select one procedure card from a configured index (WP-WF3 entry point).
+
+    ``app_package`` is the hard app gate: when it is known only cards scoped to
+    exactly that package qualify, otherwise only general cards do.
+    """
+
+    active = embedder or MlxEmbedder(embed_model, embed_dim)
+    with VecIndex(db_path, embedder=active) as index:
+        return index.select_procedure(
+            goal_text,
+            app_package=app_package,
+            device_id=device_id,
+            min_score=min_score,
+        )
+
+
 def recall(
     query: str,
     *,
@@ -1457,17 +2141,33 @@ __all__ = [
     "Embedder",
     "HashEmbedder",
     "MlxEmbedder",
+    "PROCEDURE_MAX_ITEMS",
+    "PROCEDURE_MAX_TOKENS",
+    "PROCEDURE_MIN_SCORE",
+    "ProcedureSelection",
+    "RECALL_SELECTION_ERROR",
     "VecIndex",
+    "add_selection_error_observer",
     "alias_snapshot",
+    "embedder_needs_warmup",
     "episode_is_indexable",
     "evaluate_recall",
     "extract_launched_apps",
+    "format_procedure_block",
     "index_app_aliases",
     "index_episodes",
     "incremental_upsert",
+    "load_procedure_lessons",
+    "note_selection_error",
     "read_episode_events",
     "recall",
     "reconcile_index",
     "rebuild_index",
+    "resolve_embedder_factory",
+    "select_procedure",
+    "selection_error_key",
+    "update_procedure_recall_stats",
     "update_recall_stats",
+    "update_selection_error_stats",
+    "warmup_embedder",
 ]

@@ -24,7 +24,7 @@ from phone_agent.grounding.provider import (
     ScreenBinding,
 )
 from phone_agent.v2.coords import convert_relative_to_absolute
-from phone_agent.v2.events import EventBus
+from phone_agent.v2.events import APP_LAUNCHED, EventBus
 from phone_agent.v2.locate_scope import (
     ScopeCrop,
     build_scope_crop,
@@ -124,6 +124,25 @@ def parse_badge(mark_id: str) -> tuple[str, int | None]:
 _UNSTABLE_MARK_CODES = frozenset(
     {"timeout", "provider_error", "accessibility_xml_parse_error"}
 )
+
+# WP-WF4-A (scheme C): packages that never announce ``app/launched`` from the
+# foreground-change path — the Android shell itself, the stock permission /
+# installer dialogs, and the launcher family (any package whose final segment
+# contains ``launcher``, covering vendor launchers like nexuslauncher /
+# launcher3). ``config.foreground_event_blocked_packages`` extends this set
+# additively. The device-confirmed ``launch_app`` path is NOT subject to this
+# filter (it only fires for authorized, installed, launch-cleared packages).
+FOREGROUND_EVENT_SYSTEM_PACKAGES: frozenset[str] = frozenset(
+    {
+        "android",
+        "com.android.systemui",
+        "com.android.packageinstaller",
+        "com.google.android.packageinstaller",
+        "com.android.permissioncontroller",
+        "com.google.android.permissioncontroller",
+    }
+)
+_LAUNCHER_TAIL_MARKER = "launcher"
 
 
 @dataclass
@@ -227,6 +246,13 @@ class PhoneSession:
         # Observe-only experience mirrors. Tools append only after device-confirmed
         # launches; finish records whether its independent verifier actually ran.
         self.launched_apps: list[str] = []
+        # WP-WF3: ``app/launched`` is emitted at most once per package per run.
+        self._launched_this_run: set[str] = set()
+        # WP-WF4-A (scheme C): last foreground package seen by a committed
+        # observation. A change to a not-yet-announced package emits
+        # ``app/launched`` (source="foreground") through the same per-run
+        # dedupe set as the launch_app path. Reset at the run boundary.
+        self._foreground_package: str | None = None
         self.finish_verifier: str = "skipped"
         # finish two-step review (S2 §1.2): the first finish() call emits a world
         # mirror (review packet) and sets finish_reviewed=True at finish_review_seq;
@@ -274,6 +300,121 @@ class PhoneSession:
         value = str(package or "").strip()
         if value:
             self.launched_apps.append(value)
+
+    def emit_app_launched(
+        self,
+        package: str,
+        device_id: str | None = None,
+        *,
+        source: str = "launch_app",
+    ) -> bool:
+        """Emit ``app/launched`` once per package for this run (WP-WF3/WF4-A).
+
+        The second procedure-card injection point listens on this event. Two
+        sources share this one per-run dedupe set (WP-WF4-A scheme C): the
+        device-confirmed ``launch_app`` success path (``source="launch_app"``)
+        and the foreground-change path in the committed observation
+        (``source="foreground"``). The emission is idempotent per package and
+        fail-open: a missing bus or a broken listener can never turn a
+        successful launch into a failure.
+        """
+
+        value = str(package or "").strip()
+        if not value or value in self._launched_this_run:
+            return False
+        self._launched_this_run.add(value)
+        bus = self.event_bus
+        if bus is None:
+            return False
+        serial = device_id or getattr(self.config, "device_id", None)
+        try:
+            bus.emit(
+                APP_LAUNCHED,
+                {"package": value, "device_id": serial, "source": source},
+            )
+        except Exception:  # noqa: BLE001 - observation events are fail-open
+            return False
+        return True
+
+    def reset_launched_events(self) -> None:
+        """Clear the per-run ``app/launched`` dedupe set (run boundary).
+
+        The foreground tracker resets too (WP-WF4-A): the next run's first
+        committed observation re-announces whatever is in the foreground
+        under the fresh per-run dedupe set.
+        """
+
+        self._launched_this_run.clear()
+        self._foreground_package = None
+
+    # -- foreground-change announcements (WP-WF4-A, scheme C) --------------
+
+    @staticmethod
+    def _package_of(
+        foreground: "ForegroundAppObservation | None",
+    ) -> str | None:
+        """Package name announced for a foreground observation (``None`` = unknown).
+
+        ``package_name`` wins; a component-only observation falls back to the
+        component's package prefix (``com.foo/.Bar`` -> ``com.foo``).
+        """
+
+        if foreground is None:
+            return None
+        package = getattr(foreground, "package_name", None)
+        if package:
+            return str(package)
+        component = getattr(foreground, "component_name", None)
+        if component:
+            head = str(component).split("/", 1)[0].strip()
+            if head:
+                return head
+        return None
+
+    def _is_blocked_foreground_package(self, package: str) -> bool:
+        """System-package filter for foreground-source announcements (WF4-A).
+
+        Blocks the built-in minimal set (shell, permission/installer dialogs),
+        the launcher family (final segment contains ``launcher``), and the
+        additive ``config.foreground_event_blocked_packages`` entries. An
+        unreadable/empty package is blocked too (nothing to announce).
+        """
+
+        value = str(package or "").strip()
+        if not value:
+            return True
+        if value in FOREGROUND_EVENT_SYSTEM_PACKAGES:
+            return True
+        if _LAUNCHER_TAIL_MARKER in value.rsplit(".", 1)[-1].casefold():
+            return True
+        blocked = getattr(self.config, "foreground_event_blocked_packages", ()) or ()
+        return value in {str(item).strip() for item in blocked if str(item).strip()}
+
+    def _maybe_emit_foreground_app(
+        self, foreground: "ForegroundAppObservation | None"
+    ) -> None:
+        """Announce a foreground-package change (WP-WF4-A scheme C, fail-open).
+
+        Runs at every committed observation: when the observed foreground
+        package differs from the tracker and is not filtered, ``app/launched``
+        is emitted with ``source="foreground"`` — the per-run dedupe set inside
+        :meth:`emit_app_launched` keeps it at most once per package, shared
+        with the ``launch_app`` path, so downstream injectors are unchanged.
+        The tracker always advances (even to a filtered/unknown package) so a
+        system package does not re-enter the change check on every observe.
+        Emission failures are swallowed by ``emit_app_launched``'s own
+        fail-open contract.
+        """
+
+        package = self._package_of(foreground)
+        if (
+            package is not None
+            and package != self._foreground_package
+            and not self._is_blocked_foreground_package(package)
+        ):
+            self.emit_app_launched(package, source="foreground")
+        self._foreground_package = package
+
     @staticmethod
     def _normalize_launch_term(value: str) -> str:
         """Strip all whitespace from a launch term without guessing aliases."""
@@ -743,6 +884,10 @@ class PhoneSession:
                 )
             except Exception:  # noqa: BLE001 - event bus must never alter observation semantics
                 pass
+        # WP-WF4-A (scheme C): a foreground-package change visible in the
+        # committed frame announces ``app/launched`` (source="foreground") —
+        # same per-run dedupe set as the launch_app path, fail-open.
+        self._maybe_emit_foreground_app(foreground)
         return observation
 
     def _invalidate_batch(self) -> None:

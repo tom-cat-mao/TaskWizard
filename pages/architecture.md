@@ -82,7 +82,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 | 系统提示 + 工具 schema | 静态 | 工具契约与安全规则 |
 | TaskDoc 任务板 | run 内 | 模型自维护的目标与路线；pinned，压缩时保留 |
 | 流程线 | run 内 | 最近 8 步"意图→工具→结果"，从 transcript 推导 |
-| 应用清单/记忆 | 跨 run | App-KB 事实；将来注入晋升的经验 |
+| 应用清单/记忆 | 跨 run | App-KB 事实；`MEMORY_RAG=on` 时按三时机注入晋升经验（开局 / mention 预取 / 进场） |
 | 截图 + marks | 每步 | 当前世界状态；历史图片滚动剪除 |
 | 窗口结构 | 每步 | marks 按窗口分组 + 可操作性标注（windowed dump 支持时） |
 

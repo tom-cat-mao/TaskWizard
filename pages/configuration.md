@@ -116,7 +116,7 @@
 | `PHONE_AGENT_EXPERIENCE_DIR` | path | `memory/experience` | 档案目录 |
 | `PHONE_AGENT_EPISODE_KEEP` | int | `500` | 保留的完整档案数；更老的归档为聚合统计 |
 | `PHONE_AGENT_EPISODE_ARCHIVE_DAYS` | int | `90` | 超过该天数的档案在 dream 时归档 |
-| `PHONE_AGENT_MEMORY_RAG` | `off`/`shadow`/`on` | `shadow` | 语义回想档位；`shadow` 只观测不注入；`on` 注入人审通过的经验 |
+| `PHONE_AGENT_MEMORY_RAG` | `off`/`shadow`/`on` | `shadow` | 语义回想档位；`shadow` 只观测不注入；`on` 注入 approved/auto_approved 的经验 |
 | `PHONE_AGENT_EMBED_MODEL` | str | `Qwen/Qwen3-Embedding-0.6B` | 本地嵌入模型（MLX） |
 | `PHONE_AGENT_EMBED_DIM` | int | `1024` | 嵌入向量维度 |
 | `PHONE_AGENT_VEC_DB` | path | `memory/vec.db` | 向量索引文件；run 结束增量更新，dream 对账 |
@@ -128,6 +128,7 @@
 | `PHONE_AGENT_LESSONS_DIR` | path | `memory/lessons` | 经验库存储目录 |
 | `PHONE_AGENT_LESSON_INJECT_MAX` | int | `3` | 单次注入的经验条数上限 |
 | `PHONE_AGENT_LESSON_INJECT_TOKENS` | int | `800` | 注入内容的 token 上限 |
+| `PHONE_AGENT_FOREGROUND_EVENT_BLOCKED_PACKAGES` | csv | 空 | app/launched 进场注入的前台包过滤补充名单；叠加内建系统包名单 |
 
 ## 任务板与记录
 
@@ -139,3 +140,13 @@
 | `PHONE_AGENT_DIAG_EVIDENCE` | bool | `false` | 诊断证据流（live-diagnosis 用） |
 | `PHONE_AGENT_DIAG_UNREDACTED` | bool | `false` | 本机诊断全保真模式 |
 | `PHONE_AGENT_RUNS_DIR` | path | `memory/runs` | runner 子进程运行目录（事件/控制通道） |
+| `PHONE_AGENT_DELIVERABLE` | bool | `true` | run 级 HTML 产出物能力（`write_document`/`update_document`） |
+| `PHONE_AGENT_DELIVERABLE_DIR` | path | `outputs/deliverables` | 产出物目录；文件固定为 `<run_id>.html`，上限 256 KiB |
+
+## 插件
+
+| 变量 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `PHONE_AGENT_PLUGINS` | bool | `true` | 外部插件总开关；`false` 关闭全部插件，内建能力不受影响 |
+| `PHONE_AGENT_PLUGIN_MANIFEST` | path | `<repo>/.taskwizard.toml` | 项目级插件清单路径覆盖 |
+| `PHONE_AGENT_PLUGIN_INDEX` | str | `plugins/index.json` | `plugin search` 索引源（URL 或本地 json） |

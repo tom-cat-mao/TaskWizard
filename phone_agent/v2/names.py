@@ -1100,6 +1100,74 @@ def decide_name(
     return decide_name_typed(mention, candidates, settings=active)
 
 
+def mentioned_apps(
+    text: str,
+    *,
+    registry: Any | None = None,
+    kb_entries: Iterable[Mapping[str, Any]] = (),
+    settings: ResolverSettings | None = None,
+    limit: int = 2,
+) -> list[AppNameResolution]:
+    """Resolve the app mentions that explicitly occur in free text.
+
+    WP-WF4-C mention prefetch (design Q3): the deterministic half — every
+    distinct source spelling that :func:`mention_occurs` finds in ``text`` —
+    feeds the shared typed resolver, and only ``resolved`` (unique pointing)
+    decisions count.  ``ambiguous``/``unknown`` mentions are dropped, never
+    guessed, and weak evidence types never auto-resolve.  Results are ordered
+    by first mention position, deduplicated per package (two aliases of one
+    app keep the earlier mention), and capped at ``limit``.  No embedding
+    route is consulted: weak similarity types cannot produce a ``resolved``
+    decision anyway, so the prefetch stays purely deterministic.
+    """
+
+    active = settings or ResolverSettings()
+    cap = max(0, int(limit))
+    if not str(text or "").strip() or cap == 0:
+        return []
+    sources = collect_name_sources(registry=registry, kb_entries=kb_entries)
+    normalized_text = normalize_name(text)
+    occurring: dict[str, tuple[int, str]] = {}
+    for source in sources:
+        term = str(source.term or "").strip()
+        normalized_term = normalize_name(term)
+        if not normalized_term or normalized_term in occurring:
+            continue
+        if not mention_occurs(term, text):
+            continue
+        position = normalized_text.find(normalized_term)
+        if position < 0:
+            position = str(text).casefold().find(term.casefold())
+        occurring[normalized_term] = (
+            position if position >= 0 else len(str(text)),
+            term,
+        )
+
+    resolved: list[AppNameResolution] = []
+    seen_packages: set[str] = set()
+    for _position, term in sorted(occurring.values(), key=lambda item: item[0]):
+        resolution = decide_name(
+            term,
+            generate_candidates(
+                term,
+                registry=registry,
+                kb_entries=kb_entries,
+                settings=active,
+            ),
+            settings=active,
+        )
+        if resolution.status != "resolved" or resolution.winner is None:
+            continue
+        package = str(resolution.winner.package or "").strip()
+        if not package or package in seen_packages:
+            continue
+        seen_packages.add(package)
+        resolved.append(resolution)
+        if len(resolved) >= cap:
+            break
+    return resolved
+
+
 def resolve_name(
     mention: str,
     *,
@@ -1167,6 +1235,7 @@ __all__ = [
     "generate_candidates",
     "lexical_similarity",
     "mention_occurs",
+    "mentioned_apps",
     "name_variants",
     "normalize_name",
     "pinyin_similarity",

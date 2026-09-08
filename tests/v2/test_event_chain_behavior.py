@@ -264,7 +264,7 @@ def test_t2_fold_prunes_once_and_taskdoc_stays_pinned(tmp_path, monkeypatch):
     the rebuilt transcript to the inner listeners — the TaskDoc injector still
     pins a fresh board onto it. The same invariant at unit level is covered by
     ``tests/v2/test_compact.py::test_t2_fold_preserves_pinned_taskdoc_and_listener_refreshes_it``
-    and ``tests/v2/test_context_pruner.py::test_compact_on_prunes_images_exactly_once``;
+    (and the compact-OFF variant in ``tests/v2/test_context_pruner.py``);
     this test asserts it through the assembled chain.
     """
 

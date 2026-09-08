@@ -17,6 +17,21 @@ Payload contracts for the plugin events:
     Payload contains ``epoch``, ``screen_seq``, ``marks_count``, and
     ``marks_failure_code``.
 
+``APP_LAUNCHED`` / ``"app/launched"``
+    Observed with :meth:`EventBus.emit` from two sources (WP-WF4-A scheme C):
+    a device-confirmed ``launch_app`` success (``source="launch_app"``), or a
+    committed observation whose foreground package changed to a
+    not-yet-announced package (``source="foreground"``; system packages —
+    shell, permission/installer dialogs, launcher family — never announce).
+    Payload is
+    ``{"package": <resolved package name>, "device_id": <device serial>,
+    "source": <"launch_app" | "foreground">}``.
+    Emitted at most once per package per run (both sources share the dedupe
+    set); the emission point is fail-open.  It drives the app-entrance
+    delivery of the procedure channel — that app's card plus its injectable
+    rules — alongside the run-start general card and the mention prefetch,
+    all three sharing one per-package per-run delivered set.
+
 ``TOOL_PRE_EXECUTE`` / ``"tool/pre_execute"``
     Applied with :meth:`EventBus.waterfall`. Payload is the tool-call object
     seen by middleware: tool ``name``, ``args``, and session-facing request
@@ -70,6 +85,7 @@ from typing import Any
 RUN_START = "run/start"
 RUN_END = "run/end"
 OBSERVE = "observe"
+APP_LAUNCHED = "app/launched"
 TOOL_PRE_EXECUTE = "tool/pre_execute"
 MODEL_PRE_REQUEST = "model/pre_request"
 MODEL_REQUEST = "model/request"
@@ -83,6 +99,7 @@ _RESERVED_EVENTS = frozenset(
         RUN_START,
         RUN_END,
         OBSERVE,
+        APP_LAUNCHED,
         TOOL_PRE_EXECUTE,
         MODEL_PRE_REQUEST,
         MODEL_REQUEST,
@@ -221,6 +238,7 @@ class EventBus:
 
 __all__ = [
     "AGENT_AFTER",
+    "APP_LAUNCHED",
     "Disposer",
     "EventBus",
     "JUMP_END",
