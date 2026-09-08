@@ -58,6 +58,13 @@ screenshots/
 bench_output/
 outputs/
 
+# Root-level working notes (plans / specs / reviews) never belong in git
+/*-PLAN.md
+/*-SPEC.md
+/*-REVIEW-*.md
+/*-DESIGN.md
+/*-TEST.md
+
 # Keep old files during transition
 call_model.py
 app_package_name.py
