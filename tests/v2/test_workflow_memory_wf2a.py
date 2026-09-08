@@ -565,8 +565,10 @@ def test_block_budget_holds_at_boundary_token_values():
     # oversized one.
     assert format_procedure_block(selection, max_tokens=1) is None
     assert format_procedure_block(selection, max_tokens=10) is None
-    # Every rendered budget holds the hard guarantee.
-    for budget in (25, 40, 60, 120, 300, 1000):
+    # Every rendered budget holds the hard guarantee.  Budgets are scaled to
+    # the CJK-aware estimator: the fixed header alone costs ~37 tokens and the
+    # header + source line ~51, so the renderable range starts above that.
+    for budget in (55, 70, 90, 120, 300, 1000):
         block = format_procedure_block(selection, max_tokens=budget)
         assert block is not None
         assert estimate_text_tokens(block) <= budget
