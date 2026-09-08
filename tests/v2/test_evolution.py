@@ -1250,7 +1250,9 @@ def test_selection_first_fit_keeps_short_rule_that_fits(tmp_path):
 def test_selection_packing_uses_the_rendered_line_cost(tmp_path):
     # Bare text fits a 200-token budget; the exact line both injectors render
     # (numbering + source label) does not — packing must weigh the latter.
-    big = _view_rule("les_aaaaaaaaaaaa", "字" * 780, version=2, created_ts=2.0)
+    # ASCII text keeps the bare-text estimate stable under the CJK-aware
+    # estimator while the wrapper still carries CJK punctuation.
+    big = _view_rule("les_aaaaaaaaaaaa", "A" * 780, version=2, created_ts=2.0)
     lessons = _write_lessons_view(tmp_path, [big])
 
     assert estimate_text_tokens(big.text) <= 200
