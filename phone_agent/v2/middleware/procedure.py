@@ -1,4 +1,4 @@
-"""WP-WF3 procedure-card injection: two event-bus points, one card each.
+"""WP-WF3/WF4 procedure-card + app-rule injection points.
 
 Per ``WORKFLOW-MEMORY-DESIGN.md`` §5 the procedure channel injects at most one
 card per point, inside its **own** 1-card/300-token budget
@@ -19,19 +19,39 @@ card per point, inside its **own** 1-card/300-token budget
   is selected at most once per run, and ``on`` injects while ``shadow`` only
   records the recall statistics.
 
-Both points render through
+WP-WF4 (chain delivery, design 增补 v3) extends both event points:
+
+* **App rules beside the card** — an entrance delivery now also carries the
+  app's injectable rules (``scope.app ==`` the package, device-matched,
+  ``approved``/``auto_approved`` rules selected read-only by
+  :func:`phone_agent.v2.evolution.select_app_rules_for_injection`) inside its
+  own ≤2-item/200-token budget, rendered as an ``[APP_RULES]`` section of the
+  same one-shot system message.  A rules-only delivery (no card hit for that
+  app) is still delivered.
+* **Mention prefetch (run start)** — :meth:`run_start` resolves the apps
+  explicitly mentioned in the goal text through
+  :func:`phone_agent.v2.names.mentioned_apps` (typed resolver, ``resolved``
+  only, ≤2 apps in mention order) and queues each app's card + rules for the
+  **first** model call, so planning already sees them (design Q2).  Prefetch
+  and the entrance channel share the per-package per-run delivered set, so a
+  prefetched app is never delivered again on entrance.  ``shadow`` selects and
+  records statistics but never injects.
+
+Every delivery renders the card through
 :func:`phone_agent.v2.recall.format_procedure_block`, which labels the card a
-non-binding historical reference and names its source lesson id. Every
+non-binding historical reference and names its source lesson id.  Every
 selection — hit or zero-recall — is accumulated by
-:func:`phone_agent.v2.recall.update_procedure_recall_stats`, and every injected
-id is exposed through :attr:`injected_ids` for the trace/episode audit plane.
-The whole channel is fail-open: a missing index, embedder, or stats file
-disables injection for that point and never alters the run.
+:func:`phone_agent.v2.recall.update_procedure_recall_stats`, and every
+injected id is exposed through :attr:`injected_ids` (cards) and
+:attr:`injected_rule_ids` (app rules) for the trace/episode audit plane.  The
+whole channel is fail-open: a missing index, embedder, or stats file disables
+injection for that point and never alters the run.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +64,38 @@ from phone_agent.v2.recall import (
 # Marker prefix for the post-launch one-shot block, kept distinct from the
 # run-start ``[过程参考]`` card so the two points stay attributable in a trace.
 PROCEDURE_CARD_PREFIX = "[PROCEDURE_CARD]"
+# WP-WF4-C: the app-scoped rule section of the same one-shot delivery.
+APP_RULES_PREFIX = "[APP_RULES]"
+APP_RULES_HEADER = (
+    "（本 App 的历史经验规则，仅供参考，不是规则；"
+    "与当前世界状态冲突时以观测为准）"
+)
+# Trace point names (C3 audit plane).
+POINT_RUN_START = "run_start"
+POINT_RUN_START_MENTION = "run_start_mention"
+POINT_APP_LAUNCHED = "app_launched"
+# Mention prefetch cap (design Q3): at most two resolved apps, mention order.
+MENTION_PREFETCH_MAX_APPS = 2
+
+
+@dataclass(frozen=True)
+class _Delivery:
+    """One pending one-shot delivery: an app card plus its app rules."""
+
+    point: str
+    package: str | None
+    card_id: str | None = None
+    card_block: str | None = None
+    rules: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+
+
+def _render_app_rules(rules: Sequence[tuple[str, str]]) -> str:
+    """Render the ``[APP_RULES]`` section for (lesson_id, text) pairs."""
+
+    lines = [APP_RULES_PREFIX, APP_RULES_HEADER]
+    for index, (_lesson_id, text) in enumerate(rules, start=1):
+        lines.append(f"{index}. {text}")
+    return "\n".join(lines)
 
 
 class ProcedureCardInjector:
@@ -71,8 +123,12 @@ class ProcedureCardInjector:
         self.goal: str = ""
         self.run_start_block: str | None = None
         self.run_start_selection: ProcedureSelection | None = None
-        self._pending: tuple[str, str, str] | None = None
+        self._pending: _Delivery | None = None
+        # WP-WF4-C: mention prefetch deliveries queued at run start, drained
+        # (FIFO, before any entrance delivery) at the first model call.
+        self._prefetch: list[_Delivery] = []
         self._injected_ids: list[str] = []
+        self._injected_rule_ids: list[str] = []
         self._selected_packages: set[str] = set()
         # Emergency revocations (P0 #18): a revoked card must not reach a later
         # injection point. Already-sent messages stay immutable.
@@ -87,20 +143,30 @@ class ProcedureCardInjector:
         self.run_start_block = None
         self.run_start_selection = None
         self._pending = None
+        self._prefetch = []
         self._injected_ids = []
+        self._injected_rule_ids = []
         self._selected_packages = set()
 
     @property
     def injected_ids(self) -> list[str]:
-        """Lesson ids actually handed to the model this run (audit plane)."""
+        """Card lesson ids actually handed to the model this run (audit)."""
 
         return list(self._injected_ids)
 
     @property
-    def pending_lesson_id(self) -> str | None:
-        """The lesson id waiting for the next ``model/pre_request``, if any."""
+    def injected_rule_ids(self) -> list[str]:
+        """App-rule lesson ids actually handed to the model this run (C3)."""
 
-        return self._pending[0] if self._pending is not None else None
+        return list(self._injected_rule_ids)
+
+    @property
+    def pending_lesson_id(self) -> str | None:
+        """The pending entrance card id waiting for the next pre-request."""
+
+        if self._pending is not None and self._pending.card_id:
+            return self._pending.card_id
+        return None
 
     @property
     def mode(self) -> str:
@@ -118,7 +184,7 @@ class ProcedureCardInjector:
 
         return self.mode in {"on", "shadow"}
 
-    # -- injection point one: run start (general cards) ------------------
+    # -- injection point one: run start (general cards + mention prefetch) -
 
     def run_start(self, goal: str) -> ProcedureSelection | None:
         """Select the run-start general card and render its prompt block.
@@ -127,31 +193,37 @@ class ProcedureCardInjector:
         (the selector's hard filter). ``shadow``/``off`` leave the block
         empty: the pre-existing shadow path owns the run-start measurement
         there, so selecting twice would double-count one run.
+
+        WP-WF4-C: after the general card, mentioned apps are prefetched
+        (select in ``on``/``shadow``, inject only in ``on``).
         """
 
         self.goal = str(goal or "").strip()
         self.run_start_block = None
         self.run_start_selection = None
-        if not self.injects or not self.goal:
+        if not self.goal:
             return None
-        selection = self._select(self.goal, app_package=None)
-        self.run_start_selection = selection
-        if selection is None or not selection.selected:
-            return selection
-        if self._revoked_selection(selection):
-            return selection
-        block = format_procedure_block(selection)
-        if not block:
-            return selection
-        self.run_start_block = block
-        self._injected_ids.append(str(selection.lesson_id))
-        self._record_trace("run_start", [str(selection.lesson_id)], app_package=None)
-        return selection
+        if self.injects:
+            selection = self._select(self.goal, app_package=None)
+            self.run_start_selection = selection
+            if selection is not None and selection.selected:
+                if not self._revoked_selection(selection):
+                    block = format_procedure_block(selection)
+                    if block:
+                        self.run_start_block = block
+                        self._injected_ids.append(str(selection.lesson_id))
+                        self._record_trace(
+                            POINT_RUN_START,
+                            [str(selection.lesson_id)],
+                            app_package=None,
+                        )
+        self._prefetch_mentioned_apps()
+        return self.run_start_selection
 
     # -- injection point two: after a confirmed launch -------------------
 
     def on_app_launched(self, payload: Any) -> None:
-        """``app/launched`` listener: select the app-scoped card (WP-WF3)."""
+        """``app/launched`` listener: card + app rules for that package."""
 
         if not self.observes:
             return
@@ -161,48 +233,58 @@ class ProcedureCardInjector:
         if not package or package in self._selected_packages:
             return
         # One selection attempt per package per run: a later re-launch of the
-        # same app has the same goal and the same index, so it cannot produce a
-        # different card and must not inject twice.
+        # same app has the same goal and the same index, so it cannot produce
+        # a different card and must not inject twice.  Mention-prefetched
+        # packages share this set, so entrance never re-delivers them (C2).
         self._selected_packages.add(package)
         goal = self.goal or self._goal_from_session()
         if not goal:
             return
-        selection = self._select(goal, app_package=package)
-        if selection is None or not selection.selected or not self.injects:
+        delivery = self._build_delivery(
+            goal, package, with_rules=self.injects, point=POINT_APP_LAUNCHED
+        )
+        if delivery is None or not self.injects:
             return
-        if self._revoked_selection(selection):
-            return
-        block = format_procedure_block(selection)
-        if not block:
-            return
-        # Replacing a still-pending card keeps one card in flight: two launches
-        # before the next model call must never queue two blocks.
-        self._pending = (str(selection.lesson_id), block, package)
+        # Replacing a still-pending entrance delivery keeps one message in
+        # flight: two launches before the next model call must never queue two
+        # entrance blocks.  Prefetch deliveries queue separately and are never
+        # displaced by a launch.
+        self._pending = delivery
 
     def make_delta(self, messages: Sequence[Any]) -> list[Any] | None:
-        """Consume the pending card as one trailing system message (or ``None``)."""
+        """Consume pending deliveries as trailing system messages (or ``None``)."""
 
-        pending = self._pending
-        if pending is None or pending[0] in self._revoked:
+        deliveries: list[_Delivery] = []
+        while self._prefetch:
+            deliveries.append(self._prefetch.pop(0))
+        if self._pending is not None:
+            deliveries.append(self._pending)
             self._pending = None
-            return None
-        self._pending = None
-        lesson_id, block, package = pending
         try:
             from langchain_core.messages import SystemMessage
-
-            delta = [
-                *messages,
-                SystemMessage(content=f"{PROCEDURE_CARD_PREFIX}\n{block}"),
-            ]
         except Exception:  # noqa: BLE001 - injection is fail-open
             return None
-        self._injected_ids.append(lesson_id)
-        self._record_trace("app_launched", [lesson_id], app_package=package)
-        return delta
+        delta = list(messages)
+        injected_any = False
+        for delivery in deliveries:
+            content, card_id, rules = self._render_delivery(delivery)
+            if content is None:
+                continue
+            delta.append(SystemMessage(content=content))
+            if card_id:
+                self._injected_ids.append(card_id)
+            for rule_id, _text in rules:
+                self._injected_rule_ids.append(rule_id)
+            self._record_trace(
+                delivery.point,
+                ([card_id] if card_id else []) + [rid for rid, _ in rules],
+                app_package=delivery.package,
+            )
+            injected_any = True
+        return delta if injected_any else None
 
     def on_pre_request(self, messages: Any, next: Callable[[Any], Any]) -> Any:
-        """``model/pre_request`` waterfall listener: inject the pending card."""
+        """``model/pre_request`` waterfall listener: inject pending deliveries."""
 
         delta = self.make_delta(messages)
         if delta is None:
@@ -212,14 +294,17 @@ class ProcedureCardInjector:
     # -- internals -------------------------------------------------------
 
     def revoke(self, lesson_id: str) -> None:
-        """Exclude one card from every later injection point (P0 #18)."""
+        """Exclude one card/rule from every later injection point (P0 #18)."""
 
         clean = str(lesson_id or "").strip()
         if not clean:
             return
         self._revoked.add(clean)
-        if self._pending is not None and self._pending[0] == clean:
+        if self._pending is not None and self._pending.card_id == clean:
             self._pending = None
+        # Queued prefetch deliveries are filtered against ``_revoked`` at
+        # delivery time; a pending delivery whose rules got revoked keeps its
+        # remaining rules.
         if self.run_start_selection is not None and (
             self.run_start_selection.lesson_id == clean
         ):
@@ -230,6 +315,126 @@ class ProcedureCardInjector:
             selection is not None
             and str(selection.lesson_id or "") in self._revoked
         )
+
+    # -- WP-WF4-C internals: prefetch + delivery assembly -----------------
+
+    def _prefetch_mentioned_apps(self) -> None:
+        """Queue card+rules deliveries for apps mentioned in the goal (C2)."""
+
+        if not self.observes or not self.goal:
+            return
+        try:
+            packages = self._mentioned_packages(self.goal)
+        except Exception:  # noqa: BLE001 - prefetch is fail-open
+            return
+        for package in packages:
+            clean = str(package or "").strip()
+            if not clean or clean in self._selected_packages:
+                continue
+            self._selected_packages.add(clean)
+            delivery = self._build_delivery(
+                self.goal,
+                clean,
+                with_rules=self.injects,
+                point=POINT_RUN_START_MENTION,
+            )
+            if delivery is not None and self.injects:
+                self._prefetch.append(delivery)
+
+    def _mentioned_packages(self, goal: str) -> list[str]:
+        """Resolve mentioned apps via the typed resolver, mention order."""
+
+        from phone_agent.v2.names import ResolverSettings, mentioned_apps
+        from phone_agent.v2.resolver import app_kb_entries
+
+        resolutions = mentioned_apps(
+            goal,
+            kb_entries=app_kb_entries(self.session),
+            settings=ResolverSettings.from_config(self.config),
+            limit=MENTION_PREFETCH_MAX_APPS,
+        )
+        return [
+            str(resolution.winner.package)
+            for resolution in resolutions
+            if resolution.winner is not None
+        ]
+
+    def _build_delivery(
+        self, goal: str, package: str, *, with_rules: bool, point: str
+    ) -> _Delivery | None:
+        """Select one app's card (+ rules) and assemble its delivery."""
+
+        card_id: str | None = None
+        card_block: str | None = None
+        selection = self._select(goal, app_package=package)
+        if (
+            selection is not None
+            and selection.selected
+            and not self._revoked_selection(selection)
+        ):
+            block = format_procedure_block(selection)
+            if block:
+                card_id = str(selection.lesson_id)
+                card_block = block
+        rules: tuple[tuple[str, str], ...] = ()
+        if with_rules:
+            rules = tuple(self._select_app_rules(package))
+        if card_block is None and not rules:
+            return None
+        return _Delivery(
+            point=point,
+            package=package,
+            card_id=card_id,
+            card_block=card_block,
+            rules=rules,
+        )
+
+    def _select_app_rules(self, package: str) -> list[tuple[str, str]]:
+        """Read-only app-rule snapshot rendered as one-liners (fail-open)."""
+
+        try:
+            from phone_agent.v2.evolution import select_app_rules_for_injection
+
+            lessons = select_app_rules_for_injection(
+                getattr(self.config, "lessons_dir", "memory/lessons"),
+                app_package=package,
+                device_scope=self._device_id(),
+            )
+        except Exception:  # noqa: BLE001 - app-rule delivery is fail-open
+            return []
+        rules: list[tuple[str, str]] = []
+        for lesson in lessons:
+            lesson_id = str(getattr(lesson, "lesson_id", "") or "")
+            if not lesson_id or lesson_id in self._revoked:
+                continue
+            device = (getattr(lesson, "scope", {}) or {}).get("device")
+            scope_label = "全局 scope" if device is None else "设备 scope"
+            rules.append(
+                (lesson_id, f"{lesson.text}（来源 {lesson_id} · {scope_label}）")
+            )
+        return rules
+
+    def _render_delivery(
+        self, delivery: _Delivery
+    ) -> tuple[str | None, str | None, list[tuple[str, str]]]:
+        """Render a delivery against current revocations (zero-residue drop)."""
+
+        card_id = delivery.card_id
+        if card_id and card_id in self._revoked:
+            card_id = None
+        rules = [
+            (rule_id, text)
+            for rule_id, text in delivery.rules
+            if rule_id not in self._revoked
+        ]
+        parts: list[str] = []
+        if card_id and delivery.card_block:
+            parts.append(f"{PROCEDURE_CARD_PREFIX}\n{delivery.card_block}")
+        if rules:
+            parts.append(_render_app_rules(rules))
+        if not parts:
+            return None, None, []
+        return "\n".join(parts), card_id, rules
 
     def _goal_from_session(self) -> str:
         doc = getattr(self.session, "task_doc", None)
@@ -354,6 +559,8 @@ def build_procedure_injector(
 
 
 __all__ = [
+    "APP_RULES_PREFIX",
+    "MENTION_PREFETCH_MAX_APPS",
     "PROCEDURE_CARD_PREFIX",
     "ProcedureCardInjector",
     "build_procedure_injector",

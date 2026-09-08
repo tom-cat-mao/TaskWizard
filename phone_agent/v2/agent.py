@@ -1652,6 +1652,22 @@ class ThinPhoneAgent:
         ids = getattr(injector, "injected_ids", None)
         return [str(lesson_id) for lesson_id in ids or () if str(lesson_id)]
 
+    def _episode_injected_lesson_ids(self) -> list[str]:
+        """Rule ids for the episode audit: run-start mirror + app rules (C3)."""
+
+        ids = [
+            str(lesson_id)
+            for lesson_id in getattr(self, "_actually_injected_lesson_ids", [])
+            or ()
+            if str(lesson_id)
+        ]
+        injector = getattr(self, "_procedure_injector", None)
+        for rule_id in getattr(injector, "injected_rule_ids", None) or ():
+            clean = str(rule_id)
+            if clean and clean not in ids:
+                ids.append(clean)
+        return ids
+
     def _append_experience_outcome(
         self,
         task: str,
@@ -1713,12 +1729,7 @@ class ThinPhoneAgent:
                 takeover=takeover,
                 verifier=getattr(self.session, "finish_verifier", "skipped"),
                 capabilities=dict(getattr(self, "_run_capabilities", {})),
-                injected_lessons=[
-                    lesson_id
-                    for lesson_id in getattr(
-                        self, "_actually_injected_lesson_ids", []
-                    )
-                ],
+                injected_lessons=self._episode_injected_lesson_ids(),
                 injected_procedures=self._injected_procedure_ids(),
                 deliverable_path=getattr(self, "_deliverable_path", None),
             )

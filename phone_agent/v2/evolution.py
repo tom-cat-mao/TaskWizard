@@ -762,6 +762,26 @@ def proposal_metadata(
     return metadata
 
 
+def _read_lessons_snapshot(lessons_dir: str | os.PathLike[str]) -> list[LessonCandidate]:
+    """Read ``lessons.json`` read-only; a damaged view fails open to empty.
+
+    Intentionally does not construct :class:`LessonStore`: opening a runtime
+    run must never create or rebuild lesson state.
+    """
+
+    path = Path(lessons_dir) / "lessons.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            return []
+        lessons = [LessonCandidate.from_dict(item) for item in payload]
+        if len({lesson.lesson_id for lesson in lessons}) != len(lessons):
+            return []
+        return lessons
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+
 def select_lessons_for_injection(
     lessons_dir: str | os.PathLike[str],
     *,
@@ -786,16 +806,7 @@ def select_lessons_for_injection(
     if item_limit <= 0 or token_limit <= 0:
         return []
 
-    path = Path(lessons_dir) / "lessons.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, list):
-            return []
-        lessons = [LessonCandidate.from_dict(item) for item in payload]
-        if len({lesson.lesson_id for lesson in lessons}) != len(lessons):
-            return []
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return []
+    lessons = _read_lessons_snapshot(lessons_dir)
 
     local_device = _single_line(device_scope).removeprefix("device:")
     if local_device == "unknown":
@@ -810,6 +821,70 @@ def select_lessons_for_injection(
         and lesson.scope["device"] in {None, local_device or None}
         # App and app-version scope cannot be established at run start.
         and lesson.scope["app"] is None
+        and lesson.scope["app_version"] is None
+    ]
+    selected = sorted(
+        eligible,
+        key=lambda lesson: (-lesson.version, -lesson.created_ts, lesson.lesson_id),
+    )[:item_limit]
+
+    while selected and sum(estimate_text_tokens(item.text) for item in selected) > token_limit:
+        selected.pop()
+    return selected
+
+
+# WP-WF4-C: the app-entrance / mention-prefetch rule mirror keeps its own
+# quota — separate from the run-start 3-item/800-token mirror and from the
+# 1-card/300-token procedure-card budget.
+APP_RULES_MAX_ITEMS = 2
+APP_RULES_MAX_TOKENS = 200
+
+
+def select_app_rules_for_injection(
+    lessons_dir: str | os.PathLike[str],
+    *,
+    app_package: str,
+    device_scope: str | None,
+    max_items: int = APP_RULES_MAX_ITEMS,
+    max_tokens: int = APP_RULES_MAX_TOKENS,
+) -> list[LessonCandidate]:
+    """Read a bounded approved-only app-rule snapshot from ``lessons.json``.
+
+    WP-WF4-C delivery selector for rules scoped to exactly one app: the
+    entrance (``app/launched``) and mention-prefetch channels hand them to the
+    model beside that app's procedure card inside the same one-shot message.
+    Same read-only discipline as :func:`select_lessons_for_injection` — a
+    runtime run must never construct a :class:`LessonStore` — and the same
+    fail-open: a missing or damaged view yields no injection.  The app scope
+    must equal ``app_package`` exactly; the device scope follows the run-start
+    rule (global matches anywhere, a pinned device only on that device); and
+    version-scoped rules never inject because the running app version is
+    unknowable here.
+    """
+
+    package = str(app_package or "").strip()
+    if not package:
+        return []
+    try:
+        item_limit = int(max_items)
+        token_limit = int(max_tokens)
+    except (TypeError, ValueError):
+        return []
+    if item_limit <= 0 or token_limit <= 0:
+        return []
+
+    lessons = _read_lessons_snapshot(lessons_dir)
+
+    local_device = _single_line(device_scope).removeprefix("device:")
+    if local_device == "unknown":
+        local_device = ""
+    eligible = [
+        lesson
+        for lesson in lessons
+        if lesson_injectable(lesson)
+        and lesson.kind == "rule"
+        and lesson.scope["app"] == package
+        and lesson.scope["device"] in {None, local_device or None}
         and lesson.scope["app_version"] is None
     ]
     selected = sorted(
@@ -2036,5 +2111,6 @@ __all__ = [
     "make_lesson_id",
     "proposal_metadata",
     "read_episode_outcomes",
+    "select_app_rules_for_injection",
     "select_lessons_for_injection",
 ]

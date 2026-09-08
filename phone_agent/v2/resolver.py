@@ -153,6 +153,12 @@ def _app_kb_entries(session: Any) -> list[Mapping[str, Any]]:
     return []
 
 
+def app_kb_entries(session: Any) -> list[Mapping[str, Any]]:
+    """Public KB-rows view for cross-module consumers (WP-WF4-C prefetch)."""
+
+    return _app_kb_entries(session)
+
+
 def resolve_app_name(
     session: Any,
     config: Any,
