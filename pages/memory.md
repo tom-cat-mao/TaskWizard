@@ -70,7 +70,7 @@ flowchart LR
 - **回注**（`PHONE_AGENT_MEMORY_RAG=on`）：已批准的经验在 run 开局以"参考提示"身份注入（上限 3 条 / 800 token，设备 scope 过滤，run 内钉死该代）；注入的 lesson id 写入 trace 与 episode 档案，用于事后度量"注入是否有帮助"；
 - **约束**：只有 approved / auto_approved 可被注入；proposed/needs_review/revoked 永不注入；shadow/off 档完全不注入。召回侧加固：embedder 在 capability 挂载时后台线程预热（on/shadow 且配置了索引才触发）；选择器异常留痕（trace `recall_selection_error` + stats 错误计数），fail-open 语义不变。
 
-原则：先记录、再影子验证、rule 晋升靠人审、过程卡靠自判分级，注入有上限可撤销；每一步可回退。
+原则：先记录、再影子验证、晋升靠蒸馏自判分级（auto_approved 两类均可注入）、人类 CLI 是纠正通道，注入有上限可撤销；每一步可回退。
 
 ### 过程卡（procedure card，WP-WF 已落地）
 
