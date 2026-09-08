@@ -11,6 +11,13 @@ cards produced by the WP-WF1 lesson pipeline (see ``WORKFLOW-MEMORY-DESIGN.md``
 §4/§5).  Matching is deterministic hard filters (app package equality, device
 scope) followed by a single embedding top-1; the selector only *selects* — the
 two injection points and the prompt wiring land in WP-WF3.
+
+Recall hardening keeps that fail-open contract but makes it observable: the
+shared embedder is warmed on a daemon thread at capability mount (``on``/
+``shadow`` only), and every selection-path exception is recorded — one
+``recall_selection_error`` trace event plus a per-namespace counter in
+``recall_stats.json`` — before the caller's fail-open return.  Neither changes
+a selection result, a run outcome, or the meaning of an existing stats field.
 """
 
 from __future__ import annotations
@@ -50,8 +57,26 @@ _LAUNCH_RE = re.compile(
     r"\blaunched\s+.*\(([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)\)\s*$",
     re.IGNORECASE,
 )
+# The recall side plane must fail open *visibly*.  A selection-path exception
+# is recorded (one trace event plus a per-namespace counter in the shadow
+# scorecard) before the caller's fail-open return, and the embedder loads its
+# model off the run's critical path at capability mount time.  Neither the
+# warm-up nor the recording may change a selection result or block a run.
+WARMUP_TEXT = "warmup"
+RECALL_SELECTION_ERROR = "recall_selection_error"
+# One observe-only counter per namespace; existing stats keys are never
+# rewritten (the schema-v2 scorecard is only extended).
+SELECTION_ERROR_KEYS = {
+    "episode": "episode_errors",
+    "app_alias": "app_alias_errors",
+    "procedure": "procedure_errors",
+}
 _STATS_LOCK = threading.Lock()
 _INDEX_LOCK = threading.RLock()
+_SELECTION_OBSERVER_LOCK = threading.Lock()
+# Observers receive ``(namespace, error_type)`` — never a stack trace, message,
+# or any caller-controlled string, so the audit plane stays redaction-safe.
+_selection_error_observers: list[Callable[[str, str], None]] = []
 
 
 class Embedder(Protocol):
@@ -126,7 +151,10 @@ class MlxEmbedder:
         self._model: Any | None = None
         self._processor: Any | None = None
         self._generate: Any | None = None
-        self._lock = threading.Lock()
+        # Reentrant: ``embed`` holds it across load + generate so a background
+        # warm-up and the run's own call can never load MLX twice or run two
+        # generate calls at once (that race segfaults the process).
+        self._lock = threading.RLock()
 
     @property
     def loaded(self) -> bool:
@@ -151,17 +179,79 @@ class MlxEmbedder:
         inputs = [str(text) for text in texts]
         if not inputs:
             return []
-        self._ensure_loaded()
-        output = self._generate(self._model, self._processor, texts=inputs)
-        embeddings = getattr(output, "text_embeds", output)
-        rows = embeddings.tolist()
-        if rows and isinstance(rows[0], (int, float)):
-            rows = [rows]
-        if len(rows) != len(inputs):
-            raise ValueError(
-                f"embedder returned {len(rows)} vectors for {len(inputs)} texts"
-            )
+        with self._lock:
+            self._ensure_loaded()
+            output = self._generate(self._model, self._processor, texts=inputs)
+            embeddings = getattr(output, "text_embeds", output)
+            rows = embeddings.tolist()
+            if rows and isinstance(rows[0], (int, float)):
+                rows = [rows]
+            if len(rows) != len(inputs):
+                raise ValueError(
+                    f"embedder returned {len(rows)} vectors for {len(inputs)} texts"
+                )
         return [_normalize(row, dimension=self.dimension) for row in rows]
+
+
+def embedder_needs_warmup(embedder: Any) -> bool:
+    """Whether a background warm-up embed is worth running for ``embedder``.
+
+    The deterministic test/office embedder has nothing to load, and an adapter
+    that reports itself loaded is already warm; only a lazy real model
+    benefits from paying the load cost off the run's critical path.
+    """
+
+    if isinstance(embedder, HashEmbedder):
+        return False
+    return getattr(embedder, "loaded", None) is not True
+
+
+def resolve_embedder_factory(candidate: Any) -> Callable[[], Any] | None:
+    """Duck-type the run's shared embedder factory out of a mounted object.
+
+    The recall capability mounts objects it does not own (currently the WP-WF3
+    procedure injector), so it reads the factory through a public attribute
+    when one exists and falls back to the private name rather than adding a
+    new harness service.  Warm-up is skipped when no factory is reachable.
+    """
+
+    for name in ("embedder_factory", "_embedder_factory"):
+        attribute = getattr(candidate, name, None)
+        if callable(attribute):
+            return attribute
+    return None
+
+
+def warmup_embedder(
+    embedder_factory: Callable[[], Any] | None,
+    *,
+    text: str = WARMUP_TEXT,
+) -> threading.Thread | None:
+    """Run one trivial embed on a daemon thread (fail-open, fire-and-forget).
+
+    The MLX stack loads its model on the first ``embed()``; doing that at
+    capability mount keeps the load off the first recall/selection of the run.
+    A failure is recorded like any other selection-path failure and never
+    reaches the caller.
+    """
+
+    if not callable(embedder_factory):
+        return None
+
+    def run() -> None:
+        try:
+            embedder = embedder_factory()
+            if embedder is None or not embedder_needs_warmup(embedder):
+                return
+            embedder.embed([text])
+        except Exception as exc:  # noqa: BLE001 - warm-up is fail-open
+            note_selection_error("embedder", exc)
+
+    thread = threading.Thread(
+        target=run, name="recall-embedder-warmup", daemon=True
+    )
+    thread.start()
+    return thread
 
 
 def read_episode_events(events_path: str | Path) -> list[dict[str, Any]]:
@@ -610,6 +700,22 @@ def format_procedure_block(
     return "\n".join(lines)
 
 
+@contextmanager
+def _selection_scope(namespace: str):
+    """Record one selection phase's failure and re-raise it unchanged.
+
+    The fail-open return belongs to the caller (the shadow run-start path and
+    the procedure injector); the scope only makes the failure visible in the
+    trace and the scorecard before control leaves this module.
+    """
+
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
+        note_selection_error(namespace, exc)
+        raise
+
+
 class VecIndex:
     """Single-file sqlite-vec + FTS5 hybrid index."""
 
@@ -1040,7 +1146,22 @@ class VecIndex:
             return ProcedureSelection(reason="empty_query")
         if not 0.0 <= float(min_score) <= 1.0:
             raise ValueError("min_score must be between 0 and 1")
+        with _selection_scope("procedure"):
+            return self._select_procedure(
+                query,
+                app_package=app_package,
+                device_id=device_id,
+                min_score=min_score,
+            )
 
+    def _select_procedure(
+        self,
+        query: str,
+        *,
+        app_package: str | None,
+        device_id: str | None,
+        min_score: float,
+    ) -> ProcedureSelection:
         from sqlite_vec import serialize_float32
 
         query_vector = serialize_float32(self.embedder.embed([query])[0])
@@ -1128,13 +1249,36 @@ class VecIndex:
             raise ValueError("min_score must be between 0 and 1")
         if decay_lambda < 0.0:
             raise ValueError("decay_lambda must be non-negative")
-        app_candidates = (
-            self._mention_candidates(query, device_scope=device_scope)
-            if "app_alias" in selected
-            else []
-        )
+        app_candidates: list[dict[str, Any]] = []
+        if "app_alias" in selected:
+            with _selection_scope("app_alias"):
+                app_candidates = self._mention_candidates(
+                    query, device_scope=device_scope
+                )
         if "episode" not in selected:
             return app_candidates
+        with _selection_scope("episode"):
+            episodes = self._episode_candidates(
+                query,
+                device_scope=device_scope,
+                top_k=top_k,
+                min_score=min_score,
+                decay_lambda=decay_lambda,
+                now=now,
+            )
+        return [*app_candidates, *episodes]
+
+    def _episode_candidates(
+        self,
+        query: str,
+        *,
+        device_scope: str,
+        top_k: int,
+        min_score: float,
+        decay_lambda: float,
+        now: float | None,
+    ) -> list[dict[str, Any]]:
+        """Rank the semantic episode namespace for one already-validated query."""
 
         episode_count = self.connection.execute(
             "SELECT count(*) FROM recall_items "
@@ -1142,7 +1286,7 @@ class VecIndex:
             (self.embedder.model_id,),
         ).fetchone()
         if not episode_count or int(episode_count[0]) == 0:
-            return app_candidates
+            return []
 
         from sqlite_vec import serialize_float32
 
@@ -1214,7 +1358,7 @@ class VecIndex:
         episode_candidates.sort(
             key=lambda item: (-item["score"], -item["time_score"], item["ref_id"])
         )
-        return [*app_candidates, *episode_candidates[:top_k]]
+        return episode_candidates[:top_k]
 
     def app_name_vector_candidates(
         self, query: str, *, device_scope: str, top_k: int = 20
@@ -1507,6 +1651,72 @@ def _accumulate_stats(
             return updated
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def selection_error_key(namespace: str) -> str | None:
+    """Return the scorecard counter key for ``namespace`` (``None`` = untracked).
+
+    Only the three recall namespaces carry a counter; the embedder warm-up
+    reports a namespace of its own and stays trace-only.
+    """
+
+    return SELECTION_ERROR_KEYS.get(str(namespace).strip())
+
+
+def add_selection_error_observer(
+    observer: Callable[[str, str], None],
+) -> Callable[[], None]:
+    """Register one ``(namespace, error_type)`` observer, returning a disposer."""
+
+    if not callable(observer):
+        raise TypeError("selection error observer must be callable")
+    with _SELECTION_OBSERVER_LOCK:
+        _selection_error_observers.append(observer)
+
+    def dispose() -> None:
+        with _SELECTION_OBSERVER_LOCK:
+            try:
+                _selection_error_observers.remove(observer)
+            except ValueError:
+                return
+
+    return dispose
+
+
+def note_selection_error(namespace: str, error: BaseException | str) -> None:
+    """Notify observers of one selection-path failure; never raises.
+
+    Only the exception *type* (or a literal string) is published, so a failure
+    leaves no stack trace, message, or caller-controlled text in the trace.
+    """
+
+    error_type = error if isinstance(error, str) else type(error).__name__
+    for observer in tuple(_selection_error_observers):
+        try:
+            observer(str(namespace), str(error_type))
+        except Exception:  # noqa: BLE001 - observation is fail-open
+            continue
+
+
+def update_selection_error_stats(
+    stats_path: str | Path, namespace: str
+) -> dict[str, Any]:
+    """Increment the per-namespace error counter in ``recall_stats.json``.
+
+    Observe-only: existing fields are preserved and an untracked namespace
+    (e.g. the embedder warm-up) is a no-op.
+    """
+
+    key = selection_error_key(namespace)
+    if key is None:
+        return {}
+
+    def accumulate(current: dict[str, Any]) -> dict[str, Any]:
+        updated = dict(current)
+        updated[key] = int(current.get(key, 0)) + 1
+        return updated
+
+    return _accumulate_stats(stats_path, accumulate)
 
 
 def update_recall_stats(
@@ -1921,8 +2131,11 @@ __all__ = [
     "PROCEDURE_MAX_TOKENS",
     "PROCEDURE_MIN_SCORE",
     "ProcedureSelection",
+    "RECALL_SELECTION_ERROR",
     "VecIndex",
+    "add_selection_error_observer",
     "alias_snapshot",
+    "embedder_needs_warmup",
     "episode_is_indexable",
     "evaluate_recall",
     "extract_launched_apps",
@@ -1931,11 +2144,16 @@ __all__ = [
     "index_episodes",
     "incremental_upsert",
     "load_procedure_lessons",
+    "note_selection_error",
     "read_episode_events",
     "recall",
     "reconcile_index",
     "rebuild_index",
+    "resolve_embedder_factory",
     "select_procedure",
+    "selection_error_key",
     "update_procedure_recall_stats",
     "update_recall_stats",
+    "update_selection_error_stats",
+    "warmup_embedder",
 ]

@@ -623,6 +623,69 @@ def _apply_experience(ctx: CapabilityAssemblyContext) -> None:
     _register_service(ctx, "experience_service_factory", "experience")
 
 
+def _install_recall_selection_observer(
+    ctx: CapabilityAssemblyContext,
+) -> Callable[[], None]:
+    """Make every selection-path failure visible: one trace event + one count.
+
+    The observer is installed for the lifetime of the capability and only
+    *adds* to the audit plane: the trace event carries ``namespace`` and
+    ``error_type`` (never a stack trace or message) and the per-namespace
+    counter extends the existing schema-v2 scorecard.
+    """
+
+    from pathlib import Path
+
+    from phone_agent.v2.recall import (
+        RECALL_SELECTION_ERROR,
+        add_selection_error_observer,
+        update_selection_error_stats,
+    )
+
+    config = ctx.service("config")
+    session = ctx.service("session")
+    stats_path = (
+        Path(getattr(config, "memory_dir", "memory")) / "experience/recall_stats.json"
+    )
+
+    def observer(namespace: str, error_type: str) -> None:
+        record = getattr(session, "resolution_trace_recorder", None)
+        if callable(record):
+            try:
+                record(
+                    RECALL_SELECTION_ERROR,
+                    namespace=namespace,
+                    error_type=error_type,
+                )
+            except Exception:  # noqa: BLE001 - trace cannot change run semantics
+                pass
+        try:
+            update_selection_error_stats(stats_path, namespace)
+        except Exception:  # noqa: BLE001 - the scorecard is observe-only
+            pass
+
+    return add_selection_error_observer(observer)
+
+
+def _warmup_recall_embedder(ctx: CapabilityAssemblyContext) -> None:
+    """Load the shared embedder off the run path (``on``/``shadow`` only)."""
+
+    from phone_agent.v2.recall import resolve_embedder_factory, warmup_embedder
+
+    config = ctx.service("config")
+    mode = str(getattr(config, "memory_rag", "off") or "off").strip().lower()
+    if mode not in {"on", "shadow"}:
+        return
+    # Nothing selects without a configured index, so an index-less mount
+    # (offline commands, minimal test configs) never pays for a model load.
+    if not getattr(config, "vec_db", None):
+        return
+    factory = resolve_embedder_factory(ctx.service("procedure_injector"))
+    if factory is None:
+        return
+    warmup_embedder(factory)
+
+
 def _apply_recall(ctx: CapabilityAssemblyContext) -> None:
     _register_service_hook(ctx, "start", "recall_run_start")
     _register_service_hook(ctx, "end", "recall_run_end")
@@ -632,18 +695,18 @@ def _apply_recall(ctx: CapabilityAssemblyContext) -> None:
     # 1-card/300-token budget) and two event listeners — ``app/launched``
     # selects the app card, ``model/pre_request`` injects the pending one.
     _register_prompt(ctx, "procedure_prompt_provider")
+    disposers: list[Callable[[], None]] = [_install_recall_selection_observer(ctx)]
     bus = ctx.service("event_bus")
     injector = ctx.service("procedure_injector")
     if bus is not None and injector is not None:
         from phone_agent.v2.events import APP_LAUNCHED
 
-        ctx.register_service(
-            "recall_event_disposers",
-            [
-                bus.on(APP_LAUNCHED, injector.on_app_launched),
-                bus.on(MODEL_PRE_REQUEST, injector.on_pre_request),
-            ],
-        )
+        disposers.append(bus.on(APP_LAUNCHED, injector.on_app_launched))
+        disposers.append(bus.on(MODEL_PRE_REQUEST, injector.on_pre_request))
+    ctx.register_service("recall_event_disposers", disposers)
+    # Warm the shared embedder on a daemon thread so the model load is not
+    # charged to the first recall/selection of the run (fail-open).
+    _warmup_recall_embedder(ctx)
     _register_cli(
         ctx,
         (

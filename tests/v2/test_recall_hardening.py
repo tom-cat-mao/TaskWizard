@@ -1,0 +1,436 @@
+"""Recall hardening (WP-DISTILL-AUTO, package B): embedder warm-up and
+selection-path failure evidence.
+
+Two contracts are covered here:
+
+* **B1** — the shared embedder is warmed on a daemon thread when the recall
+  capability mounts in ``on``/``shadow`` mode, and never in ``off`` mode.  A
+  warm-up failure is recorded but cannot break assembly or the run.
+* **B2** — every exception on the ``episode`` / ``app_alias`` / ``procedure``
+  selection path leaves one ``recall_selection_error`` trace event (namespace
+  plus error type, no stack trace or message) and bumps one per-namespace
+  counter in the observe-only shadow scorecard, without changing the exception
+  the caller sees — the fail-open return is untouched.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from phone_agent.v2.capabilities import (
+    CapabilityAssemblyContext,
+    assemble_capabilities,
+    build_capability_registry,
+)
+from phone_agent.v2.recall import (
+    HashEmbedder,
+    VecIndex,
+    add_selection_error_observer,
+    embedder_needs_warmup,
+    update_selection_error_stats,
+)
+from phone_agent.v2.recall import MlxEmbedder as _MlxEmbedder  # noqa: F401 - patch target
+
+WEATHER = "com.example.weather"
+
+
+# --- doubles -----------------------------------------------------------
+
+
+class _RecordingEmbedder:
+    """Lazy (``loaded=False``) stand-in for :class:`MlxEmbedder`."""
+
+    def __init__(self, dimension: int = 8, *, fail: bool = False) -> None:
+        self.model_id = "warm-v1"
+        self.dimension = dimension
+        self.loaded = False
+        self.fail = fail
+        self.calls: list[str] = []
+        self._done = threading.Event()
+
+    def embed(self, texts):
+        self.calls.extend(str(text) for text in texts)
+        self._done.set()
+        if self.fail:
+            raise RuntimeError("mlx exploded")
+        return [[0.0] * self.dimension for _ in texts]
+
+    def wait(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while not self._done.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self._done.is_set()
+
+
+class _CountingHash(HashEmbedder):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.calls: list[str] = []
+
+    def embed(self, texts):
+        self.calls.extend(str(text) for text in texts)
+        return super().embed(texts)
+
+
+class _FaultEmbedder:
+    """Same identity as the test index, but every embed blows up."""
+
+    model_id = "hash-v1"
+    dimension = 64
+    loaded = False
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+    def embed(self, _texts):
+        raise RuntimeError("embedder is on fire")
+
+
+def _config(**overrides) -> SimpleNamespace:
+    values = {
+        "memory_rag": "shadow",
+        "experience_enabled": True,
+        "device_id": "serial-1",
+        "memory_dir": "memory",
+        # The warm-up only runs for a mounted index; a config without one is
+        # the offline/index-less case that must never load a model.
+        "vec_db": "memory/vec.db",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _context(config, *, injector=None, session=None) -> CapabilityAssemblyContext:
+    return CapabilityAssemblyContext(
+        {
+            "config": config,
+            "session": session if session is not None else SimpleNamespace(),
+            "procedure_injector": injector,
+            "recall_run_start": lambda _state: None,
+            "recall_run_end": lambda _state: None,
+            "experience_run_start": lambda _state: None,
+            "experience_run_end": lambda _state: None,
+        }
+    )
+
+
+def _assemble(config, **kwargs):
+    return assemble_capabilities(
+        build_capability_registry(config), _context(config, **kwargs)
+    )
+
+
+def _wait_until(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+@pytest.fixture
+def seen_errors():
+    """Collect ``(namespace, error_type)`` pairs from the recall side plane."""
+
+    observed: list[tuple[str, str]] = []
+    dispose = add_selection_error_observer(
+        lambda namespace, error_type: observed.append((namespace, error_type))
+    )
+    yield observed
+    dispose()
+
+
+# --- B1: embedder warm-up ----------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["on", "shadow"])
+def test_warmup_runs_in_background_for_on_and_shadow(mode):
+    embedder = _RecordingEmbedder()
+    ctx = _assemble(
+        _config(memory_rag=mode),
+        injector=SimpleNamespace(embedder_factory=lambda: embedder),
+    )
+
+    assert embedder.wait() is True
+    assert embedder.calls == ["warmup"]
+    # Warm-up owns nothing on the assembly ledger: no new service/tool/hook.
+    assert ctx.service("recall_event_disposers")
+
+
+def test_warmup_is_skipped_when_recall_is_off():
+    embedder = _RecordingEmbedder()
+    _assemble(
+        _config(memory_rag="off"),
+        injector=SimpleNamespace(embedder_factory=lambda: embedder),
+    )
+
+    time.sleep(0.2)
+    assert embedder.calls == []
+    assert embedder.wait(0.05) is False
+
+
+def test_warmup_is_skipped_without_a_configured_index():
+    """Offline commands and index-less mounts never pay for a model load."""
+
+    embedder = _RecordingEmbedder()
+    _assemble(
+        _config(memory_rag="on", vec_db=None),
+        injector=SimpleNamespace(embedder_factory=lambda: embedder),
+    )
+
+    time.sleep(0.2)
+    assert embedder.calls == []
+
+
+def test_warmup_also_reads_the_private_factory_name():
+    """The capability duck-types the factory off an object it does not own."""
+
+    embedder = _RecordingEmbedder()
+    _assemble(
+        _config(memory_rag="on"),
+        injector=SimpleNamespace(**{"_embedder_factory": lambda: embedder}),
+    )
+    assert embedder.wait() is True
+    assert embedder.calls == ["warmup"]
+
+
+def test_warmup_without_a_reachable_factory_is_silent():
+    # No procedure injector mounted (e.g. a plugin replaced the capability).
+    _assemble(_config(memory_rag="on"), injector=None)
+
+
+def test_deterministic_hash_embedder_is_never_warmed():
+    embedder = _CountingHash(8)
+    _assemble(
+        _config(memory_rag="on"),
+        injector=SimpleNamespace(embedder_factory=lambda: embedder),
+    )
+    time.sleep(0.2)
+
+    assert embedder_needs_warmup(embedder) is False
+    assert embedder.calls == []
+
+
+def test_warmup_failure_is_recorded_and_never_breaks_assembly(tmp_path):
+    events: list[dict] = []
+    embedder = _RecordingEmbedder(fail=True)
+    session = SimpleNamespace(
+        resolution_trace_recorder=lambda event, **payload: events.append(
+            {"event": event, **payload}
+        )
+    )
+    _assemble(
+        _config(memory_rag="shadow", memory_dir=str(tmp_path / "memory")),
+        injector=SimpleNamespace(embedder_factory=lambda: embedder),
+        session=session,
+    )
+
+    # The warm-up records the failure after the embed call returns, so wait for
+    # the evidence instead of for the call itself.
+    assert _wait_until(lambda: bool(events)) is True
+    assert events == [
+        {
+            "event": "recall_selection_error",
+            "namespace": "embedder",
+            "error_type": "RuntimeError",
+        }
+    ]
+    # The warm-up namespace is trace-only: no scorecard counter, no file.
+    assert not (tmp_path / "memory" / "experience" / "recall_stats.json").exists()
+
+
+# --- B2: selection-path failure evidence --------------------------------
+
+
+def _index(tmp_path: Path, *, episode: bool = False) -> Path:
+    db_path = tmp_path / "vec.db"
+    with VecIndex(db_path, embedder=HashEmbedder(64)) as index:
+        if episode:
+            index.index_episode(
+                {
+                    "type": "episode_outcome",
+                    "schema_v": 1,
+                    "run_id": "run-1",
+                    "goal_text": "打开天气应用查预报",
+                    "apps": [WEATHER],
+                    "steps": 4,
+                    "success": True,
+                    "reason": "finished",
+                    "device_scope": "device:serial-1",
+                    "ts_end": 1.0,
+                }
+            )
+    return db_path
+
+
+def test_episode_selection_error_is_recorded_before_the_caller_fails_open(
+    tmp_path, seen_errors
+):
+    with VecIndex(_index(tmp_path, episode=True), embedder=_FaultEmbedder()) as index:
+        with pytest.raises(RuntimeError):
+            index.recall("天气应用查预报", device_scope="device:serial-1")
+
+    # Fail-open semantics are unchanged: the caller still sees the exception,
+    # and the failure is attributable before it swallows it.
+    assert seen_errors == [("episode", "RuntimeError")]
+
+
+def test_app_alias_selection_error_is_recorded(tmp_path, seen_errors, monkeypatch):
+    monkeypatch.setattr(
+        "phone_agent.v2.names.mention_occurs",
+        lambda _term, _query: (_ for _ in ()).throw(RuntimeError("names exploded")),
+    )
+    with VecIndex(_index(tmp_path), embedder=HashEmbedder(64)) as index:
+        with pytest.raises(RuntimeError):
+            index.recall("打开微信", device_scope="device:serial-1")
+
+    assert seen_errors == [("app_alias", "RuntimeError")]
+
+
+def test_procedure_selection_error_is_recorded(tmp_path, seen_errors):
+    with VecIndex(_index(tmp_path), embedder=_FaultEmbedder()) as index:
+        with pytest.raises(RuntimeError):
+            index.select_procedure("天气应用查预报", device_id="serial-1")
+
+    assert seen_errors == [("procedure", "RuntimeError")]
+
+
+def test_error_stats_counter_is_per_namespace_and_only_extends(tmp_path):
+    stats_path = tmp_path / "memory" / "experience" / "recall_stats.json"
+    update_selection_error_stats(stats_path, "episode")
+    update_selection_error_stats(stats_path, "procedure")
+    update_selection_error_stats(stats_path, "procedure")
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+
+    assert stats["episode_errors"] == 1
+    assert stats["procedure_errors"] == 2
+    assert "app_alias_errors" not in stats
+    assert stats["schema_v"] == 2
+
+
+def test_unknown_namespace_records_no_counter(tmp_path):
+    stats_path = tmp_path / "memory" / "experience" / "recall_stats.json"
+    assert update_selection_error_stats(stats_path, "embedder") == {}
+    assert not stats_path.exists()
+
+
+def test_release_of_the_recall_capability_removes_the_observer(tmp_path):
+    events: list[dict] = []
+    session = SimpleNamespace(
+        resolution_trace_recorder=lambda event, **payload: events.append(
+            {"event": event, **payload}
+        )
+    )
+    ctx = _assemble(
+        _config(memory_rag="shadow", memory_dir=str(tmp_path / "memory")),
+        session=session,
+    )
+
+    def failing_recall() -> None:
+        with VecIndex(
+            _index(tmp_path, episode=True), embedder=_FaultEmbedder()
+        ) as index:
+            with pytest.raises(RuntimeError):
+                index.recall("天气应用查预报", device_scope="device:serial-1")
+
+    failing_recall()
+    assert [item["namespace"] for item in events] == ["episode"]
+
+    # Switching the capability off must leave zero residue (P0 #18): the
+    # observer is disposed, so a later failure is silent again.
+    assemble_capabilities(build_capability_registry(_config(memory_rag="off")), ctx)
+    failing_recall()
+    assert [item["namespace"] for item in events] == ["episode"]
+    stats_path = tmp_path / "memory" / "experience" / "recall_stats.json"
+    assert json.loads(stats_path.read_text(encoding="utf-8"))["episode_errors"] == 1
+
+
+# --- B3 integration: a faulty embedder leaves the run intact ------------
+
+
+def _mini_config(monkeypatch, tmp_path: Path, *, mode: str):
+    from tests.v2.test_experience import _install_mini_agent_modules
+
+    config = _install_mini_agent_modules(monkeypatch, tmp_path, True)
+    config.trace_enabled = True
+    config.memory_rag = mode
+    config.memory_dir = str(tmp_path / "memory")
+    config.vec_db = str(tmp_path / "vec.db")
+    config.embed_model = "hash-v1"
+    config.embed_dim = 64
+    config.lessons_dir = str(tmp_path / "lessons")
+    return config
+
+
+def _install_fault_embedder(monkeypatch) -> None:
+    monkeypatch.setattr("phone_agent.v2.recall.MlxEmbedder", _FaultEmbedder)
+
+
+def _trace_events(agent) -> list[dict]:
+    path = Path(agent.trace_path)
+    if not path.exists():
+        return []
+    return [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line
+    ]
+
+
+def test_shadow_run_survives_a_faulty_embedder_and_leaves_evidence(
+    tmp_path, monkeypatch
+):
+    _index(tmp_path, episode=True)
+    config = _mini_config(monkeypatch, tmp_path, mode="shadow")
+    _install_fault_embedder(monkeypatch)
+
+    from phone_agent.v2.agent import ThinPhoneAgent
+
+    agent = ThinPhoneAgent(config)
+    assert agent.run("打开天气应用查预报").success is True
+
+    pairs = [
+        (event["namespace"], event["error_type"])
+        for event in _trace_events(agent)
+        if event.get("event") == "recall_selection_error"
+    ]
+    # The warm-up namespace may (or may not, depending on thread timing) also
+    # report the same broken embedder; the episode failure is what must land.
+    assert ("episode", "RuntimeError") in pairs
+    assert {namespace for namespace, _ in pairs} <= {"episode", "embedder"}
+    # No stack trace, message, or caller text crosses the redaction boundary.
+    assert "embedder is on fire" not in str(pairs)
+    stats = json.loads(
+        (tmp_path / "memory" / "experience" / "recall_stats.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert stats["episode_errors"] == 1
+
+
+def test_on_run_survives_a_faulty_procedure_selection(tmp_path, monkeypatch):
+    _index(tmp_path)
+    config = _mini_config(monkeypatch, tmp_path, mode="on")
+    _install_fault_embedder(monkeypatch)
+
+    from phone_agent.v2.agent import ThinPhoneAgent
+
+    agent = ThinPhoneAgent(config)
+    assert agent.run("打开天气应用查预报").success is True
+
+    assert ("procedure", "RuntimeError") in [
+        (event["namespace"], event["error_type"])
+        for event in _trace_events(agent)
+        if event.get("event") == "recall_selection_error"
+    ]
+    stats = json.loads(
+        (tmp_path / "memory" / "experience" / "recall_stats.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert stats["procedure_errors"] == 1
