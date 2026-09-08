@@ -269,8 +269,8 @@ def test_hard_filter_uses_successful_launch_receipts(tmp_path: Path) -> None:
     assert general_row["hit_app_scope"] == "general"
 
 
-def test_coverage_and_relevance_gates_with_steps_delta_na(tmp_path: Path) -> None:
-    """Coverage counts every episode; relevance only counts app-grounded hits."""
+def test_coverage_and_app_grounded_gates_with_steps_delta_na(tmp_path: Path) -> None:
+    """Coverage counts every episode; app-grounded hits count app-pool top-1s."""
 
     lessons = tmp_path / "lessons"
     _write(
@@ -288,7 +288,7 @@ def test_coverage_and_relevance_gates_with_steps_delta_na(tmp_path: Path) -> Non
             _launch(run_id="run_b1", step=1, ts=11.0, package=BILI),
             _episode(run_id="run_b2", ts_start=20.0, goal_text="打开b站搜索视频"),
             _launch(run_id="run_b2", step=1, ts=21.0, package=BILI),
-            # General-pool episodes: covered is possible, relevant is not.
+            # General-pool episodes: covered is possible, app-grounded is not.
             _episode(run_id="run_g1", ts_start=30.0, goal_text="在这个应用里搜索关键词"),
             _episode(run_id="run_g2", ts_start=40.0, goal_text="点开搜索框输入关键词"),
             # No card for this app: never covered.
@@ -308,22 +308,23 @@ def test_coverage_and_relevance_gates_with_steps_delta_na(tmp_path: Path) -> Non
     assert result["runs_queried"] == 5
     assert result["runs_with_pool"] == 4
     assert result["covered"] == 2
-    assert result["relevant"] == 2
+    assert result["app_grounded_hits"] == 2
     assert result["coverage_rate"] == 0.4
     assert result["coverage_rate_over_pool"] == 0.5
-    assert result["relevance_rate"] == 1.0
+    assert result["app_grounded_hit_rate"] == 1.0
 
     # steps-delta has no counterfactual offline and does not gate the channel.
     assert result["steps_delta"]["applicable"] is False
     assert result["gates"]["delta_ok"] is None
     assert result["gates"]["delta_note"] == "n/a"
     assert result["gates"]["coverage_ok"] is True
-    assert result["gates"]["relevance_ok"] is True
+    assert result["gates"]["app_grounded_ok"] is True
     assert result["gates"]["channel_recommended"] is True
+    assert result["calibrate_only"] is False
 
 
 def test_sweep_picks_the_knee_point(tmp_path: Path) -> None:
-    """Knee = highest coverage among thresholds clearing the relevance target."""
+    """Knee = highest coverage among thresholds clearing the hit-rate target."""
 
     lessons = tmp_path / "lessons"
     _write(
@@ -342,7 +343,7 @@ def test_sweep_picks_the_knee_point(tmp_path: Path) -> None:
             _episode(run_id="run_b2", ts_start=20.0, goal_text="打开b站搜索视频"),
             _launch(run_id="run_b2", step=1, ts=21.0, package=BILI),
             # Weak general hits (0.307 / 0.489): they lift coverage but never
-            # relevance, so the loosest thresholds fail the relevance gate.
+            # the app-grounded rate, so the loosest thresholds fail the gate.
             _episode(run_id="run_g1", ts_start=30.0, goal_text="在这个应用里搜索关键词"),
             _episode(run_id="run_g2", ts_start=40.0, goal_text="点开搜索框输入关键词"),
             _episode(run_id="run_x", ts_start=50.0, goal_text="高德地图导航"),
@@ -366,24 +367,24 @@ def test_sweep_picks_the_knee_point(tmp_path: Path) -> None:
         0.7,
     ]
     table = {row["min_score"]: row for row in result["thresholds"]}
-    # Loosest threshold: 4 covered but only 2 app-grounded -> relevance 0.5.
+    # Loosest threshold: 4 covered but only 2 app-grounded -> rate 0.5.
     assert table[0.3]["coverage_rate"] == 0.8
-    assert table[0.3]["relevance_rate"] == 0.5
-    # Both weak general hits are gone by 0.5: relevance 1.0, coverage 0.4.
+    assert table[0.3]["app_grounded_hit_rate"] == 0.5
+    # Both weak general hits are gone by 0.5: rate 1.0, coverage 0.4.
     assert table[0.5]["coverage_rate"] == 0.4
-    assert table[0.5]["relevance_rate"] == 1.0
+    assert table[0.5]["app_grounded_hit_rate"] == 1.0
     assert table[0.7]["covered"] == 2
 
     # Coverage never grows as the threshold tightens.
     rates = [row["coverage_rate"] for row in result["thresholds"]]
     assert rates == sorted(rates, reverse=True)
 
-    # 0.30 has the highest coverage (0.8) but fails relevance; the knee is the
-    # loosest threshold that clears relevance: 0.35 (coverage 0.6).
+    # 0.30 has the highest coverage (0.8) but fails the hit-rate gate; the
+    # knee is the loosest threshold that clears it: 0.35 (coverage 0.6).
     assert result["recommended"]["min_score"] == 0.35
     assert result["recommended"]["coverage_rate"] == 0.6
-    assert result["recommended"]["relevance_rate"] == 0.666667
-    assert "relevance >= 0.6" in result["recommended_reason"]
+    assert result["recommended"]["app_grounded_hit_rate"] == 0.666667
+    assert "app_grounded_hit_rate >= 0.6" in result["recommended_reason"]
 
 
 def test_empty_card_pool_exits_cleanly(tmp_path: Path, capsys) -> None:
@@ -498,6 +499,51 @@ def test_exemplar_channel_is_untouched(tmp_path: Path, capsys) -> None:
     assert payload["runs_total"] == 2
 
 
+def test_exemplar_no_lookahead_excludes_overlapping_runs(tmp_path: Path) -> None:
+    """A candidate that ended after the query run started is never eligible.
+
+    Episodes index in ``ts_end`` order, but overlapping runs make that order
+    insufficient: ``run_overlap`` ends *before* ``run_query`` ends (so it is
+    indexed first) yet started after ``run_query`` started — at
+    ``run_query``'s start-of-run recall window it did not exist yet and must
+    not be recalled.
+    """
+
+    experience = tmp_path / "experience"
+    _write(
+        experience,
+        [
+            _episode(
+                run_id="run_query", ts_start=100.0, ts_end=130.0, goal_text="查机票", steps=9
+            ),
+            _episode(
+                run_id="run_overlap", ts_start=105.0, ts_end=115.0, goal_text="查机票", steps=4
+            ),
+            # A later run may legitimately recall both earlier episodes.
+            _episode(
+                run_id="run_later", ts_start=140.0, ts_end=150.0, goal_text="查机票", steps=3
+            ),
+        ],
+    )
+
+    result = replay_exemplar_metrics(
+        str(experience),
+        embedder=HashEmbedder(dimension=64),
+        min_score=0.50,
+        now=1_800_000_000.0,
+    )
+
+    details = {row["run_id"]: row for row in result["details"]}
+    # run_query sees nothing: its only same-goal candidate overlapped it.
+    assert details["run_query"]["hit_run_id"] is None
+    assert details["run_query"]["qualified"] is False
+    assert details["run_query"]["relevant"] is False
+    # run_later started after both earlier runs ended: recall works again
+    # (top-1 is one of the two legitimately-eligible earlier episodes).
+    assert details["run_later"]["hit_run_id"] in {"run_query", "run_overlap"}
+    assert details["run_later"]["qualified"] is True
+
+
 def test_procedure_calibrate_mode_uses_final_pool_for_all_episodes(tmp_path: Path) -> None:
     """--calibrate deliberately breaks no-time-travel (cold-start threshold tuning)."""
 
@@ -532,3 +578,9 @@ def test_procedure_calibrate_mode_uses_final_pool_for_all_episodes(tmp_path: Pat
     assert strict["details"][0]["pool_size"] == 0  # card approved after ts_start
     assert cal["details"][0]["pool_size"] == 1
     assert cal["details"][0]["hit_lesson_id"] == "les_0000000000000001"
+
+    # Calibration honesty (S3): calibrate output is marked and its verdict is
+    # forced off even when the numbers themselves look great.
+    assert strict["calibrate_only"] is False
+    assert cal["calibrate_only"] is True
+    assert cal["gates"]["channel_recommended"] is False

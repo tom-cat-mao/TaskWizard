@@ -145,6 +145,34 @@ def _card_selector(*, target: str = APP, card_id: str = CARD_ID):
     return selector
 
 
+def _card_payload() -> dict:
+    """The selectable card, materialized in the lesson view for the S3 gate.
+
+    The delivery-time authoritative re-check only delivers a card that the
+    lesson view lists as injectable, so the fixture store always carries the
+    card the fake selector returns.
+    """
+
+    return {
+        "lesson_id": CARD_ID,
+        "schema_v": 1,
+        "version": 1,
+        "status": "auto_approved",
+        "kind": "procedure",
+        "text": "闪记记录行程",
+        "steps": ["打开闪记应用", "记录一条行程"],
+        "pitfalls": None,
+        "app_scope": APP,
+        "scope": {"device": None, "app": None, "app_version": None},
+        "evidence": [{"run_id": "a", "note": "outcome pattern"}],
+        "support_count": 1,
+        "task_keys": ["search"],
+        "conflicts": [],
+        "created_ts": 1.0,
+        "source": "distill",
+    }
+
+
 def _injector(
     tmp_path: Path,
     *,
@@ -154,7 +182,7 @@ def _injector(
     with_index: bool = True,
     session=None,
 ) -> tuple[ProcedureCardInjector, list[tuple]]:
-    lessons_dir = _write_rules(tmp_path, rules or [])
+    lessons_dir = _write_rules(tmp_path, [*(rules or []), _card_payload()])
     config = SimpleNamespace(
         memory_rag=mode,
         vec_db=str(tmp_path / "vec.db") if with_index else None,

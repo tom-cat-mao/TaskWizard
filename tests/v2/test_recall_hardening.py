@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -31,7 +32,6 @@ from phone_agent.v2.capabilities import (
 from phone_agent.v2.recall import (
     HashEmbedder,
     VecIndex,
-    add_selection_error_observer,
     embedder_needs_warmup,
     update_selection_error_stats,
 )
@@ -92,15 +92,28 @@ class _FaultEmbedder:
         raise RuntimeError("embedder is on fire")
 
 
+# Per-test isolation root: the autouse fixture below points it at tmp_path so
+# no test can ever touch the repo's real memory/ directory (S3 test hygiene).
+_THIS_MODULE = sys.modules[__name__]
+_TEST_ROOT = Path("memory").parent
+
+
+@pytest.fixture(autouse=True)
+def _isolated_memory(tmp_path, monkeypatch):
+    """Force every config's memory_dir/vec_db under this test's tmp_path."""
+
+    monkeypatch.setattr(_THIS_MODULE, "_TEST_ROOT", tmp_path)
+
+
 def _config(**overrides) -> SimpleNamespace:
     values = {
         "memory_rag": "shadow",
         "experience_enabled": True,
         "device_id": "serial-1",
-        "memory_dir": "memory",
+        "memory_dir": str(_TEST_ROOT / "memory"),
         # The warm-up only runs for a mounted index; a config without one is
         # the offline/index-less case that must never load a model.
-        "vec_db": "memory/vec.db",
+        "vec_db": str(_TEST_ROOT / "vec.db"),
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -135,16 +148,19 @@ def _wait_until(predicate, timeout: float = 5.0) -> bool:
     return False
 
 
-@pytest.fixture
-def seen_errors():
-    """Collect ``(namespace, error_type)`` pairs from the recall side plane."""
+def _collect_errors(index: VecIndex) -> list[tuple[str, str]]:
+    """Register a ``(namespace, error_type)`` collector on this index's scope.
+
+    Observers are instance-scoped (S3): registering on the index — or on a
+    capability mount's shared registry — is the only way to observe, so two
+    coexisting contexts can no longer cross-notify each other.
+    """
 
     observed: list[tuple[str, str]] = []
-    dispose = add_selection_error_observer(
+    index.selection_error_observers.add(
         lambda namespace, error_type: observed.append((namespace, error_type))
     )
-    yield observed
-    dispose()
+    return observed
 
 
 # --- B1: embedder warm-up ----------------------------------------------
@@ -292,31 +308,33 @@ def _alias_index(tmp_path: Path) -> Path:
 
 
 def test_episode_selection_error_is_recorded_before_the_caller_fails_open(
-    tmp_path, seen_errors
+    tmp_path,
 ):
     with VecIndex(_index(tmp_path, episode=True), embedder=_FaultEmbedder()) as index:
+        observed = _collect_errors(index)
         with pytest.raises(RuntimeError):
             index.recall("天气应用查预报", device_scope="device:serial-1")
 
     # Fail-open semantics are unchanged: the caller still sees the exception,
     # and the failure is attributable before it swallows it.
-    assert seen_errors == [("episode", "RuntimeError")]
+    assert observed == [("episode", "RuntimeError")]
 
 
-def test_app_alias_selection_error_is_recorded(tmp_path, seen_errors, monkeypatch):
+def test_app_alias_selection_error_is_recorded(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "phone_agent.v2.names.mention_occurs",
         lambda _term, _query: (_ for _ in ()).throw(RuntimeError("names exploded")),
     )
     with VecIndex(_index(tmp_path), embedder=HashEmbedder(64)) as index:
+        observed = _collect_errors(index)
         with pytest.raises(RuntimeError):
             index.recall("打开微信", device_scope="device:serial-1")
 
-    assert seen_errors == [("app_alias", "RuntimeError")]
+    assert observed == [("app_alias", "RuntimeError")]
 
 
 def test_app_alias_vector_route_error_is_recorded_before_names_swallows_it(
-    tmp_path, seen_errors
+    tmp_path,
 ):
     """The names.py embedding route records its failure before the caller's
     fail-open ``except Exception: embedded = ()`` discards it."""
@@ -325,6 +343,7 @@ def test_app_alias_vector_route_error_is_recorded_before_names_swallows_it(
 
     db_path = _alias_index(tmp_path)
     with VecIndex(db_path, embedder=_FaultEmbedder()) as index:
+        observed = _collect_errors(index)
 
         def embedding_search(query, top_k):
             return index.app_name_vector_candidates(
@@ -340,7 +359,7 @@ def test_app_alias_vector_route_error_is_recorded_before_names_swallows_it(
     # names.py's fail-open swallow is untouched: no exception escapes and the
     # resolution still returns, but the failure left evidence first.
     assert result.status in {"ambiguous", "unknown"}
-    assert seen_errors == [("app_alias", "RuntimeError")]
+    assert observed == [("app_alias", "RuntimeError")]
 
 
 def test_app_alias_vector_route_wrap_preserves_healthy_results(tmp_path):
@@ -354,12 +373,13 @@ def test_app_alias_vector_route_wrap_preserves_healthy_results(tmp_path):
         assert index.app_name_vector_candidates("天气", device_scope="") == []
 
 
-def test_procedure_selection_error_is_recorded(tmp_path, seen_errors):
+def test_procedure_selection_error_is_recorded(tmp_path):
     with VecIndex(_index(tmp_path), embedder=_FaultEmbedder()) as index:
+        observed = _collect_errors(index)
         with pytest.raises(RuntimeError):
             index.select_procedure("天气应用查预报", device_id="serial-1")
 
-    assert seen_errors == [("procedure", "RuntimeError")]
+    assert observed == [("procedure", "RuntimeError")]
 
 
 def test_error_stats_counter_is_per_namespace_and_only_extends(tmp_path):
@@ -393,9 +413,15 @@ def test_release_of_the_recall_capability_removes_the_observer(tmp_path):
         session=session,
     )
 
+    # Production wiring: an index opened by this mount reports to the mount's
+    # scoped registry, so the capability observer sees its failures.
+    mount_observers = ctx.service("recall_selection_observers")
+
     def failing_recall() -> None:
         with VecIndex(
-            _index(tmp_path, episode=True), embedder=_FaultEmbedder()
+            _index(tmp_path, episode=True),
+            embedder=_FaultEmbedder(),
+            selection_error_observers=mount_observers,
         ) as index:
             with pytest.raises(RuntimeError):
                 index.recall("天气应用查预报", device_scope="device:serial-1")
@@ -410,6 +436,40 @@ def test_release_of_the_recall_capability_removes_the_observer(tmp_path):
     assert [item["namespace"] for item in events] == ["episode"]
     stats_path = tmp_path / "memory" / "experience" / "recall_stats.json"
     assert json.loads(stats_path.read_text(encoding="utf-8"))["episode_errors"] == 1
+
+
+def test_coexisting_mounts_never_cross_notify_each_other(tmp_path):
+    """Two mounted recall capabilities observe only their own scopes (S3)."""
+
+    def mount():
+        events: list[dict] = []
+        session = SimpleNamespace(
+            resolution_trace_recorder=lambda event, **payload: events.append(
+                {"event": event, **payload}
+            )
+        )
+        ctx = _assemble(_config(memory_rag="shadow"), session=session)
+        return events, ctx
+
+    events_a, ctx_a = mount()
+    events_b, ctx_b = mount()
+
+    def failing_recall(observers) -> None:
+        with VecIndex(
+            _index(tmp_path, episode=True),
+            embedder=_FaultEmbedder(),
+            selection_error_observers=observers,
+        ) as index:
+            with pytest.raises(RuntimeError):
+                index.recall("天气应用查预报", device_scope="device:serial-1")
+
+    failing_recall(ctx_a.service("recall_selection_observers"))
+    # Only A's observer fired; B's mount saw nothing of A's failure.
+    assert [item["namespace"] for item in events_a] == ["episode"]
+    assert events_b == []
+    failing_recall(ctx_b.service("recall_selection_observers"))
+    assert [item["namespace"] for item in events_b] == ["episode"]
+    assert [item["namespace"] for item in events_a] == ["episode"]
 
 
 # --- B3 integration: a faulty embedder leaves the run intact ------------

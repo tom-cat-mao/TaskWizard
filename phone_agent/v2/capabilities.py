@@ -657,20 +657,21 @@ def _apply_experience(ctx: CapabilityAssemblyContext) -> None:
 
 def _install_recall_selection_observer(
     ctx: CapabilityAssemblyContext,
+    observers: Any,
 ) -> Callable[[], None]:
     """Make every selection-path failure visible: one trace event + one count.
 
-    The observer is installed for the lifetime of the capability and only
-    *adds* to the audit plane: the trace event carries ``namespace`` and
-    ``error_type`` (never a stack trace or message) and the per-namespace
-    counter extends the existing schema-v2 scorecard.
+    The observer is registered on this mount's *scoped* observer registry (not
+    a process-global list), so two coexisting agent contexts never cross-notify
+    each other's observers.  It only *adds* to the audit plane: the trace event
+    carries ``namespace`` and ``error_type`` (never a stack trace or message)
+    and the per-namespace counter extends the existing schema-v2 scorecard.
     """
 
     from pathlib import Path
 
     from phone_agent.v2.recall import (
         RECALL_SELECTION_ERROR,
-        add_selection_error_observer,
         update_selection_error_stats,
     )
 
@@ -696,10 +697,10 @@ def _install_recall_selection_observer(
         except Exception:  # noqa: BLE001 - the scorecard is observe-only
             pass
 
-    return add_selection_error_observer(observer)
+    return observers.add(observer)
 
 
-def _warmup_recall_embedder(ctx: CapabilityAssemblyContext) -> None:
+def _warmup_recall_embedder(ctx: CapabilityAssemblyContext, observers: Any) -> None:
     """Load the shared embedder off the run path (``on``/``shadow`` only)."""
 
     from phone_agent.v2.recall import resolve_embedder_factory, warmup_embedder
@@ -715,10 +716,12 @@ def _warmup_recall_embedder(ctx: CapabilityAssemblyContext) -> None:
     factory = resolve_embedder_factory(ctx.service("procedure_injector"))
     if factory is None:
         return
-    warmup_embedder(factory)
+    warmup_embedder(factory, observers=observers)
 
 
 def _apply_recall(ctx: CapabilityAssemblyContext) -> None:
+    from phone_agent.v2.recall import SelectionErrorObservers
+
     _register_service_hook(ctx, "start", "recall_run_start")
     _register_service_hook(ctx, "end", "recall_run_end")
     _register_service(ctx, "recall_service_factory", "recall")
@@ -730,9 +733,24 @@ def _apply_recall(ctx: CapabilityAssemblyContext) -> None:
     # card at run start (this provider), the mention prefetch, and the app
     # entrance (card plus that app's ≤2 injectable rules).
     _register_prompt(ctx, "procedure_prompt_provider")
-    disposers: list[Callable[[], None]] = [_install_recall_selection_observer(ctx)]
-    bus = ctx.service("event_bus")
+    # Selection-error observers are scoped to this mount: the registry is
+    # capability-owned (released with the capability) and shared with the
+    # injector's indexes and the agent's shadow-recall index, so two
+    # coexisting contexts never double-count into shared stats.
+    observers = SelectionErrorObservers()
+    ctx.register_service("recall_selection_observers", observers)
     injector = ctx.service("procedure_injector")
+    if injector is not None:
+        # The injector's indexes (and anything else that reads this attribute)
+        # must report to this mount's registry, not to a per-object default.
+        try:
+            injector.selection_error_observers = observers
+        except Exception:  # noqa: BLE001 - assembly must never fail here
+            pass
+    disposers: list[Callable[[], None]] = [
+        _install_recall_selection_observer(ctx, observers)
+    ]
+    bus = ctx.service("event_bus")
     if bus is not None and injector is not None:
         from phone_agent.v2.events import APP_LAUNCHED
 
@@ -741,7 +759,7 @@ def _apply_recall(ctx: CapabilityAssemblyContext) -> None:
     ctx.register_service("recall_event_disposers", disposers)
     # Warm the shared embedder on a daemon thread so the model load is not
     # charged to the first recall/selection of the run (fail-open).
-    _warmup_recall_embedder(ctx)
+    _warmup_recall_embedder(ctx, observers)
     _register_cli(
         ctx,
         (

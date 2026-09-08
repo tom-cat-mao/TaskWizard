@@ -73,10 +73,51 @@ SELECTION_ERROR_KEYS = {
 }
 _STATS_LOCK = threading.Lock()
 _INDEX_LOCK = threading.RLock()
-_SELECTION_OBSERVER_LOCK = threading.Lock()
-# Observers receive ``(namespace, error_type)`` — never a stack trace, message,
-# or any caller-controlled string, so the audit plane stays redaction-safe.
-_selection_error_observers: list[Callable[[str, str], None]] = []
+
+
+class SelectionErrorObservers:
+    """Instance-scoped registry of ``(namespace, error_type)`` observers.
+
+    Observers are registered per *scope* — a :class:`VecIndex` instance or a
+    capability mount — never globally, so two coexisting agent contexts can no
+    longer cross-notify each other's observers and double-count shared stats.
+    Observers receive ``(namespace, error_type)`` — never a stack trace,
+    message, or any caller-controlled string, so the audit plane stays
+    redaction-safe.  ``add`` returns a disposer; ``notify`` never raises.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._observers: list[Callable[[str, str], None]] = []
+
+    def add(self, observer: Callable[[str, str], None]) -> Callable[[], None]:
+        """Register one observer, returning a zero-residue disposer."""
+
+        if not callable(observer):
+            raise TypeError("selection error observer must be callable")
+        with self._lock:
+            self._observers.append(observer)
+
+        def dispose() -> None:
+            with self._lock:
+                try:
+                    self._observers.remove(observer)
+                except ValueError:
+                    return
+
+        return dispose
+
+    def notify(self, namespace: str, error: BaseException | str) -> None:
+        """Publish one selection-path failure to this scope's observers."""
+
+        error_type = error if isinstance(error, str) else type(error).__name__
+        with self._lock:
+            observers = tuple(self._observers)
+        for observer in observers:
+            try:
+                observer(str(namespace), str(error_type))
+            except Exception:  # noqa: BLE001 - observation is fail-open
+                continue
 
 
 class Embedder(Protocol):
@@ -226,13 +267,14 @@ def warmup_embedder(
     embedder_factory: Callable[[], Any] | None,
     *,
     text: str = WARMUP_TEXT,
+    observers: SelectionErrorObservers | None = None,
 ) -> threading.Thread | None:
     """Run one trivial embed on a daemon thread (fail-open, fire-and-forget).
 
     The MLX stack loads its model on the first ``embed()``; doing that at
     capability mount keeps the load off the first recall/selection of the run.
-    A failure is recorded like any other selection-path failure and never
-    reaches the caller.
+    A failure is recorded on the supplied mount-scoped observer registry (when
+    one is given) and never reaches the caller.
     """
 
     if not callable(embedder_factory):
@@ -245,7 +287,8 @@ def warmup_embedder(
                 return
             embedder.embed([text])
         except Exception as exc:  # noqa: BLE001 - warm-up is fail-open
-            note_selection_error("embedder", exc)
+            if observers is not None:
+                observers.notify("embedder", exc)
 
     thread = threading.Thread(
         target=run, name="recall-embedder-warmup", daemon=True
@@ -628,6 +671,10 @@ class ProcedureSelection:
     candidates: int = 0
     filtered: int = 0
     reason: str = "no_cards"
+    # The lesson version the indexed card was minted from (``None`` when the
+    # metadata carries none).  The injector re-checks this against the
+    # authoritative lesson view before delivering.
+    version: int | None = None
 
     @property
     def selected(self) -> bool:
@@ -646,6 +693,7 @@ class ProcedureSelection:
             "filtered": int(self.filtered),
             "reason": self.reason,
             "selected": self.selected,
+            "version": self.version,
         }
 
 
@@ -657,8 +705,14 @@ def format_procedure_block(
     """Render at most one procedure card inside its own token budget.
 
     The card is a non-binding reference: the block says so explicitly and names
-    the source lesson id.  Steps are appended in order and dropped (never
-    rewritten) once the budget is spent.  Pure function — no I/O, no index.
+    the source lesson id.  The fixed header (label line plus the title/source
+    line) is budgeted **first**: a too-long title is truncated with an ellipsis
+    until the header alone fits, and steps/pitfalls only fill the remainder.
+    Steps are appended in order and dropped (never rewritten) once the budget
+    is spent.  Hard guarantee: the returned block's token estimate never
+    exceeds ``max_tokens`` — when even the minimal fixed header cannot fit,
+    ``None`` is returned (no card delivered).  Pure function — no I/O, no
+    index.
     """
 
     payload = (
@@ -676,9 +730,30 @@ def format_procedure_block(
     if budget <= 0:
         return None
     header = "[过程参考]（历史过程卡，仅供参考，不是规则；与当前世界状态冲突时以观测为准）"
-    title = str(payload.get("title") or "").strip()
     scope = str(payload.get("app_scope") or GENERAL_APP_SCOPE)
-    lines = [header, f"{title}（来源 {lesson_id} · app {scope}）"]
+    title = str(payload.get("title") or "").strip()
+
+    def _source_line(card_title: str) -> str:
+        return f"{card_title}（来源 {lesson_id} · app {scope}）"
+
+    # Budget the header first: the title is the only elastic part of it.
+    if estimate_text_tokens("\n".join([header, _source_line("")])) > budget:
+        # Even an empty title cannot fit the fixed header — nothing may be
+        # returned within this budget.
+        return None
+    if estimate_text_tokens("\n".join([header, _source_line(title)])) > budget:
+        low, high = 0, len(title)
+        # Invariant: the empty prefix fits, the full title does not.  Binary
+        # search the longest prefix that still fits with the ellipsis.
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = title[:middle] + "…"
+            if estimate_text_tokens("\n".join([header, _source_line(candidate)])) <= budget:
+                low = middle
+            else:
+                high = middle - 1
+        title = title[:low] + "…" if low else ""
+    lines = [header, _source_line(title)]
     truncated = False
     for index, step in enumerate(payload.get("steps") or (), start=1):
         candidate = f"{index}. {step}"
@@ -697,36 +772,38 @@ def format_procedure_block(
         marker = "…（过程卡已按预算截断）"
         if estimate_text_tokens("\n".join([*lines, marker])) <= budget:
             lines.append(marker)
-    return "\n".join(lines)
-
-
-@contextmanager
-def _selection_scope(namespace: str):
-    """Record one selection phase's failure and re-raise it unchanged.
-
-    The fail-open return belongs to the caller (the shadow run-start path and
-    the procedure injector); the scope only makes the failure visible in the
-    trace and the scorecard before control leaves this module.
-    """
-
-    try:
-        yield
-    except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
-        note_selection_error(namespace, exc)
-        raise
+    block = "\n".join(lines)
+    # Hard guarantee (defense in depth): the estimate is checked after every
+    # append above, so this assertion can only trip on a future edit.
+    if estimate_text_tokens(block) > budget:
+        return None
+    return block
 
 
 class VecIndex:
-    """Single-file sqlite-vec + FTS5 hybrid index."""
+    """Single-file sqlite-vec + FTS5 hybrid index.
+
+    Every index instance owns a :class:`SelectionErrorObservers` registry
+    (``selection_error_observers``).  Selection-path failures inside this
+    index notify only the observers registered *here* — or on the
+    mount-scoped registry the creator passed in — never a process-global list,
+    so two coexisting agent contexts cannot double-count each other's stats.
+    """
 
     def __init__(
         self,
         db_path: str | Path = "memory/vec.db",
         *,
         embedder: Embedder,
+        selection_error_observers: SelectionErrorObservers | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.embedder = embedder
+        self.selection_error_observers = (
+            selection_error_observers
+            if selection_error_observers is not None
+            else SelectionErrorObservers()
+        )
         if self.db_path != Path(":memory:"):
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(str(self.db_path))
@@ -801,6 +878,22 @@ class VecIndex:
 
     def __exit__(self, *_args: Any) -> None:
         self.close()
+
+    @contextmanager
+    def _selection_scope(self, namespace: str):
+        """Record one selection phase's failure and re-raise it unchanged.
+
+        The fail-open return belongs to the caller (the shadow run-start path
+        and the procedure injector); the scope only makes the failure visible
+        — on *this index's* observer registry — before control leaves the
+        module.
+        """
+
+        try:
+            yield
+        except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
+            self.selection_error_observers.notify(namespace, exc)
+            raise
 
     def count(self, *, embed_model: str | None = None) -> int:
         if embed_model is None:
@@ -936,6 +1029,39 @@ class VecIndex:
                 )
                 self.connection.execute("DELETE FROM recall_items WHERE id = ?", (row_id,))
         return len(deleted)
+
+    def delete_procedure(self, lesson_id: str) -> bool:
+        """Remove one lesson's row from the ``procedure`` namespace.
+
+        Revoke propagation for the CLI: a lesson revoked in the authoritative
+        store must not stay selectable from the derived index until the next
+        sync.  Returns whether a row was removed; deleting an absent id is a
+        no-op, and rows of other embed models are removed too (the lesson is
+        gone for every embedding of this index).
+        """
+
+        ref_id = str(lesson_id).strip()
+        if not ref_id:
+            return False
+        rows = self.connection.execute(
+            "SELECT id FROM recall_items WHERE namespace = 'procedure' AND ref_id = ?",
+            (ref_id,),
+        ).fetchall()
+        if not rows:
+            return False
+        with self.connection:
+            for row in rows:
+                row_id = int(row["id"])
+                self.connection.execute(
+                    "DELETE FROM recall_vectors WHERE rowid = ?", (row_id,)
+                )
+                self.connection.execute(
+                    "DELETE FROM recall_fts WHERE rowid = ?", (row_id,)
+                )
+                self.connection.execute(
+                    "DELETE FROM recall_items WHERE id = ?", (row_id,)
+                )
+        return True
 
     def source_hash(self, namespace: str, ref_id: str) -> str | None:
         row = self.connection.execute(
@@ -1146,7 +1272,7 @@ class VecIndex:
             return ProcedureSelection(reason="empty_query")
         if not 0.0 <= float(min_score) <= 1.0:
             raise ValueError("min_score must be between 0 and 1")
-        with _selection_scope("procedure"):
+        with self._selection_scope("procedure"):
             return self._select_procedure(
                 query,
                 app_package=app_package,
@@ -1220,6 +1346,7 @@ class VecIndex:
             candidates=len(in_device),
             filtered=len(scored),
             reason="hit",
+            version=int(metadata["generation"]) if metadata.get("generation") else None,
         )
 
     def recall(
@@ -1251,13 +1378,13 @@ class VecIndex:
             raise ValueError("decay_lambda must be non-negative")
         app_candidates: list[dict[str, Any]] = []
         if "app_alias" in selected:
-            with _selection_scope("app_alias"):
+            with self._selection_scope("app_alias"):
                 app_candidates = self._mention_candidates(
                     query, device_scope=device_scope
                 )
         if "episode" not in selected:
             return app_candidates
-        with _selection_scope("episode"):
+        with self._selection_scope("episode"):
             episodes = self._episode_candidates(
                 query,
                 device_scope=device_scope,
@@ -1365,13 +1492,13 @@ class VecIndex:
     ) -> list[dict[str, Any]]:
         """Return App-KB vector neighbours for the names.py embedding route.
 
-        The route runs inside :func:`_selection_scope` so a failure on this
+        The route runs inside :meth:`_selection_scope` so a failure on this
         path is recorded (trace event + ``app_alias_errors``) *before* the
         caller's fail-open swallow — ``names.py`` catches and discards the
         exception, so without the scope the failure would leave no evidence.
         """
 
-        with _selection_scope("app_alias"):
+        with self._selection_scope("app_alias"):
             return self._app_name_vector_candidates(
                 query, device_scope=device_scope, top_k=top_k
             )
@@ -1677,41 +1804,6 @@ def selection_error_key(namespace: str) -> str | None:
     return SELECTION_ERROR_KEYS.get(str(namespace).strip())
 
 
-def add_selection_error_observer(
-    observer: Callable[[str, str], None],
-) -> Callable[[], None]:
-    """Register one ``(namespace, error_type)`` observer, returning a disposer."""
-
-    if not callable(observer):
-        raise TypeError("selection error observer must be callable")
-    with _SELECTION_OBSERVER_LOCK:
-        _selection_error_observers.append(observer)
-
-    def dispose() -> None:
-        with _SELECTION_OBSERVER_LOCK:
-            try:
-                _selection_error_observers.remove(observer)
-            except ValueError:
-                return
-
-    return dispose
-
-
-def note_selection_error(namespace: str, error: BaseException | str) -> None:
-    """Notify observers of one selection-path failure; never raises.
-
-    Only the exception *type* (or a literal string) is published, so a failure
-    leaves no stack trace, message, or caller-controlled text in the trace.
-    """
-
-    error_type = error if isinstance(error, str) else type(error).__name__
-    for observer in tuple(_selection_error_observers):
-        try:
-            observer(str(namespace), str(error_type))
-        except Exception:  # noqa: BLE001 - observation is fail-open
-            continue
-
-
 def update_selection_error_stats(
     stats_path: str | Path, namespace: str
 ) -> dict[str, Any]:
@@ -1854,6 +1946,36 @@ def update_procedure_recall_stats(
                 "latest_procedure": {"run_id": run_id, **payload},
             }
         )
+        return updated
+
+    return _accumulate_stats(stats_path, accumulate)
+
+
+def update_procedure_delivery_suppressed(
+    stats_path: str | Path,
+    *,
+    reason: str,
+    lesson_id: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Count one delivery suppressed by the authoritative lesson re-check.
+
+    Observe-only and purely additive: the selection scorecard above stays
+    "what the index selected"; this counter records that a selected card was
+    **not** delivered because the authoritative ``lessons.json`` snapshot no
+    longer backed it (revoked, demoted, missing, version drift, or unreadable).
+    """
+
+    def accumulate(current: dict[str, Any]) -> dict[str, Any]:
+        updated = dict(current)
+        updated["procedure_suppressed"] = (
+            int(current.get("procedure_suppressed", 0)) + 1
+        )
+        updated["latest_procedure_suppressed"] = {
+            "run_id": run_id,
+            "lesson_id": lesson_id,
+            "reason": str(reason),
+        }
         return updated
 
     return _accumulate_stats(stats_path, accumulate)
@@ -2107,6 +2229,31 @@ def select_procedure(
         )
 
 
+def delete_index_procedure(config: Any, lesson_id: str) -> dict[str, Any] | None:
+    """Best-effort removal of one lesson's procedure row from the index.
+
+    CLI revoke propagation: after the authoritative store revokes a lesson,
+    the derived index must not keep serving it until the next sync.  Returns a
+    small report, or ``None`` when no index is configured or anything fails —
+    this helper is fail-open by contract and must never break the CLI command.
+    """
+
+    if not getattr(config, "vec_db", None):
+        return None
+    try:
+        db_path = Path(getattr(config, "vec_db", "memory/vec.db"))
+        active = MlxEmbedder(
+            getattr(config, "embed_model", DEFAULT_EMBED_MODEL),
+            int(getattr(config, "embed_dim", 1024)),
+        )
+        with _index_file_lock(db_path):
+            with VecIndex(db_path, embedder=active) as index:
+                removed = index.delete_procedure(lesson_id)
+        return {"lesson_id": str(lesson_id), "removed": bool(removed)}
+    except Exception:  # noqa: BLE001 - the CLI command must never fail on this
+        return None
+
+
 def recall(
     query: str,
     *,
@@ -2146,9 +2293,10 @@ __all__ = [
     "PROCEDURE_MIN_SCORE",
     "ProcedureSelection",
     "RECALL_SELECTION_ERROR",
+    "SelectionErrorObservers",
     "VecIndex",
-    "add_selection_error_observer",
     "alias_snapshot",
+    "delete_index_procedure",
     "embedder_needs_warmup",
     "episode_is_indexable",
     "evaluate_recall",
@@ -2158,7 +2306,6 @@ __all__ = [
     "index_episodes",
     "incremental_upsert",
     "load_procedure_lessons",
-    "note_selection_error",
     "read_episode_events",
     "recall",
     "reconcile_index",
@@ -2166,6 +2313,7 @@ __all__ = [
     "resolve_embedder_factory",
     "select_procedure",
     "selection_error_key",
+    "update_procedure_delivery_suppressed",
     "update_procedure_recall_stats",
     "update_recall_stats",
     "update_selection_error_stats",

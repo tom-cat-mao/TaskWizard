@@ -232,11 +232,21 @@ def _review_lessons(config: V2Config) -> dict[str, int]:
         elif verdict in {"r", "revoke"}:
             reason = input("reason: ").strip()
             try:
-                store.revoke(candidate.lesson_id, reason)
+                revoked_lesson = store.revoke(candidate.lesson_id, reason)
             except ValueError as exc:
                 print(f"blocked: {exc}", file=sys.stderr)
             else:
                 revoked += 1
+                # Same best-effort index purge as --revoke-lesson (S3).
+                if revoked_lesson.kind == "procedure":
+                    from phone_agent.v2.recall import delete_index_procedure
+
+                    purge = delete_index_procedure(config, candidate.lesson_id)
+                    if purge is not None:
+                        print(
+                            "vec: "
+                            + json.dumps(purge, ensure_ascii=False, sort_keys=True)
+                        )
     return {"reviewed": reviewed, "approved": approved, "revoked": revoked}
 
 
@@ -377,6 +387,18 @@ def _build_cli_capability_context(config: V2Config) -> CapabilityAssemblyContext
         except (KeyError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+        # Revoke propagation (S3): the derived index must not keep serving a
+        # revoked card until the next sync.  Best-effort — a missing index or
+        # any failure never fails this command (dream/rebuild re-sync later).
+        if lesson.kind == "procedure":
+            from phone_agent.v2.recall import delete_index_procedure
+
+            purge = delete_index_procedure(config, lesson_id)
+            if purge is not None:
+                print(
+                    "vec: "
+                    + json.dumps(purge, ensure_ascii=False, sort_keys=True)
+                )
         print(
             "lesson: "
             + json.dumps(lesson.to_dict(), ensure_ascii=False, sort_keys=True)

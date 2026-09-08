@@ -484,3 +484,111 @@ def test_shadow_run_records_procedure_selection(tmp_path, monkeypatch):
     assert stats["procedure_runs"] == 1
     assert stats["procedure_hits"] == 1
     assert stats["latest_procedure"]["lesson_id"] == selection.lesson_id
+
+
+# --- S3 FIX 1: revoke propagation (delete_procedure) ---------------------
+
+
+def test_delete_procedure_removes_only_that_lesson_row(tmp_path):
+    lessons = tmp_path / "lessons"
+    food = _food_card(lessons)
+    general = _propose(
+        lessons, _payload(text=GENERAL_TITLE, steps=GENERAL_STEPS, app_scope="general")
+    )
+    with VecIndex(tmp_path / "vec.db", embedder=HashEmbedder(64)) as index:
+        index.sync_procedure_lessons(load_procedure_lessons(lessons))
+        assert index.count() == 2
+
+        assert index.delete_procedure(food.lesson_id) is True
+        # Idempotent: a second delete finds no row.
+        assert index.delete_procedure(food.lesson_id) is False
+        assert index.delete_procedure("les_0000000000000009") is False
+        # The remaining card is still selectable.
+        selection = index.select_procedure(
+            GENERAL_TITLE, app_package=None, min_score=0.0
+        )
+        assert selection.lesson_id == general.lesson_id
+
+
+def test_delete_index_procedure_is_fail_open_and_purges(tmp_path):
+    from phone_agent.v2.recall import delete_index_procedure
+
+    lessons = tmp_path / "lessons"
+    card = _food_card(lessons)
+    config = SimpleNamespace(
+        vec_db=str(tmp_path / "vec.db"),
+        embed_model="hash-v1",
+        embed_dim=64,
+    )
+    with VecIndex(tmp_path / "vec.db", embedder=HashEmbedder(64)) as index:
+        index.sync_procedure_lessons(load_procedure_lessons(lessons))
+
+    # Unknown id: no row removed, still a successful no-op report.
+    report = delete_index_procedure(config, "les_0000000000000009")
+    assert report == {"lesson_id": "les_0000000000000009", "removed": False}
+
+    report = delete_index_procedure(config, card.lesson_id)
+    assert report == {"lesson_id": card.lesson_id, "removed": True}
+    with VecIndex(tmp_path / "vec.db", embedder=HashEmbedder(64)) as index:
+        assert index.count() == 0
+
+    # No index configured → None (best-effort, never an error).
+    assert delete_index_procedure(SimpleNamespace(vec_db=None), card.lesson_id) is None
+    # Unusable index path → None (fail-open), the CLI command must survive it.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    assert (
+        delete_index_procedure(
+            SimpleNamespace(vec_db=str(blocker / "v.db"), embed_model="hash-v1",
+                            embed_dim=64),
+            card.lesson_id,
+        )
+        is None
+    )
+
+
+# --- S3 FIX 5: the header must respect the token budget ------------------
+
+
+def test_block_budget_holds_at_boundary_token_values():
+    selection = ProcedureSelection(
+        lesson_id="les_0123456789ab",
+        title=FOOD_TITLE,
+        steps=tuple(FOOD_STEPS),
+        app_scope=FOOD,
+        score=0.9,
+        reason="hit",
+    )
+    # Budget 0: nothing may be rendered.
+    assert format_procedure_block(selection, max_tokens=0) is None
+    # Budget 1 and 10: even the fixed header cannot fit — no block, never an
+    # oversized one.
+    assert format_procedure_block(selection, max_tokens=1) is None
+    assert format_procedure_block(selection, max_tokens=10) is None
+    # Every rendered budget holds the hard guarantee.
+    for budget in (25, 40, 60, 120, 300, 1000):
+        block = format_procedure_block(selection, max_tokens=budget)
+        assert block is not None
+        assert estimate_text_tokens(block) <= budget
+
+
+def test_block_truncates_title_when_header_alone_exceeds_budget():
+    long_title = "超长标题" * 500  # 2000 chars
+    selection = ProcedureSelection(
+        lesson_id="les_0123456789ab",
+        title=long_title,
+        steps=("打开天气应用",),
+        app_scope=FOOD,
+        score=0.9,
+        reason="hit",
+    )
+
+    block = format_procedure_block(selection, max_tokens=300)
+
+    assert block is not None
+    assert estimate_text_tokens(block) <= 300
+    # The header survived; the title was cut with an ellipsis, never dropped.
+    assert "仅供参考，不是规则" in block
+    assert "…" in block
+    assert long_title not in block
+    assert "1. 打开天气应用" not in block  # the header consumed the remainder

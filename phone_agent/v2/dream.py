@@ -493,12 +493,14 @@ def lesson_effectiveness(
 ) -> list[dict[str, Any]]:
     """Compare run outcomes with and without an injected lesson.
 
-    Cohort definition: ``runs_with`` are the episodes whose ``injected_lessons``
-    contains the lesson id; ``runs_without`` are every other episode in the same
-    view, whether it injected nothing or injected different lessons.  The
-    narrower "empty injection only" baseline was rejected because archived and
-    folded episodes leave the view over time, which makes the empty cohort both
-    smaller and systematically older than the injected one.
+    Cohort definition: ``runs_with`` are the episodes whose injected-lesson
+    union — ``injected_lessons`` (rule channel) *plus* ``injected_procedures``
+    (procedure-card channel) — contains the lesson id; ``runs_without`` are
+    every other episode in the same view, whether it injected nothing or
+    injected different lessons.  The narrower "empty injection only" baseline
+    was rejected because archived and folded episodes leave the view over
+    time, which makes the empty cohort both smaller and systematically older
+    than the injected one.
 
     Only lessons injected into at least ``min_runs`` episodes are reported; one
     run says nothing about a lesson.  Nothing here revokes or demotes: the
@@ -532,10 +534,19 @@ def lesson_effectiveness(
 
 
 def _injected_lesson_ids(episode: Mapping[str, Any]) -> set[str]:
-    raw = episode.get("injected_lessons")
-    if not isinstance(raw, (list, tuple)):
-        return set()
-    return {str(item) for item in raw if item}
+    """Union of every injected lesson id: rules *and* procedure cards.
+
+    The rule channel records ``injected_lessons`` and the WP-WF3 card channel
+    records ``injected_procedures``; effectiveness must see both, otherwise
+    card-only injections silently leave the cohorts.
+    """
+
+    ids: set[str] = set()
+    for field_name in ("injected_lessons", "injected_procedures"):
+        raw = episode.get(field_name)
+        if isinstance(raw, (list, tuple)):
+            ids.update(str(item) for item in raw if item)
+    return ids
 
 
 def _as_non_negative_int(value: Any) -> int:

@@ -1315,3 +1315,30 @@ def test_app_rule_selection_goal_relevance_beats_version_order(tmp_path):
         relevant.lesson_id,
         irrelevant.lesson_id,
     ]
+# --- S3 FIX 1: public read-only lesson-view helpers -----------------------
+
+
+def test_read_lessons_snapshot_is_read_only_and_fail_open(tmp_path):
+    """The public helper mirrors the private snapshot: view-only, no rebuild."""
+
+    import json
+
+    from phone_agent.v2.evolution import lessons_view_path, read_lessons_snapshot
+
+    lessons_dir = tmp_path / "lessons"
+    candidate = _candidate(text="公共快照可读")
+    store = LessonStore(lessons_dir)
+    saved = store.propose(candidate)
+    store.approve(saved.lesson_id)
+    view_mtime = lessons_view_path(lessons_dir).stat().st_mtime_ns
+
+    snapshot = read_lessons_snapshot(lessons_dir)
+    assert [lesson.lesson_id for lesson in snapshot] == [saved.lesson_id]
+    assert snapshot[0].status == "approved"
+    # Strictly read-only: the view was neither rebuilt nor rewritten.
+    assert lessons_view_path(lessons_dir).stat().st_mtime_ns == view_mtime
+    # Missing / damaged views fail open to empty, never raise.
+    assert read_lessons_snapshot(tmp_path / "absent") == []
+    lessons_view_path(lessons_dir).write_text("{not json", encoding="utf-8")
+    assert read_lessons_snapshot(lessons_dir) == []
+    assert lessons_view_path(lessons_dir).name == "lessons.json"
