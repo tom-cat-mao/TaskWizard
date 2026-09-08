@@ -46,6 +46,21 @@ injected id is exposed through :attr:`injected_ids` (cards) and
 :attr:`injected_rule_ids` (app rules) for the trace/episode audit plane.  The
 whole channel is fail-open: a missing index, embedder, or stats file disables
 injection for that point and never alters the run.
+
+Authoritative delivery gate (S3): the sqlite index's ``revoked`` /
+``injectable`` columns are *copies* synced from the materialized lesson
+view only at
+run-end upsert / dream reconcile, so a card revoked through the CLI could
+still be selected — and previously delivered — by a fresh agent process.
+Before any card delivery the injector therefore re-validates the selected
+lesson id against the authoritative lesson-view snapshot (existence +
+``approved``/``auto_approved`` status + version match when the index metadata
+carries one).  Any read or validation failure **suppresses the injection
+quietly** (the run continues; a failed validation never injects unverified
+memory) and is recorded through
+:func:`phone_agent.v2.recall.update_procedure_delivery_suppressed` plus a
+``procedure_delivery_suppressed`` trace event.  The snapshot read is cheap:
+one view read per delivery point at most (an mtime-keyed cache).
 """
 
 from __future__ import annotations
@@ -57,7 +72,9 @@ from typing import Any
 
 from phone_agent.v2.recall import (
     ProcedureSelection,
+    SelectionErrorObservers,
     format_procedure_block,
+    update_procedure_delivery_suppressed,
     update_procedure_recall_stats,
 )
 
@@ -111,6 +128,7 @@ class ProcedureCardInjector:
         embedder_factory: Callable[[], Any] | None = None,
         selector: Callable[..., Any] | None = None,
         stats_recorder: Callable[[Any], Any] | None = None,
+        selection_error_observers: SelectionErrorObservers | None = None,
     ) -> None:
         self.config = config
         self.session = session
@@ -119,6 +137,13 @@ class ProcedureCardInjector:
         self._embedder_factory = embedder_factory
         self._selector = selector
         self._stats_recorder = stats_recorder
+        # Mount-scoped selection-error observers: every VecIndex this injector
+        # opens reports its failures here and nowhere else.
+        self.selection_error_observers = (
+            selection_error_observers
+            if selection_error_observers is not None
+            else SelectionErrorObservers()
+        )
         # Run-scoped state, cleared by :meth:`reset` at every run boundary.
         self.goal: str = ""
         self.run_start_block: str | None = None
@@ -133,6 +158,12 @@ class ProcedureCardInjector:
         # Emergency revocations (P0 #18): a revoked card must not reach a later
         # injection point. Already-sent messages stay immutable.
         self._revoked: set[str] = set()
+        # Authoritative lesson-view snapshot cache, keyed by the view file's
+        # (mtime_ns, size) so one delivery point reads the file at most once.
+        # ``False`` marks a failed read: validation then fails closed until
+        # the file changes.
+        self._lessons_cache_key: tuple[int, int] | None = None
+        self._lessons_cache: dict[str, tuple[str, int]] | None | bool = False
 
     # -- run lifecycle ---------------------------------------------------
 
@@ -147,6 +178,8 @@ class ProcedureCardInjector:
         self._injected_ids = []
         self._injected_rule_ids = []
         self._selected_packages = set()
+        self._lessons_cache_key = None
+        self._lessons_cache = False
 
     @property
     def injected_ids(self) -> list[str]:
@@ -207,16 +240,15 @@ class ProcedureCardInjector:
             selection = self._select(self.goal, app_package=None)
             self.run_start_selection = selection
             if selection is not None and selection.selected:
-                if not self._revoked_selection(selection):
-                    block = format_procedure_block(selection)
-                    if block:
-                        self.run_start_block = block
-                        self._injected_ids.append(str(selection.lesson_id))
-                        self._record_trace(
-                            POINT_RUN_START,
-                            [str(selection.lesson_id)],
-                            app_package=None,
-                        )
+                block = self._card_block(selection, POINT_RUN_START)
+                if block:
+                    self.run_start_block = block
+                    self._injected_ids.append(str(selection.lesson_id))
+                    self._record_trace(
+                        POINT_RUN_START,
+                        [str(selection.lesson_id)],
+                        app_package=None,
+                    )
         self._prefetch_mentioned_apps()
         return self.run_start_selection
 
@@ -371,15 +403,10 @@ class ProcedureCardInjector:
         card_id: str | None = None
         card_block: str | None = None
         selection = self._select(goal, app_package=package)
-        if (
-            selection is not None
-            and selection.selected
-            and not self._revoked_selection(selection)
-        ):
-            block = format_procedure_block(selection)
-            if block:
-                card_id = str(selection.lesson_id)
-                card_block = block
+        block = self._card_block(selection, point)
+        if block:
+            card_id = str(selection.lesson_id)
+            card_block = block
         rules: tuple[tuple[str, str], ...] = ()
         if with_rules:
             rules = tuple(self._select_app_rules(package))
@@ -392,6 +419,116 @@ class ProcedureCardInjector:
             card_block=card_block,
             rules=rules,
         )
+
+    def _card_block(self, selection: Any, point: str) -> str | None:
+        """Render the selected card for delivery, or ``None`` (skip recorded).
+
+        The authoritative gate applies only when this mode actually injects:
+        ``shadow`` selects purely for statistics and never delivers, so it
+        must not accrue suppression counts for deliveries that cannot happen.
+        """
+
+        if selection is None or not selection.selected:
+            return None
+        if self._revoked_selection(selection):
+            return None
+        reason = self._authoritative_check(selection) if self.injects else None
+        if reason is not None:
+            self._record_suppressed(point, selection, reason)
+            return None
+        return format_procedure_block(selection)
+
+    # -- authoritative delivery gate (S3) ---------------------------------
+
+    def _authoritative_check(self, selection: ProcedureSelection) -> str | None:
+        """Return ``None`` when the authoritative view backs this card.
+
+        The sqlite index's ``revoked``/``injectable`` flags are copies synced
+        only at run-end/dream, so the selected lesson id is re-checked against
+        the current authoritative lesson view: the lesson must exist, be
+        injectable, and — when the index metadata carries a version — carry
+        the same version.  Any mismatch (or an unreadable snapshot) suppresses
+        the delivery; the run itself is never affected.
+        """
+
+        lesson_id = str(selection.lesson_id or "").strip()
+        if not lesson_id:
+            return "no_lesson_id"
+        snapshot = self._lessons_status_snapshot()
+        if snapshot is None:
+            return "snapshot_unreadable"
+        entry = snapshot.get(lesson_id)
+        if entry is None:
+            return "lesson_missing"
+        injectable, version = entry
+        if not injectable:
+            return "not_injectable"
+        if selection.version is not None and version != selection.version:
+            return "version_mismatch"
+        return None
+
+    def _lessons_status_snapshot(self) -> dict[str, tuple[bool, int]] | None:
+        """``{lesson_id: (injectable, version)}`` from the lesson view.
+
+        Read at most once per file change (mtime-keyed cache) per delivery
+        point; ``None`` signals an unreadable snapshot (fail closed for the
+        injection, never for the run).  Strictly read-only.
+        """
+
+        from phone_agent.v2.evolution import (
+            lesson_injectable,
+            lessons_view_path,
+            read_lessons_snapshot,
+        )
+
+        lessons_dir = str(
+            getattr(self.config, "lessons_dir", "memory/lessons") or "memory/lessons"
+        )
+        view_path = lessons_view_path(lessons_dir)
+        try:
+            stat = view_path.stat()
+        except OSError:
+            return None
+        key = (stat.st_mtime_ns, stat.st_size)
+        if self._lessons_cache_key == key and isinstance(self._lessons_cache, dict):
+            return self._lessons_cache
+        try:
+            snapshot = {
+                str(lesson.lesson_id): (lesson_injectable(lesson), int(lesson.version))
+                for lesson in read_lessons_snapshot(lessons_dir)
+            }
+        except Exception:  # noqa: BLE001 - the gate fails closed, not open
+            return None
+        self._lessons_cache_key = key
+        self._lessons_cache = snapshot
+        return snapshot
+
+    def _record_suppressed(self, point: str, selection: Any, reason: str) -> None:
+        """Record one suppressed delivery in the shadow/stats path (fail-open)."""
+
+        lesson_id = str(getattr(selection, "lesson_id", "") or "") or None
+        try:
+            stats_path = (
+                Path(getattr(self.config, "memory_dir", "memory"))
+                / "experience/recall_stats.json"
+            )
+            update_procedure_delivery_suppressed(
+                stats_path, reason=reason, lesson_id=lesson_id
+            )
+        except Exception:  # noqa: BLE001 - shadow statistics are fail-open
+            pass
+        record = getattr(self.trace, "record_event", None)
+        if not callable(record):
+            return
+        try:
+            record(
+                "procedure_delivery_suppressed",
+                point=point,
+                lesson_id=lesson_id,
+                reason=str(reason),
+            )
+        except Exception:  # noqa: BLE001 - trace cannot change run semantics
+            return
 
     def _select_app_rules(self, package: str) -> list[tuple[str, str]]:
         """Read-only app-rule snapshot rendered as one-liners (fail-open)."""
@@ -504,7 +641,9 @@ class ProcedureCardInjector:
                 int(getattr(self.config, "embed_dim", 1024)),
             )
         with VecIndex(
-            getattr(self.config, "vec_db", "memory/vec.db"), embedder=embedder
+            getattr(self.config, "vec_db", "memory/vec.db"),
+            embedder=embedder,
+            selection_error_observers=self.selection_error_observers,
         ) as index:
             return index.select_procedure(
                 goal, app_package=app_package, device_id=self._device_id()
@@ -551,6 +690,7 @@ def build_procedure_injector(
     session: Any = None,
     trace: Any = None,
     embedder_factory: Callable[[], Any] | None = None,
+    selection_error_observers: SelectionErrorObservers | None = None,
 ) -> ProcedureCardInjector:
     """Build the WP-WF3 injector mounted by the recall capability."""
 
@@ -559,6 +699,7 @@ def build_procedure_injector(
         session=session,
         trace=trace,
         embedder_factory=embedder_factory,
+        selection_error_observers=selection_error_observers,
     )
 
 

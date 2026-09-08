@@ -118,6 +118,44 @@ def _selection(lesson_id: str, *, title: str, steps, app_scope: str) -> Procedur
     )
 
 
+def _materialize_card(
+    lessons_dir: Path, lesson_id: str, *, title: str, app_scope: str
+) -> None:
+    """Write the fake selector's card into the lesson view (S3 gate).
+
+    The delivery-time authoritative re-check only delivers cards the lesson
+    view lists as injectable, so every fake-selector fixture materializes the
+    card it returns.
+    """
+
+    payloads: list[dict] = []
+    view = lessons_dir / "lessons.json"
+    if view.exists():
+        payloads = json.loads(view.read_text(encoding="utf-8"))
+    payloads.append(
+        {
+            "lesson_id": lesson_id,
+            "schema_v": 1,
+            "version": 1,
+            "status": "auto_approved",
+            "kind": "procedure",
+            "text": title,
+            "steps": ["打开应用", "完成任务"],
+            "pitfalls": None,
+            "app_scope": app_scope,
+            "scope": {"device": None, "app": None, "app_version": None},
+            "evidence": [{"run_id": "a", "note": "outcome pattern"}],
+            "support_count": 1,
+            "task_keys": ["search"],
+            "conflicts": [],
+            "created_ts": 1.0,
+            "source": "distill",
+        }
+    )
+    lessons_dir.mkdir(parents=True, exist_ok=True)
+    view.write_text(json.dumps(payloads, ensure_ascii=False), encoding="utf-8")
+
+
 def _bare_agent(tmp_path: Path, *, mode: str = "on", selector=None) -> ThinPhoneAgent:
     config = SimpleNamespace(
         memory_rag=mode,
@@ -126,6 +164,7 @@ def _bare_agent(tmp_path: Path, *, mode: str = "on", selector=None) -> ThinPhone
         device_id="serial-1",
         embed_model="hash-v1",
         embed_dim=64,
+        lessons_dir=str(tmp_path / "lessons"),
     )
     agent = ThinPhoneAgent.__new__(ThinPhoneAgent)
     agent.config = config
@@ -195,7 +234,9 @@ def _launch_session(tmp_path: Path):
     from phone_agent.v2.appkb import AppKnowledge, AppKnowledgeStore
 
     bus = EventBus()
-    config = SimpleNamespace(device_id="serial-1", app_kb_enabled=True)
+    # ``vec_db=""`` keeps the resolver's embedding route from touching any
+    # derived index (S3 test hygiene: never the repo's real memory/).
+    config = SimpleNamespace(device_id="serial-1", app_kb_enabled=True, vec_db="")
     device = FakeDeviceFactory(installed=frozenset({WECHAT}))
     session = PhoneSession(config, device_factory=device)
     session.event_bus = bus
@@ -234,6 +275,9 @@ def test_launch_app_success_emits_once_per_package(tmp_path):
 
 def test_run_start_general_card_injects_in_on_mode(tmp_path):
     general_id = "les_0123456789ab"
+    _materialize_card(
+        tmp_path / "lessons", general_id, title=GENERAL_TITLE, app_scope="general"
+    )
     calls: list[dict] = []
 
     def selector(goal, *, app_package, device_id):
@@ -357,6 +401,9 @@ def test_run_start_zero_recall_is_recorded_with_its_reason(tmp_path):
 
 
 def test_post_launch_card_is_injected_once_at_the_next_pre_request(tmp_path):
+    _materialize_card(
+        tmp_path / "lessons", "les_f00d00000001", title=FOOD_TITLE, app_scope=FOOD
+    )
     agent = _bare_agent(tmp_path)
     injector = agent._procedure_injector
     injector.run_start(GOAL)
@@ -367,12 +414,12 @@ def test_post_launch_card_is_injected_once_at_the_next_pre_request(tmp_path):
     def selector(goal, *, app_package, device_id):
         selected.append({"goal": goal, "app_package": app_package})
         return _selection(
-            "les_food000001", title=FOOD_TITLE, steps=FOOD_STEPS, app_scope=FOOD
+            "les_f00d00000001", title=FOOD_TITLE, steps=FOOD_STEPS, app_scope=FOOD
         )
 
     injector._selector = selector
     injector.on_app_launched({"package": FOOD, "device_id": "serial-1"})
-    assert injector.pending_lesson_id == "les_food000001"
+    assert injector.pending_lesson_id == "les_f00d00000001"
 
     messages = [SystemMessage(content="SYSTEM")]
     first = injector.on_pre_request(messages, next=lambda payload: payload)
@@ -380,7 +427,7 @@ def test_post_launch_card_is_injected_once_at_the_next_pre_request(tmp_path):
 
     assert len(first) == 2
     assert first[-1].content.startswith(PROCEDURE_CARD_PREFIX)
-    assert "les_food000001" in first[-1].content
+    assert "les_f00d00000001" in first[-1].content
     assert FOOD_TITLE in first[-1].content
     assert estimate_text_tokens(first[-1].content) <= PROCEDURE_MAX_TOKENS
     # One-shot: the next pre-request adds nothing, and the same package is
@@ -389,7 +436,7 @@ def test_post_launch_card_is_injected_once_at_the_next_pre_request(tmp_path):
     injector.on_app_launched({"package": FOOD, "device_id": "serial-1"})
     assert injector.on_pre_request(second, next=lambda payload: payload) == second
     assert selected == [{"goal": GOAL, "app_package": FOOD}]
-    assert injector.injected_ids == ["les_food000001"]
+    assert injector.injected_ids == ["les_f00d00000001"]
 
 
 def test_post_launch_card_is_hard_filtered_to_the_launched_app(tmp_path):
@@ -420,32 +467,38 @@ def test_post_launch_card_is_hard_filtered_to_the_launched_app(tmp_path):
 
 
 def test_revoked_card_never_reaches_a_later_injection_point(tmp_path):
+    _materialize_card(
+        tmp_path / "lessons", "les_cafe00000001", title=GENERAL_TITLE, app_scope="general"
+    )
+    _materialize_card(
+        tmp_path / "lessons", "les_f00d00000001", title=FOOD_TITLE, app_scope=FOOD
+    )
     agent = _bare_agent(tmp_path)
     injector = agent._procedure_injector
     def selector(_goal, *, app_package, device_id):
         if app_package is None:
             return _selection(
-                "les_general0001",
+                "les_cafe00000001",
                 title=GENERAL_TITLE,
                 steps=GENERAL_STEPS,
                 app_scope="general",
             )
         return _selection(
-            "les_food000001", title=FOOD_TITLE, steps=FOOD_STEPS, app_scope=app_package
+            "les_f00d00000001", title=FOOD_TITLE, steps=FOOD_STEPS, app_scope=app_package
         )
 
     injector._selector = selector
     injector.run_start(GOAL)
     injector.on_app_launched({"package": FOOD, "device_id": "serial-1"})
-    assert injector.pending_lesson_id == "les_food000001"
+    assert injector.pending_lesson_id == "les_f00d00000001"
 
-    injector.revoke("les_food000001")
+    injector.revoke("les_f00d00000001")
 
     assert injector.pending_lesson_id is None
     assert injector.on_pre_request(
         [SystemMessage(content="SYSTEM")], next=lambda payload: payload
     ) == [SystemMessage(content="SYSTEM")]
-    assert injector.injected_ids == ["les_general0001"]
+    assert injector.injected_ids == ["les_cafe00000001"]
     # A later launch of the same app cannot re-select the revoked card either.
     injector.on_app_launched({"package": WEATHER, "device_id": "serial-1"})
     assert injector.pending_lesson_id is None
@@ -470,6 +523,9 @@ def test_post_launch_card_missing_for_that_app_injects_nothing(tmp_path):
 
 
 def test_post_launch_card_budget_truncates_steps(tmp_path):
+    _materialize_card(
+        tmp_path / "lessons", "les_0123456789ab", title=FOOD_TITLE, app_scope=FOOD
+    )
     agent = _bare_agent(tmp_path)
     injector = agent._procedure_injector
     injector.run_start(GOAL)
@@ -529,6 +585,10 @@ def test_procedure_and_rule_blocks_coexist_with_separate_budgets(tmp_path):
 
     agent = _bare_agent(tmp_path)
     agent.config.lessons_dir = str(lessons_dir)
+    # The fake selector's card must be backed by the lesson view (S3 gate).
+    _materialize_card(
+        lessons_dir, "les_0123456789ab", title=GENERAL_TITLE, app_scope="general"
+    )
     # One rule only, though three are approved and the rule budget is roomy:
     # the rule quota is its own and the card quota is untouched by it.
     agent.config.lesson_inject_max = 1
@@ -760,6 +820,9 @@ def test_empty_goal_launch_keeps_the_package_delivery_slot(tmp_path):
     """A launch seen before any goal must not burn that app's one slot."""
 
     card_id = "les_0123456789ab"
+    _materialize_card(
+        tmp_path / "lessons", card_id, title=WEATHER_TITLE, app_scope=WEATHER
+    )
     agent = _bare_agent(
         tmp_path,
         selector=lambda _goal, **_kwargs: _selection(
@@ -817,3 +880,89 @@ def test_rule_injection_channel_excludes_procedure_cards(tmp_path: Path) -> None
         str(lessons), device_scope=None, max_items=3, max_tokens=800
     )
     assert [item.text for item in selected] == ["权限弹窗一律选仅本次"]
+
+
+# --- S3: authoritative delivery gate (stale index vs lesson store) -------
+
+
+def test_card_revoked_in_store_still_selected_but_never_delivered(tmp_path):
+    """The index keeps the row until the next sync, but delivery refuses it.
+
+    Verified problem (S3 FIX 1): ``select_procedure`` filters on the sqlite
+    index's own ``revoked`` copy, so a CLI-revoked card stayed selectable for
+    a fresh agent process.  The injector's authoritative re-check closes the
+    delivery path without touching selection semantics.
+    """
+
+    lessons = tmp_path / "lessons"
+    ids = _index_cards(tmp_path, lessons)
+    LessonStore(lessons).revoke(ids[WEATHER], "不信任这张卡")
+
+    # A fresh agent process mounts against the stale index (no re-sync ran).
+    agent = _bare_agent(tmp_path)
+    injector = agent._procedure_injector
+    injector.run_start(GOAL)
+
+    # The stale index still selects the revoked card for the launched app...
+    with VecIndex(tmp_path / "vec.db", embedder=HashEmbedder(64)) as index:
+        selection = index.select_procedure(GOAL, app_package=WEATHER)
+    assert selection.selected and selection.lesson_id == ids[WEATHER]
+
+    # ...but the injector refuses to deliver it and records the suppression.
+    injector.on_app_launched({"package": WEATHER, "device_id": "serial-1"})
+    assert injector.pending_lesson_id is None
+    # Only the run-start general card was injected; the revoked app card is not.
+    assert injector.injected_ids == [ids["general"]]
+    messages = injector.on_pre_request(
+        [SystemMessage(content="SYSTEM")], next=lambda payload: payload
+    )
+    assert PROCEDURE_CARD_PREFIX not in messages[-1].content
+    assert any(
+        event == "procedure_delivery_suppressed"
+        for event, _payload in agent.trace_events
+    )
+    stats = _stats(tmp_path)
+    assert stats["procedure_suppressed"] == 1
+    assert stats["latest_procedure_suppressed"]["reason"] == "not_injectable"
+
+    # After the sync the revoked card is gone from the index entirely.
+    with VecIndex(tmp_path / "vec.db", embedder=HashEmbedder(64)) as index:
+        index.sync_procedure_lessons(load_procedure_lessons(lessons))
+        assert index.select_procedure(GOAL, app_package=WEATHER).reason == (
+            "app_scope_mismatch"
+        )
+
+
+def test_version_mismatch_between_index_and_view_suppresses_delivery(tmp_path):
+    """A superseded+re-approved card (v2 in the view, v1 in the index) waits."""
+
+    lessons = tmp_path / "lessons"
+    ids = _index_cards(tmp_path, lessons)
+    store = LessonStore(lessons)
+    superseded = store.supersede(ids[WEATHER], "天气应用查预报（修订）")
+    store.approve(superseded.lesson_id)
+
+    agent = _bare_agent(tmp_path)
+    injector = agent._procedure_injector
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": WEATHER, "device_id": "serial-1"})
+
+    assert injector.pending_lesson_id is None
+    stats = _stats(tmp_path)
+    assert stats["latest_procedure_suppressed"]["reason"] == "version_mismatch"
+
+
+def test_missing_lesson_view_suppresses_delivery_quietly(tmp_path):
+    """No authoritative view at all: fail closed for injection, not the run."""
+
+    lessons = tmp_path / "lessons"
+    _index_cards(tmp_path, lessons)
+    agent = _bare_agent(tmp_path)
+    injector = agent._procedure_injector
+    injector.config.lessons_dir = str(tmp_path / "absent-lessons")
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": WEATHER, "device_id": "serial-1"})
+
+    assert injector.pending_lesson_id is None
+    stats = _stats(tmp_path)
+    assert stats["latest_procedure_suppressed"]["reason"] == "snapshot_unreadable"

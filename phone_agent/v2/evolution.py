@@ -769,6 +769,32 @@ def proposal_metadata(
     return metadata
 
 
+def lessons_view_path(lessons_dir: str | os.PathLike[str]) -> Path:
+    """Return the materialized lesson view file for ``lessons_dir``.
+
+    Single home for the view filename so runtime consumers (e.g. the
+    procedure-card injector's delivery gate) can stat the snapshot for cache
+    keying without duplicating — or naming — the path themselves.
+    """
+
+    return Path(lessons_dir) / "lessons.json"
+
+
+def read_lessons_snapshot(
+    lessons_dir: str | os.PathLike[str],
+) -> list[LessonCandidate]:
+    """Public read-only view of ``lessons.json`` (fail-open to empty).
+
+    The authoritative current-version lesson snapshot for runtime consumers
+    that must re-check injectability at delivery time (e.g. the procedure-card
+    injector's post-selection revocation check).  Strictly read-only: opening a
+    runtime run must never create or rebuild lesson state, and a missing or
+    damaged view yields no lessons rather than an exception.
+    """
+
+    return _read_lessons_snapshot(lessons_dir)
+
+
 def _read_lessons_snapshot(lessons_dir: str | os.PathLike[str]) -> list[LessonCandidate]:
     """Read ``lessons.json`` read-only; a damaged view fails open to empty.
 
@@ -2139,10 +2165,12 @@ __all__ = [
     "evaluate_promotion",
     "evidence_loss_reason",
     "lesson_injectable",
+    "lessons_view_path",
     "load_lessons",
     "make_lesson_id",
     "proposal_metadata",
     "read_episode_outcomes",
+    "read_lessons_snapshot",
     "select_app_rules_for_injection",
     "select_lessons_for_injection",
 ]

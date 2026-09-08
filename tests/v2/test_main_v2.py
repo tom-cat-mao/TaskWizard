@@ -152,3 +152,64 @@ def test_manual_mode_does_not_run_dream_automatically(monkeypatch):
 
     assert main_v2.main(["做任务"]) == 0
     assert calls == []
+
+
+def test_revoke_lesson_purges_procedure_row_from_index(tmp_path, monkeypatch, capsys):
+    """S3 FIX 1: CLI revoke propagation best-effort deletes the index row."""
+
+    from phone_agent.v2.recall import HashEmbedder, VecIndex, load_procedure_lessons
+
+    monkeypatch.setattr(main_v2, "load_project_env", lambda: None)
+
+    lessons_dir = tmp_path / "lessons"
+    card = _procedure_card()
+    LessonStore(lessons_dir).propose(card)
+    vec_db = tmp_path / "vec.db"
+    with VecIndex(vec_db, embedder=HashEmbedder(64)) as index:
+        index.sync_procedure_lessons(load_procedure_lessons(lessons_dir))
+        assert index.count() == 1
+
+    config = SimpleNamespace(
+        lessons_dir=str(lessons_dir),
+        experience_dir=str(tmp_path / "experience"),
+        experience_enabled=True,
+        vec_db=str(vec_db),
+        embed_model="hash-v1",
+        embed_dim=64,
+        memory_rag="on",
+    )
+    monkeypatch.setattr(main_v2.V2Config, "from_env", lambda overrides: config)
+
+    rc = main_v2.main(["--revoke-lesson", card.lesson_id, "不信任这张卡"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert '"removed": true' in out
+    store = LessonStore(lessons_dir)
+    assert store.get(card.lesson_id).status == "revoked"
+    with VecIndex(vec_db, embedder=HashEmbedder(64)) as index:
+        assert index.count() == 0
+        assert index.select_procedure("外卖下单").lesson_id is None
+
+
+def _procedure_card() -> LessonCandidate:
+    return LessonCandidate.from_dict(
+        {
+            "lesson_id": "les_bbbbbbbbbbbb0001",
+            "schema_v": 1,
+            "version": 1,
+            "status": "auto_approved",
+            "kind": "procedure",
+            "text": "外卖应用下单到结算",
+            "steps": ["搜索餐厅", "下单", "结算前停手"],
+            "pitfalls": None,
+            "app_scope": "com.example.food",
+            "scope": {"device": None, "app": None, "app_version": None},
+            "evidence": [{"run_id": "run-1", "note": "ok"}],
+            "support_count": 1,
+            "task_keys": ["order"],
+            "conflicts": [],
+            "created_ts": 1.0,
+            "source": "distill",
+        }
+    )

@@ -55,6 +55,7 @@ def _episode(
     steps: int = 10,
     tokens_total: int = 1000,
     injected_lessons: list[str] | None = None,
+    injected_procedures: list[str] | None = None,
 ) -> dict:
     # Recent timestamps: dream's 90-day retention would archive 1970-era runs.
     now = time.time()
@@ -71,6 +72,7 @@ def _episode(
         "steps": steps,
         "tokens_total": tokens_total,
         "injected_lessons": injected_lessons or [],
+        "injected_procedures": injected_procedures or [],
     }
 
 
@@ -397,3 +399,51 @@ def test_dream_does_not_flag_lesson_injected_into_successful_runs(tmp_path):
     summary = run_maintenance(config, light=False)
 
     assert summary["suggested_revoke"] == []
+
+
+def test_lesson_effectiveness_counts_procedure_card_injections(tmp_path):
+    """S3 FIX 3: ``injected_procedures`` joins the injected-lesson union."""
+
+    experience_dir = str(tmp_path / "experience")
+    writer = ExperienceWriter(experience_dir)
+    writer.append_outcome(
+        **_episode(
+            "run-1",
+            goal="查询机票",
+            success=False,
+            steps=25,
+            tokens_total=6000,
+            injected_procedures=[LESSON_B],
+        )
+    )
+    writer.append_outcome(
+        **_episode(
+            "run-2",
+            goal="查询机票",
+            success=False,
+            steps=26,
+            tokens_total=6100,
+            injected_lessons=[LESSON_A],
+            injected_procedures=[LESSON_B],
+        )
+    )
+    writer.append_outcome(
+        **_episode(
+            "run-3",
+            goal="查询机票",
+            success=True,
+            steps=10,
+            tokens_total=2000,
+            injected_lessons=[LESSON_A],
+        )
+    )
+
+    report = lesson_effectiveness(_view_episodes(experience_dir))
+
+    by_id = {item["lesson_id"]: item for item in report}
+    # The card channel's id forms its own cohort — previously invisible.
+    assert by_id[LESSON_B]["runs_with"]["runs"] == 2
+    assert by_id[LESSON_B]["runs_without"]["runs"] == 1
+    # A lesson injected through the rule channel keeps its own cohort.
+    assert by_id[LESSON_A]["runs_with"]["runs"] == 2
+    assert by_id[LESSON_A]["runs_without"]["runs"] == 1

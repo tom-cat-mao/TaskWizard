@@ -1243,9 +1243,19 @@ class ThinPhoneAgent:
                 trace_payload["reason"] = "device_scope_unavailable"
             else:
                 embedder = self._recall_embedder_instance()
+                # Scoped selection-error observers: the shadow index reports
+                # to the recall capability's mount registry when one is
+                # mounted (otherwise this index gets its own empty registry
+                # and stays silent).
+                capability_ctx = getattr(self, "_capability_ctx", None)
                 with VecIndex(
                     getattr(self.config, "vec_db", "memory/vec.db"),
                     embedder=embedder,
+                    selection_error_observers=(
+                        capability_ctx.service("recall_selection_observers")
+                        if capability_ctx is not None
+                        else None
+                    ),
                 ) as index:
                     self._shadow_candidates = index.recall(
                         task,
