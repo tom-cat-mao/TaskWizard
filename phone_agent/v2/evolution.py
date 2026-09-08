@@ -2070,18 +2070,17 @@ def approve_if_eligible(
     lesson_id: str,
     episodes: Sequence[Mapping[str, Any]],
 ) -> LessonCandidate:
-    """Approve one human-selected proposal only after Rule-of-3 passes."""
+    """Approve one human-selected lesson unconditionally.
+
+    Post-DISTILL-AUTO the human CLI is a correction channel, not a gate:
+    Rule-of-3 lives only in the distill fact sheet, so promotion never
+    hard-blocks on support counts. `episodes` is accepted for signature
+    compatibility and is unused.
+    """
 
     candidate = store.get(lesson_id)
     if candidate is None:
         raise KeyError(f"unknown lesson: {lesson_id}")
-    evaluation = evaluate_promotion(
-        candidate,
-        episodes,
-        approved_lessons=store.lessons(status="approved"),
-    )
-    if not evaluation.eligible:
-        raise ValueError("promotion blocked: " + ", ".join(evaluation.reasons))
     return store.approve(lesson_id)
 
 

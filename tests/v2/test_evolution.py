@@ -545,18 +545,10 @@ def test_same_scope_opposite_approved_lesson_blocks_promotion():
 def test_human_approve_and_revoke_write_events(tmp_path):
     store = LessonStore(tmp_path / "lessons")
     candidate = store.propose(_candidate())
-    episodes = [
-        _episode(
-            f"run-{index}",
-            success=bool(index),
-            goal="打开应用" if index != 2 else "查询机票",
-            reason="failed" if index == 0 else "finished",
-            ts=index + 1,
-        )
-        for index in range(3)
-    ]
 
-    assert approve_if_eligible(store, candidate.lesson_id, episodes).status == "approved"
+    # Human CLI is a correction channel, not a gate: approval succeeds even
+    # with zero supporting episodes (no Rule-of-3 hard block).
+    assert approve_if_eligible(store, candidate.lesson_id, []).status == "approved"
     assert store.revoke(candidate.lesson_id, "人工撤销").status == "revoked"
     raw = store.events_path.read_text(encoding="utf-8")
     assert "lesson_approved" in raw
