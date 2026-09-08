@@ -34,7 +34,6 @@ from phone_agent.v2.evolution import (
 from phone_agent.v2.middleware._tokens import estimate_text_tokens
 from phone_agent.v2.middleware.procedure import (
     APP_RULES_PREFIX,
-    MENTION_PREFETCH_MAX_APPS,
     PROCEDURE_CARD_PREFIX,
     ProcedureCardInjector,
 )
@@ -359,15 +358,8 @@ def test_mentioned_apps_orders_by_mention_position_and_dedupes_packages():
     assert [item.winner.package for item in resolved] == [OTHER, APP]
 
 
-def test_mentioned_apps_caps_at_limit():
-    entries = _entries(("闪记", APP), ("速记", OTHER), ("云记", "com.example.cloud"))
-
-    resolved = mentioned_apps(
-        "打开速记和云记和闪记", registry=(), kb_entries=entries, limit=2
-    )
-
-    assert [item.winner.package for item in resolved] == [OTHER, "com.example.cloud"]
-    assert MENTION_PREFETCH_MAX_APPS == 2
+# The cap=2 contract is exercised at the consumption point by
+# test_mention_prefetch_caps_at_two_apps_in_mention_order below.
 
 
 # --- C1 entrance delivery: card + [APP_RULES] ---------------------------

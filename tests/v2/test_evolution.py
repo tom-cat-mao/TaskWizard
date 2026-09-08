@@ -633,18 +633,8 @@ def test_unapproved_lessons_never_enter_actor_initial_messages_when_on(
     assert secret_lesson not in rendered
 
 
-def test_evolution_config_defaults_and_env(monkeypatch):
-    monkeypatch.delenv("PHONE_AGENT_EVOLUTION", raising=False)
-    monkeypatch.delenv("PHONE_AGENT_LESSONS_DIR", raising=False)
-    monkeypatch.delenv("PHONE_AGENT_LESSON_INJECT_MAX", raising=False)
-    monkeypatch.delenv("PHONE_AGENT_LESSON_INJECT_TOKENS", raising=False)
-    default = V2Config.from_env()
-    assert default.evolution_mode == "manual"
-    assert default.lessons_dir == "memory/lessons"
-    assert default.memory_rag == "shadow"
-    assert default.lesson_inject_max == 3
-    assert default.lesson_inject_tokens == 800
-
+def test_evolution_config_env_overrides(monkeypatch):
+    # Default values live in test_config.py::test_from_env_defaults.
     monkeypatch.setenv("PHONE_AGENT_EVOLUTION", "off")
     monkeypatch.setenv("PHONE_AGENT_LESSONS_DIR", "/tmp/example-lessons")
     configured = V2Config.from_env()

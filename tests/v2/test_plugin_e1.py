@@ -137,18 +137,11 @@ def test_agent_after_bridge_emits_state_summary() -> None:
     assert payloads[0]["messages"] is state["messages"]
 
 
-def test_jump_end_sentinel_is_singleton_and_distinct_from_reject() -> None:
-    from phone_agent.v2.events import JUMP_END as exported_jump_end
-
-    assert repr(JUMP_END) == "JUMP_END"
-    assert JUMP_END is exported_jump_end
-    assert JUMP_END is JUMP_END
-    assert JUMP_END is not REJECT
-    assert JUMP_END != REJECT
-
-
 def test_tool_execute_bridge_reject_becomes_tool_message() -> None:
     from phone_agent.v2.agent import _ToolExecuteBridgeMiddleware
+
+    # The sentinels must stay distinct: only REJECT becomes an error ToolMessage.
+    assert JUMP_END is not REJECT
 
     bus = EventBus()
     mw = _ToolExecuteBridgeMiddleware(bus)

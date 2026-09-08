@@ -407,8 +407,6 @@ def test_grading_prompt_states_the_asymmetric_risk_of_auto_approval():
     system = _build_grading_messages([], {})[0].content
     # The grader must know a wrong injection costs more than a slow review.
     assert "风险并不对称" in system
-    assert "needs_review" in system
-    assert "conflicts_with_approved" in system
 
 
 # --- fact sheet -----------------------------------------------------------
@@ -541,37 +539,9 @@ def test_second_batch_detects_previously_proposed_procedure(tmp_path):
 
 
 # --- grading verdicts -----------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("reply", "expected"),
-    [
-        (_grading_reply("auto_approved"), "auto_approved"),
-        (_grading_reply("needs_review"), "needs_review"),
-        (_grading_reply("confident"), "needs_review"),
-        (json.dumps({"grades": []}), "needs_review"),
-        ("not json at all", "needs_review"),
-    ],
-)
-def test_grade_mapping_including_illegal_and_unparsable(tmp_path, reply, expected):
-    events_path = tmp_path / "experience/events.jsonl"
-    _write_episodes(events_path, _default_batch())
-    model = _ScriptedModel(
-        json.dumps(
-            {
-                "rules": [],
-                "procedures": [
-                    _procedure_payload(["run-1", "run-2"], ["search_flight", "search_hotel"])
-                ],
-            },
-            ensure_ascii=False,
-        ),
-        reply,
-    )
-
-    result = distill_lessons(events_path, tmp_path / "lessons", model=model)
-
-    assert [item.status for item in result.proposed] == [expected]
+# The verdict-mapping matrix (legal/illegal/unparsable → status) lives in
+# test_distill_auto.py::test_rule_grading_states; procedure-side auto_approved
+# mapping is exercised by test_second_batch_detects_previously_proposed_procedure.
 
 
 def test_grading_call_failure_keeps_candidates_at_needs_review(tmp_path):

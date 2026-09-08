@@ -229,28 +229,10 @@ def test_compact_off_prunes_images_exactly_once(monkeypatch, tmp_path):
     assert _count_images(msgs[3]) == 1
 
 
-def test_compact_on_prunes_images_exactly_once(monkeypatch, tmp_path):
-    from tests.v2.test_experience import _install_mini_agent_modules
-
-    config = _install_mini_agent_modules(monkeypatch, tmp_path, enabled=False)
-    config.compact_enabled = True
-    config.image_keep = 2
-    config.obs_marks_keep = 2
-
-    agent = ThinPhoneAgent(config)
-    service = agent._capability_ctx.service("context_pruner")
-    get_calls = _prune_call_counter(service)
-
-    msgs = [_obs_msg("app", i) for i in range(1, 5)]
-    agent.event_bus.waterfall(
-        MODEL_PRE_REQUEST, msgs, terminal=lambda x: x
-    )
-
-    # Compact listener calls the pruner internally; no separate middleware.
-    assert get_calls() == 1
-    assert _count_images(msgs[0]) == 0
-    assert "[screen#1 已剪除]" in _message_text(msgs[0])
-    assert _count_images(msgs[3]) == 1
+# The compact-ON prune-once invariant is asserted through the assembled chain
+# by tests/v2/test_event_chain_behavior.py::test_t2_fold_prunes_once_and_
+# taskdoc_stays_pinned (which also pins the TaskDoc re-attach); the compact-OFF
+# unit variant below keeps the pruner-count guarded at unit level.
 
 
 # --------------------------------------------------------------------------

@@ -54,8 +54,25 @@ def test_emit_manifest_escapes_and_shapes(tmp_path):
     assert plugins.read_manifest(path)[0] == entry
 
 
-def test_missing_manifest_is_empty(tmp_path):
-    assert plugins.read_manifest(tmp_path / "nope.toml") == []
+def test_empty_manifest_zero_behavior_change(tmp_path):
+    # Folded from test_missing_manifest_is_empty + test_discover_skips_disabled:
+    # every zero-entry path must be a behaviour-preserving no-op.
+    config = _config(tmp_path)
+    # A missing manifest reads as empty (parse layer)...
+    assert plugins.read_manifest(config.plugin_manifest) == []
+    # ...so discovery is a no-op and the CLI lists nothing.
+    assert plugins.discover_external_specs(config) == []
+    assert plugins.cmd_list(config) == []
+
+    # A disabled entry is skipped before path resolution — even a missing path
+    # must never raise.
+    directory = _write_plugin_dir(tmp_path, "on_plug", cap_id="cap_on")
+    entries = [
+        plugins.PluginEntry(name="on_plug", enabled=True, path=str(directory)),
+        plugins.PluginEntry(name="off_plug", enabled=False, path="./missing"),
+    ]
+    specs = plugins.discover_external_specs(entries=entries)
+    assert [s.cap_id for s in specs] == ["cap_on"]
 
 
 def test_project_overrides_user_by_name():
@@ -446,9 +463,3 @@ def test_agent_registers_extra_capabilities():
     registry.register(extra)
     after = {row["cap_id"] for row in registry.status()}
     assert after - before == {"plug_extra"}
-
-
-def test_empty_manifest_zero_behavior_change(tmp_path):
-    config = _config(tmp_path)
-    assert plugins.discover_external_specs(config) == []
-    assert plugins.cmd_list(config) == []

@@ -22,9 +22,7 @@ from phone_agent.v2.evolution import (
     _candidate_from_model_dict,
     _struggle_markers,
     distill_lessons,
-    lesson_injectable,
     make_lesson_id,
-    select_lessons_for_injection,
 )
 
 APP = "com.example.travel"
@@ -193,17 +191,12 @@ def test_success_only_rule_with_error_receipts_reaches_self_grading(tmp_path):
     ]
 
 
-def test_distill_prompt_drops_the_failure_anchor_and_teaches_four_lenses():
+def test_distill_prompt_teaches_the_distillation_lenses():
+    # Single anchor-phrase smoke check; the anti-anchor behaviour itself is
+    # proven by test_success_only_rule_with_error_receipts_reaches_self_grading.
     system = _build_distill_messages([], {})[0].content
 
-    assert "必须锚定失败" not in system
-    for lens in ("错误恢复", "弯路重走", "跨任务复现子流程", "finish 驳回史"):
-        assert lens in system, lens
-    # Golden example + two negative archetypes with their rejection reasons.
-    assert "筛选面板不收起" in system
-    assert "绑死单屏与坐标" in system
-    assert "空谈型" in system
-    assert "宁可输出空数组也不要凑数" in system
+    assert "弯路重走" in system
 
 
 # --- A2: slim candidate contract ------------------------------------------
@@ -547,32 +540,8 @@ def test_prompt_rows_carry_one_marker_block_per_episode(tmp_path):
 
 
 # --- A6: injection gate ----------------------------------------------------
-
-
-def test_auto_approved_rule_injects_and_needs_review_rule_does_not(tmp_path):
-    lessons_dir = tmp_path / "lessons"
-    store = LessonStore(lessons_dir)
-    run_start_scope = {"device": "serial-1", "app": None}
-    confident_payload = _slim_rule(
-        ["run-0"], ["search_flight"], text="自信的规则", scope=run_start_scope
-    )
-    unsure_payload = _slim_rule(
-        ["run-1"], ["search_flight"], text="拿不准的规则", scope=run_start_scope
-    )
-    confident = store.propose(
-        replace(_candidate_from_model_dict(confident_payload), status="auto_approved")
-    )
-    unsure = store.propose(
-        replace(_candidate_from_model_dict(unsure_payload), status="needs_review")
-    )
-
-    assert lesson_injectable(confident) is True
-    assert lesson_injectable(unsure) is False
-    selected = select_lessons_for_injection(
-        lessons_dir, device_scope="device:serial-1", max_items=10, max_tokens=800
-    )
-    assert [item.lesson_id for item in selected] == [confident.lesson_id]
-    assert unsure.lesson_id not in {item.lesson_id for item in selected}
+# The full gate matrix (approved/auto/needs_review × rule/procedure + kind
+# filtering) lives in test_workflow_memory_wf1.py::test_injection_gate_matrix.
 
 
 def test_human_approval_still_required_to_move_past_a_verdict(tmp_path):

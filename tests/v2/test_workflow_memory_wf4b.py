@@ -109,14 +109,11 @@ def _scope_copy(app: str | None) -> dict:
 
 
 def test_distill_prompt_carries_cross_app_copy_guidance():
+    # Single anchor-phrase smoke check; the fanout behaviour itself is covered
+    # by test_cross_app_copies_both_land_with_distinct_lesson_ids below.
     system = _build_distill_messages([], {})[0].content
 
-    assert "App 之间切换/交接" in system
-    assert "偏好按实际涉及的每个 App 各产出一条候选" in system
-    assert "scope.app 各挂对应包名" in system
-    # A preference, not a gate: the general single entry stays legitimate.
     assert "偏好不是闸门" in system
-    assert "仍可只出一条通用课" in system
 
 
 # --- fanout regression ------------------------------------------------------

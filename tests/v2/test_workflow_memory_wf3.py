@@ -171,29 +171,9 @@ def _text(result) -> str:
 
 
 # --- app/launched event -------------------------------------------------
-
-
-def test_app_launched_event_is_registerable_and_carries_package_payload():
-    bus = EventBus()
-    seen: list[dict] = []
-    bus.on(APP_LAUNCHED, seen.append)
-
-    session = PhoneSession.__new__(PhoneSession)
-    session.event_bus = bus
-    session.config = SimpleNamespace(device_id="serial-1")
-    session._launched_this_run = set()
-
-    assert session.emit_app_launched(WECHAT) is True
-    assert seen == [
-        {"package": WECHAT, "device_id": "serial-1", "source": "launch_app"}
-    ]
-    # One event per package per run: a re-launch of the same app is silent.
-    assert session.emit_app_launched(WECHAT) is False
-    assert session.emit_app_launched(FOOD) is True
-    assert [payload["package"] for payload in seen] == [WECHAT, FOOD]
-
-    session.reset_launched_events()
-    assert session.emit_app_launched(WECHAT) is True
+# The session-method-level dedup/payload coverage is folded into
+# test_launch_app_success_emits_once_per_package (production path through the
+# launch_app tool); reset behaviour is guarded in test_workflow_memory_wf4a.
 
 
 def test_app_launched_emission_is_fail_open():
