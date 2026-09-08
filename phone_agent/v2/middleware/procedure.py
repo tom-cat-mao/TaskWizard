@@ -232,14 +232,18 @@ class ProcedureCardInjector:
             package = str(payload.get("package", "") or "").strip()
         if not package or package in self._selected_packages:
             return
+        goal = self.goal or self._goal_from_session()
+        if not goal:
+            # Nothing is selectable without a goal, so the package must keep
+            # its one delivery slot instead of being consumed by a no-op: an
+            # empty goal now (e.g. a launch observed before ``run_start``)
+            # must not silence that app for the rest of the run.
+            return
         # One selection attempt per package per run: a later re-launch of the
         # same app has the same goal and the same index, so it cannot produce
         # a different card and must not inject twice.  Mention-prefetched
         # packages share this set, so entrance never re-delivers them (C2).
         self._selected_packages.add(package)
-        goal = self.goal or self._goal_from_session()
-        if not goal:
-            return
         delivery = self._build_delivery(
             goal, package, with_rules=self.injects, point=POINT_APP_LAUNCHED
         )

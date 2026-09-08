@@ -691,9 +691,12 @@ def _apply_recall(ctx: CapabilityAssemblyContext) -> None:
     _register_service_hook(ctx, "end", "recall_run_end")
     _register_service(ctx, "recall_service_factory", "recall")
     _register_prompt(ctx, "recall_prompt_provider")
-    # WP-WF3: the procedure card rides a second prompt provider (separate
+    # WP-WF3/WF4: the procedure card rides a second prompt provider (separate
     # 1-card/300-token budget) and two event listeners — ``app/launched``
-    # selects the app card, ``model/pre_request`` injects the pending one.
+    # stages the entrance delivery, ``model/pre_request`` injects what is
+    # pending.  Three delivery situations feed those listeners: the general
+    # card at run start (this provider), the mention prefetch, and the app
+    # entrance (card plus that app's ≤2 injectable rules).
     _register_prompt(ctx, "procedure_prompt_provider")
     disposers: list[Callable[[], None]] = [_install_recall_selection_observer(ctx)]
     bus = ctx.service("event_bus")

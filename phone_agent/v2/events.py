@@ -27,8 +27,10 @@ Payload contracts for the plugin events:
     ``{"package": <resolved package name>, "device_id": <device serial>,
     "source": <"launch_app" | "foreground">}``.
     Emitted at most once per package per run (both sources share the dedupe
-    set); the emission point is fail-open (WP-WF3 procedure-card injection
-    point two listens on it).
+    set); the emission point is fail-open.  It drives the app-entrance
+    delivery of the procedure channel — that app's card plus its injectable
+    rules — alongside the run-start general card and the mention prefetch,
+    all three sharing one per-package per-run delivered set.
 
 ``TOOL_PRE_EXECUTE`` / ``"tool/pre_execute"``
     Applied with :meth:`EventBus.waterfall`. Payload is the tool-call object

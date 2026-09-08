@@ -451,9 +451,10 @@ def reconcile_lessons(
     trigger — support counts, task spread and contradictions are semantic
     judgments that belong to the grading model and the human CLI, so they never
     demote a lesson on their own and only appear in the demotion reason text.
-    Only injectable lessons are reconsidered — ``approved`` (any kind) and
-    ``auto_approved`` procedure cards — a revoked lesson stays revoked because
-    there is deliberately no automatic reinstatement path, and a demoted lesson
+    Only injectable lessons are reconsidered — ``approved`` and
+    ``auto_approved`` lessons of either kind (a procedure card is not
+    special-cased) — a revoked lesson stays revoked because there is
+    deliberately no automatic reinstatement path, and a demoted lesson
     must be approved again by a human before it can be injected.
     """
 

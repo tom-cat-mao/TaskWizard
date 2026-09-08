@@ -1363,8 +1363,22 @@ class VecIndex:
     def app_name_vector_candidates(
         self, query: str, *, device_scope: str, top_k: int = 20
     ) -> list[dict[str, Any]]:
-        """Return App-KB vector neighbours for the names.py embedding route."""
+        """Return App-KB vector neighbours for the names.py embedding route.
 
+        The route runs inside :func:`_selection_scope` so a failure on this
+        path is recorded (trace event + ``app_alias_errors``) *before* the
+        caller's fail-open swallow — ``names.py`` catches and discards the
+        exception, so without the scope the failure would leave no evidence.
+        """
+
+        with _selection_scope("app_alias"):
+            return self._app_name_vector_candidates(
+                query, device_scope=device_scope, top_k=top_k
+            )
+
+    def _app_name_vector_candidates(
+        self, query: str, *, device_scope: str, top_k: int = 20
+    ) -> list[dict[str, Any]]:
         clean_query = str(query or "").strip()
         clean_scope = str(device_scope or "").strip()
         if not clean_query or not clean_scope or top_k <= 0:

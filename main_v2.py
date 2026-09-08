@@ -69,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     maintenance.add_argument(
         "--review-lessons",
         action="store_true",
-        help="interactively review proposed lessons",
+        help="interactively review proposed/needs_review lessons",
     )
     maintenance.add_argument(
         "--approve-lesson",

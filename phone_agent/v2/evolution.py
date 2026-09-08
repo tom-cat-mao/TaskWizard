@@ -580,8 +580,10 @@ class LessonStore:
         This is the evidence-loss counterpart of :meth:`approve`: a lesson whose
         cited episodes left the episode view (archived or folded) stops being
         injectable and needs another human approval — including an
-        ``auto_approved`` procedure card, which lands in ``needs_review``
-        instead of ``proposed``.  Revoked lessons are never reinstated.
+        ``auto_approved`` lesson of either kind, which lands in ``needs_review``
+        instead of ``proposed`` (a demoted procedure card therefore keeps its
+        card shape and only loses injectability).  Revoked lessons are never
+        reinstated.
         """
 
         clean_reason = _single_line(reason)
@@ -591,8 +593,8 @@ class LessonStore:
             candidate = self._require(lesson_id)
             if candidate.status not in _DEMOTABLE_STATUSES:
                 raise ValueError(
-                    "only an approved lesson or an auto_approved procedure card"
-                    " can be demoted"
+                    "only an approved lesson or an auto_approved lesson"
+                    " of either kind can be demoted"
                 )
             demoted = replace(candidate, status=_demoted_status(candidate))
             self._append(

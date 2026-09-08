@@ -270,6 +270,27 @@ def _index(tmp_path: Path, *, episode: bool = False) -> Path:
     return db_path
 
 
+def _alias_index(tmp_path: Path) -> Path:
+    """An index holding one App-KB alias, so the vector route runs for real."""
+
+    db_path = tmp_path / "alias.db"
+    with VecIndex(db_path, embedder=HashEmbedder(64)) as index:
+        index.upsert(
+            namespace="app_alias",
+            ref_id="alias:weather",
+            text="天气 com.example.weather",
+            metadata={
+                "device_scope": "global",
+                "app_package": WEATHER,
+                "term": "天气",
+                "label": "天气",
+                "kind": "learned",
+                "semantic_eligible": True,
+            },
+        )
+    return db_path
+
+
 def test_episode_selection_error_is_recorded_before_the_caller_fails_open(
     tmp_path, seen_errors
 ):
@@ -292,6 +313,45 @@ def test_app_alias_selection_error_is_recorded(tmp_path, seen_errors, monkeypatc
             index.recall("打开微信", device_scope="device:serial-1")
 
     assert seen_errors == [("app_alias", "RuntimeError")]
+
+
+def test_app_alias_vector_route_error_is_recorded_before_names_swallows_it(
+    tmp_path, seen_errors
+):
+    """The names.py embedding route records its failure before the caller's
+    fail-open ``except Exception: embedded = ()`` discards it."""
+
+    from phone_agent.v2.names import resolve_name
+
+    db_path = _alias_index(tmp_path)
+    with VecIndex(db_path, embedder=_FaultEmbedder()) as index:
+
+        def embedding_search(query, top_k):
+            return index.app_name_vector_candidates(
+                query, device_scope="device:serial-1", top_k=top_k
+            )
+
+        result = resolve_name(
+            "微信",
+            registry=(),
+            embedding_search=embedding_search,
+        )
+
+    # names.py's fail-open swallow is untouched: no exception escapes and the
+    # resolution still returns, but the failure left evidence first.
+    assert result.status in {"ambiguous", "unknown"}
+    assert seen_errors == [("app_alias", "RuntimeError")]
+
+
+def test_app_alias_vector_route_wrap_preserves_healthy_results(tmp_path):
+    """Wrap-only change: real hits and short-circuits behave as before."""
+
+    with VecIndex(_alias_index(tmp_path), embedder=HashEmbedder(64)) as index:
+        hits = index.app_name_vector_candidates("天气", device_scope="device:serial-1")
+        assert [hit["package"] for hit in hits] == [WEATHER]
+        # An empty query/scope short-circuits before the embedder is reached.
+        assert index.app_name_vector_candidates("", device_scope="device:serial-1") == []
+        assert index.app_name_vector_candidates("天气", device_scope="") == []
 
 
 def test_procedure_selection_error_is_recorded(tmp_path, seen_errors):

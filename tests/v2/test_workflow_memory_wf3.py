@@ -578,8 +578,37 @@ class _EmittingSession(FakePhoneSession):
         super().__init__(*args, **kwargs)
         self._launched_this_run: set[str] = set()
 
-    def emit_app_launched(self, package: str, device_id: str | None = None) -> bool:
-        return PhoneSession.emit_app_launched(self, package, device_id)
+    def emit_app_launched(
+        self,
+        package: str,
+        device_id: str | None = None,
+        *,
+        source: str = "launch_app",
+    ) -> bool:
+        """Mirror the WF4 multi-source signature (``launch_app``/``foreground``)."""
+
+        return PhoneSession.emit_app_launched(
+            self, package, device_id, source=source
+        )
+
+
+def test_emitting_fake_session_accepts_the_wf4_source_argument():
+    """The fixture keeps pace with the multi-source emission surface."""
+
+    session = _EmittingSession()
+    bus = EventBus()
+    seen: list[dict] = []
+    bus.on(APP_LAUNCHED, seen.append)
+    session.event_bus = bus
+
+    assert (
+        session.emit_app_launched(WEATHER, "serial-mini", source="foreground") is True
+    )
+    assert session.emit_app_launched(FOOD) is True
+
+    assert [payload["source"] for payload in seen] == ["foreground", "launch_app"]
+    assert [payload["package"] for payload in seen] == [WEATHER, FOOD]
+    assert seen[0]["device_id"] == "serial-mini"
 
 
 def _install_launching_mini_modules(monkeypatch, tmp_path):
@@ -725,6 +754,37 @@ def test_run_audits_both_injection_points_in_trace_and_episode(tmp_path, monkeyp
         if PROCEDURE_CARD_PREFIX in str(getattr(message, "content", ""))
     )
     assert ids[WEATHER] in str(card.content)
+
+
+def test_empty_goal_launch_keeps_the_package_delivery_slot(tmp_path):
+    """A launch seen before any goal must not burn that app's one slot."""
+
+    card_id = "les_0123456789ab"
+    agent = _bare_agent(
+        tmp_path,
+        selector=lambda _goal, **_kwargs: _selection(
+            card_id, title=WEATHER_TITLE, steps=WEATHER_STEPS, app_scope=WEATHER
+        ),
+    )
+    injector = agent._procedure_injector
+
+    # No run_start yet: nothing is selectable, so the launch is a silent no-op
+    # that must *not* mark the package as already delivered.
+    injector.on_app_launched({"package": WEATHER})
+    assert injector.pending_lesson_id is None
+    assert WEATHER not in injector._selected_packages
+
+    # The goal arrives; the very same package is still deliverable.
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": WEATHER})
+    assert injector.pending_lesson_id == card_id
+    assert WEATHER in injector._selected_packages
+
+    # The one-shot-per-package rule is unchanged: a re-launch after the
+    # delivery was consumed queues nothing new.
+    assert injector.make_delta([]) is not None
+    injector.on_app_launched({"package": WEATHER})
+    assert injector.pending_lesson_id is None
 
 
 def test_rule_injection_channel_excludes_procedure_cards(tmp_path: Path) -> None:
