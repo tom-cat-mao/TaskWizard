@@ -6,6 +6,22 @@ bounded, read-only selector for approved lessons; actor message construction
 remains owned by :mod:`phone_agent.v2.agent`.
 events.jsonl is authoritative; lessons.json is a rebuildable current-version
 view.
+
+WP-DISTILL-AUTO (distillation end-to-end without mechanical anchoring): the
+harness is a fact-checker, fact supplier, and bookkeeper — never the semantic
+judge.  One batch costs two model calls (both charged to the ``distill`` role):
+
+* call 1 proposes candidates from episode cards and their ``struggle_markers``;
+  the model emits semantics only (text/kind/evidence/scope/task_keys and the
+  procedure extras) and every bookkeeping field is filled here;
+* call 2 self-grades **every** candidate (rules and procedure cards alike) over
+  a harness-computed fact sheet.  The only two verdicts are ``auto_approved``
+  and ``needs_review``; transport, budget, and malformed-reply failures are
+  fail-open and land candidates at ``needs_review`` rather than dropping them.
+
+The sole remaining human gate is the CLI (approve/revoke/supersede) plus dream's
+evidence-loss demotion; contradictions are surfaced to the grader through
+``conflicts_with_approved`` instead of blocking anything mechanically.
 """
 
 from __future__ import annotations
@@ -697,16 +713,15 @@ def load_lessons(
 def lesson_injectable(lesson: LessonCandidate) -> bool:
     """Return whether a lesson may cross the run-start injection gate.
 
-    ``approved`` injects for either artifact kind.  ``auto_approved`` is the
-    distiller's own confident verdict and is only trusted for a procedure card
-    (a reference card, never a binding rule); it is never enough for a rule,
-    which still needs a human.  ``needs_review`` behaves exactly like
+    ``approved`` injects for either artifact kind — that is always a human
+    decision.  ``auto_approved`` is the distiller's own confident verdict in the
+    second self-grading call and injects for either kind too (WP-DISTILL-AUTO):
+    a wrong card is corrected afterwards by human CLI or dream demotion rather
+    than by a prior restraint.  ``needs_review`` behaves exactly like
     ``proposed`` and never injects.
     """
 
-    if lesson.status == "approved":
-        return True
-    return lesson.status == "auto_approved" and lesson.kind == "procedure"
+    return lesson.status in {"approved", "auto_approved"}
 
 
 def proposal_metadata(
@@ -856,13 +871,36 @@ def _opposes(left: LessonCandidate, right: LessonCandidate) -> bool:
     )
 
 
+def _approved_conflicts(
+    candidate: LessonCandidate,
+    approved_lessons: Sequence[LessonCandidate],
+) -> list[str]:
+    """Return same-scope injectable lessons that state the opposite.
+
+    The fact-sheet counterpart of :func:`evaluate_promotion`'s contradiction
+    check: nothing here blocks a proposal, the list only reaches the grader.
+    """
+
+    return [
+        f"{approved.lesson_id}@v{approved.version}"
+        for approved in approved_lessons
+        if approved.lesson_id != candidate.lesson_id and _opposes(candidate, approved)
+    ]
+
+
 def evaluate_promotion(
     candidate: LessonCandidate,
     episodes: Sequence[Mapping[str, Any]],
     *,
     approved_lessons: Sequence[LessonCandidate] = (),
 ) -> PromotionEvaluation:
-    """Apply Rule-of-3 and conservative same-scope contradiction detection."""
+    """Apply Rule-of-3 and conservative same-scope contradiction detection.
+
+    This is the **human** gate only (``--approve-lesson`` and dream's
+    evidence-loss demotion).  Distillation never routes through it any more: a
+    batch's status comes from the self-grading call, and the numbers below are
+    reported to that grader through the fact sheet instead of blocking.
+    """
 
     reasons = [
         item
@@ -1019,6 +1057,9 @@ def _prompt_rows(
         steps_ledger = [dict(entry) for entry in ledgers.get(run_id, ())]
         if steps_ledger:
             row["steps_ledger"] = steps_ledger
+        # Mechanical struggle signals for the same run; always present so every
+        # episode card keeps one shape (empty when the run went smoothly).
+        row["struggle_markers"] = _struggle_markers(steps_ledger)
         rows.append(row)
     return rows
 
@@ -1034,34 +1075,44 @@ def _build_distill_messages(
             "你是离线经验提炼器：你会看到若干完整的任务过程（目标、逐步 intent/note 与"
             "执行结果账本、最终结局），请从中提炼两类可复用经验：单条行为规则（rule）与"
             "多步过程卡（procedure）。"
+            "每条 episode 除账本外还有一个 struggle_markers 段，它是 harness 机械算出的"
+            "挣扎信号：error_steps 是报错回执的位置与工具，redo_loops 是 back 之后又重走"
+            "过的操作串，finish_rejections 是 finish 被驳回的次数，steps 是总步数。"
+            "请优先从这四个镜头找经验："
+            "① 错误恢复——某步报错之后，actor 用什么动作回到正轨；"
+            "② 弯路重走——redo_loops 暴露重复劳动，说明前面少了哪一步或没确认哪个状态；"
+            "③ 跨任务复现子流程——同一串语义子过程在 ≥2 个不同 task_key 的任务里出现；"
+            "④ finish 驳回史——finish_rejections 说明这类任务的收尾还缺什么。"
             "只输出严格 JSON 对象 {\"rules\": [...], \"procedures\": [...]}，"
             "不要 Markdown、解释或代码围栏；两个数组都可以为空。"
-            "每个元素必须且只能包含："
-            + ", ".join(LESSON_FIELDS)
-            + " 以及可选字段 kind、steps、pitfalls、app_scope。"
-            "status 必须是 proposed，schema_v/version 必须是 1，source 必须是 distill；"
-            "lesson_id 使用 les_ 加 12-64 位小写十六进制。"
-            "scope 的 device/app 只能逐字选自输入，app_version 必须为 null。"
-            "evidence 只能引用输入 run_id（元素为 run_id 字符串或 {\"run_id\", \"note\"} "
-            "对象，note 可留一句话支撑点）；support_count 必须等于去重 evidence 数；"
-            "task_keys 只能选输入 task_key。"
-            "rules（单条行为规则）：text 只能是一句行为规则及适用条件，应能指导未来同类任务，"
-            "不得照抄单次任务的具体参数；kind 必须是 rule，不得携带 steps/app_scope。"
-            "候选的 evidence 必须锚定失败：要么同时引用失败与成功 run 且至少一次失败早于成功"
-            "（先踩坑后绕开），要么引用 ≥2 次同一失败原因且失败过程相似（可复现的坑）；"
-            "仅引用成功 run 的候选会被丢弃。"
+            "候选元素只写语义字段：text、kind、evidence、scope、task_keys，"
+            "以及可选字段 conflicts、steps、pitfalls、app_scope。"
+            "簿记字段全由 harness 自填（lesson_id、schema_v、version、status、source、"
+            "created_ts、support_count、scope.app_version），你不要写。"
+            "evidence 的元素是 run_id 字符串或 {\"run_id\", \"note\"}，"
+            "run_id 只能引用输入里真实存在的 run（编造即丢弃），note 可选一句话支撑点；"
+            "scope 只有 device 与 app 两个键，取值只能逐字选自输入，没有就填 null；"
+            "task_keys 只能选输入里出现过的 task_key。"
+            "rules（单条行为规则）：text 写一句行为规则加适用条件，kind 必须是 rule，"
+            "不得携带 steps/app_scope。"
+            "参考这句金例的写法："
+            "「B站搜索切换排序方式后筛选面板不收起，此时按返回键会连同结果页一起退出；"
+            "应先收起面板再继续后续操作」—— 说清触发条件、错在哪、正确做什么。"
+            "两个负例不要提："
+            "照抄型，如「在 run-3 第 7 步点坐标 500,800 后失败」——绑死单屏与坐标，"
+            "UI 一变就失效；空谈型，如「操作时要小心一点」——读不出下一步该做什么。"
+            "宁可输出空数组也不要凑数：证据不足就留空，"
+            "一条错误的经验会在未来所有同类任务里误导 actor。"
             "procedures（多步过程卡）：kind 必须填 procedure；text 写卡名（一句短语）；"
             "app_scope 填应用包名，跨应用通用的卡填 \"general\"；steps 写有序语义步；"
             "pitfalls 写观察到的坑位（失败后恢复、弹窗/权限框如何处理），没有观察到就填 null"
             "（字符串或 null，不要数组）。"
-            "只有当一个子过程在 ≥2 个不同任务（task_key）里重复出现时才提案；"
-            "只在单一任务里出现过的流程不要提案。"
+            "只在单一任务里出现过的流程通常不足以下结论（会在第二步自评里被降级），"
+            "但请按你的判断决定，harness 不会替你拦截。"
             "steps 必须是语义步：描述意图与目标，例如「搜索框输入目标」「选店进入」"
             "「到结算页停手问人」；禁止出现坐标（500,800）、mark id（ax_3、ax_3@e7）、"
             "具体工具名与工具参数（tap(ax_3)、type_text(上海)）——照抄工具参数的候选会被丢弃。"
             "太通用的流程（例如「打开 app 后点搜索」这类常识）不要提案。"
-            "证据纪律与 rule 相同：只能引用输入里真实存在的 run_id，support_count 必须等于"
-            "去重 evidence 数；引用不存在的 run 或数量不一致的候选会被丢弃。"
             "没有足够证据支撑的经验时对应的数组输出 []。"
         )
     )
@@ -1105,41 +1156,70 @@ def _strict_json_loads(text: str) -> Any:
     )
 
 
-def _effective_tool_prefix(
-    ledger: Sequence[Mapping[str, Any]],
-) -> tuple[str, ...]:
-    """Return the first three effective tool names, excluding wait/read_screen."""
-
-    filtered = [
-        str(entry.get("tool", "unknown"))
-        for entry in ledger
-        if str(entry.get("tool", "unknown")) not in {"wait", "read_screen"}
-    ]
-    return tuple(filtered[:3])
+_REDO_WINDOW_SIZES = (4, 3)
 
 
-def _has_distill_evidence(
-    candidate: LessonCandidate,
-    group: Sequence[Mapping[str, Any]],
-    tool_prefixes: Mapping[str, Sequence[str]],
-) -> bool:
-    """Require the candidate's own citations to prove a supported pattern."""
+def _back_redo_loops(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Return every ``back`` step whose following tool window repeats earlier.
 
-    evidence_ids = {item["run_id"] for item in candidate.evidence}
-    cited = [item for item in group if str(item["run_id"]) in evidence_ids]
-    failures = [item for item in cited if not bool(item.get("success"))]
-    successes = [item for item in cited if bool(item.get("success"))]
-    if failures and successes:
-        return min(float(item.get("ts_end", 0.0)) for item in failures) < max(
-            float(item.get("ts_end", 0.0)) for item in successes
-        )
-    failure_signatures: Counter[tuple[str, tuple[str, ...]]] = Counter()
-    for item in failures:
-        reason = _single_line(item.get("reason"))
-        prefix = tuple(tool_prefixes.get(str(item["run_id"]), ()))
-        if reason and prefix:
-            failure_signatures[(reason, prefix)] += 1
-    return any(count >= 2 for count in failure_signatures.values())
+    Purely mechanical and deliberately conservative: only an exact contiguous
+    repeat of a 4- (else 3-) tool window counts, at most one record per ``back``,
+    and every tool including wait/read_screen participates, so an interleaved
+    observation breaks the match rather than fabricating a loop.
+    """
+
+    tools = [str(entry.get("tool", "unknown")) for entry in entries]
+    loops: list[dict[str, Any]] = []
+    for index, tool in enumerate(tools):
+        if tool != "back":
+            continue
+        earlier = tools[:index]
+        for size in _REDO_WINDOW_SIZES:
+            window = tools[index + 1 : index + 1 + size]
+            if len(window) < size:
+                continue
+            if not any(
+                earlier[offset : offset + size] == window
+                for offset in range(len(earlier) - size + 1)
+            ):
+                continue
+            loops.append(
+                {
+                    "after_step": max(0, int(entries[index].get("step", 0) or 0)),
+                    "repeat_tools": list(window),
+                }
+            )
+            break
+    return loops
+
+
+def _struggle_markers(ledger: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Distill mechanical struggle signals out of one run's step ledger.
+
+    Only fields the experience plane already carries are used — ledger entries
+    have no error text and never will (P0 #16), so an error is a receipt class,
+    not a message.  Every key is always present; no signal means empty.
+    """
+
+    entries = sorted(ledger, key=lambda item: item.get("step", 0))
+    return {
+        "error_steps": [
+            {
+                "step": max(0, int(entry.get("step", 0) or 0)),
+                "tool": str(entry.get("tool", "unknown")),
+            }
+            for entry in entries
+            if str(entry.get("result_class", "")) == "error"
+        ],
+        "redo_loops": _back_redo_loops(entries),
+        "finish_rejections": sum(
+            1
+            for entry in entries
+            if str(entry.get("tool", "")) == "finish"
+            and str(entry.get("result_class", "")) != "ok"
+        ),
+        "steps": len(entries),
+    }
 
 
 _MECHANICAL_STEP = re.compile(
@@ -1174,10 +1254,141 @@ def _split_distill_payload(payload: Any) -> tuple[list[Any], list[Any]]:
     )
 
 
+_MODEL_CANDIDATE_FIELDS = frozenset(
+    {
+        "text",
+        "kind",
+        "evidence",
+        "scope",
+        "task_keys",
+        "conflicts",
+        "steps",
+        "pitfalls",
+        "app_scope",
+    }
+)
+# Bookkeeping the harness owns.  A model still emitting the pre-A2 full payload
+# is tolerated — the fields are read and discarded — while any *unknown* key
+# still fails closed.
+_IGNORED_MODEL_FIELDS = frozenset(
+    {"lesson_id", "schema_v", "version", "status", "source", "created_ts", "support_count"}
+)
+_REQUIRED_MODEL_FIELDS = ("text", "evidence", "scope", "task_keys")
+
+
+def _model_evidence(raw: Any) -> list[dict[str, str]]:
+    """Normalize `evidence[{run_id, note?}]`; the note is optional."""
+
+    if not isinstance(raw, list):
+        raise ValueError("evidence must be an array")
+    evidence: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, str):
+            item = {"run_id": item}
+        if (
+            not isinstance(item, Mapping)
+            or not set(item) <= _EVIDENCE_FIELDS
+            or "run_id" not in item
+        ):
+            raise ValueError(
+                "each evidence item must be a run_id string or {run_id, note?}"
+            )
+        run_id = item["run_id"]
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("evidence.run_id must be a non-empty string")
+        run_id = run_id.strip()
+        note = item.get("note")
+        if note is None or (isinstance(note, str) and not note.strip()):
+            note = "cited by distill"
+        if not isinstance(note, str) or note != _single_line(note):
+            raise ValueError("evidence.note must be a non-empty normalized line")
+        if run_id in seen:
+            # Same run cited twice still counts once.
+            continue
+        seen.add(run_id)
+        evidence.append({"run_id": run_id, "note": note})
+    return evidence
+
+
+def _model_scope(raw: Any) -> dict[str, str | None]:
+    """Normalize `scope{device, app}`; ``app_version`` is always None."""
+
+    if not isinstance(raw, Mapping) or not set(raw) <= {"device", "app", "app_version"}:
+        raise ValueError("scope must contain only device/app")
+    return {
+        "device": _nullable_text(raw.get("device"), "device"),
+        "app": _nullable_text(raw.get("app"), "app"),
+        "app_version": None,
+    }
+
+
+def _candidate_from_model_dict(payload: Any) -> LessonCandidate:
+    """Build a lesson from the distiller's slim, semantic-only element.
+
+    The model emits meaning; the harness emits bookkeeping: ``lesson_id``
+    (text+scope hash, later re-based on the identity scope), ``schema_v``,
+    ``version``, ``status=proposed``, ``source=distill``, ``created_ts``,
+    ``scope.app_version=None``, and ``support_count`` = deduplicated evidence
+    count.  Validation of every shape the harness did not produce stays strict
+    through :meth:`LessonCandidate.from_dict`, which remains the storage entry.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("lesson candidate must be an object")
+    extra = sorted(set(payload) - _MODEL_CANDIDATE_FIELDS - _IGNORED_MODEL_FIELDS)
+    if extra:
+        raise ValueError(f"unexpected candidate fields: {extra}")
+    for key in _REQUIRED_MODEL_FIELDS:
+        if key not in payload:
+            raise ValueError(f"missing candidate field: {key}")
+
+    kind = payload.get("kind", "rule")
+    if not isinstance(kind, str) or kind not in LESSON_KINDS:
+        raise ValueError(f"kind must be one of {sorted(LESSON_KINDS)!r}")
+    text = payload["text"]
+    if not isinstance(text, str) or not text.strip() or text != _single_line(text):
+        raise ValueError("text must be one non-empty normalized line")
+    evidence = _model_evidence(payload["evidence"])
+    scope = _model_scope(payload["scope"])
+    task_keys = _string_list(payload["task_keys"], "task_keys")
+    raw_conflicts = payload.get("conflicts")
+    conflicts = _string_list(raw_conflicts, "conflicts") if raw_conflicts is not None else []
+    raw_steps = payload.get("steps")
+    steps = _step_list(raw_steps) if raw_steps is not None else []
+    raw_pitfalls = payload.get("pitfalls")
+    if isinstance(raw_pitfalls, list):
+        raw_pitfalls = "；".join(
+            s for s in (str(i).strip() for i in raw_pitfalls) if s
+        ) or None
+    pitfalls = _nullable_str(raw_pitfalls, "pitfalls")
+    app_scope = _nullable_str(payload.get("app_scope"), "app_scope")
+
+    return LessonCandidate.from_dict(
+        {
+            "lesson_id": make_lesson_id(text, scope),
+            "schema_v": 1,
+            "version": 1,
+            "status": "proposed",
+            "text": text,
+            "scope": scope,
+            "evidence": evidence,
+            "support_count": len(evidence),
+            "task_keys": task_keys,
+            "conflicts": conflicts,
+            "created_ts": time.time(),
+            "source": "distill",
+            "kind": kind,
+            "steps": steps,
+            "pitfalls": pitfalls,
+            "app_scope": app_scope,
+        }
+    )
+
+
 def _validate_model_candidates(
     response: Any,
     group: Sequence[Mapping[str, Any]],
-    ledgers: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> list[LessonCandidate]:
     payload = _strict_json_loads(_response_text(response))
     raw_rules, raw_procedures = _split_distill_payload(payload)
@@ -1185,25 +1396,12 @@ def _validate_model_candidates(
     episode_by_id = {str(item["run_id"]): item for item in group}
     allowed_tasks = {_task_key(item) for item in group}
     scope_values = _scope_values(group)
-    tool_prefixes = {
-        run_id: _effective_tool_prefix(entries)
-        for run_id, entries in ledgers.items()
-    }
     candidates: list[LessonCandidate] = []
     for raw in [*raw_rules, *raw_procedures]:
         try:
-            candidate = LessonCandidate.from_dict(raw)
-            if candidate.status != "proposed" or candidate.version != 1:
-                continue
+            candidate = _candidate_from_model_dict(raw)
             evidence_ids = {item["run_id"] for item in candidate.evidence}
             if not evidence_ids or not evidence_ids <= allowed_runs:
-                continue
-            # A rule must prove a坑 was hit; a procedure card legitimately
-            # records a repeated sub-process, so it is exempt from the
-            # failure-anchor requirement.
-            if candidate.kind == "rule" and not _has_distill_evidence(
-                candidate, group, tool_prefixes
-            ):
                 continue
             cited = [item for item in group if str(item["run_id"]) in evidence_ids]
             cited_tasks = {_task_key(item) for item in cited}
@@ -1211,11 +1409,13 @@ def _validate_model_candidates(
                 continue
             if not set(candidate.task_keys) <= cited_tasks:
                 continue
-            if candidate.kind == "procedure":
-                # A sub-process must recur across at least two tasks, and its
-                # steps must survive a UI redesign.
-                if len(cited_tasks) < 2 or not _is_semantic_steps(candidate.steps):
-                    continue
+            if candidate.kind == "procedure" and not _is_semantic_steps(
+                candidate.steps
+            ):
+                # The only mechanical procedure check left: steps must survive
+                # a UI redesign. How often the sub-process recurred is a fact
+                # for the grader (``recurs_in_tasks``), never a harness gate.
+                continue
             if candidate.scope["device"] not in {None, *scope_values["devices"]}:
                 continue
             if candidate.scope["app"] not in {None, *scope_values["apps"]}:
@@ -1359,6 +1559,89 @@ def _procedure_fact_sheet(
     }
 
 
+def _recurrence_counts(events_path: Path) -> Counter[str]:
+    """Count prior proposals per stable lesson id (text+scope identical)."""
+
+    counts: Counter[str] = Counter()
+    if not events_path.exists():
+        return counts
+    with events_path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                event = json.loads(line)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(event, Mapping)
+                or event.get("type") not in {"lesson_proposed", "lesson_superseded"}
+                or not isinstance(event.get("lesson"), Mapping)
+            ):
+                continue
+            lesson_id = str(event["lesson"].get("lesson_id") or "").strip()
+            if lesson_id:
+                counts[lesson_id] += 1
+    return counts
+
+
+def _candidate_fact_sheet(
+    candidate: LessonCandidate,
+    group: Sequence[Mapping[str, Any]],
+    *,
+    ledgers: Mapping[str, Sequence[Mapping[str, Any]]],
+    verified_packages: frozenset[str],
+    prior_counts: Mapping[tuple[str, str], int],
+    recurrence: Mapping[str, int],
+    approved_lessons: Sequence[LessonCandidate],
+) -> dict[str, Any]:
+    """Build the unified fact sheet a grader sees for one candidate.
+
+    Rules and procedure cards share the same evidence-is-real core (outcomes,
+    error load, cross-task recurrence, past proposals, conflicts); a procedure
+    card additionally carries its card-specific block (identity, step shape,
+    App-KB verification).
+    """
+
+    run_ids = sorted({item["run_id"] for item in candidate.evidence})
+    episode_by_id = {str(item.get("run_id")): item for item in group}
+    cited = [episode_by_id[run_id] for run_id in run_ids if run_id in episode_by_id]
+    sheet: dict[str, Any] = {
+        "kind": candidate.kind,
+        "support_count_verified": len(cited),
+        "evidence_outcomes": [
+            {
+                "run_id": run_id,
+                "success": bool(episode_by_id[run_id].get("success")),
+                "reason": _single_line(episode_by_id[run_id].get("reason"))[:120],
+            }
+            for run_id in run_ids
+            if run_id in episode_by_id
+        ],
+        "error_receipts_per_run": {
+            run_id: sum(
+                1
+                for entry in ledgers.get(run_id, ())
+                if str(entry.get("result_class", "")) == "error"
+            )
+            for run_id in run_ids
+        },
+        "recurs_in_tasks": len({_task_key(item) for item in cited}),
+        # Earlier identical proposals, excluding this one — recurrence across
+        # batches is corroboration, novelty is not disqualification.
+        "recurrence_history": int(recurrence.get(candidate.lesson_id, 0)),
+        "conflicts_with_approved": _approved_conflicts(candidate, approved_lessons),
+    }
+    if candidate.kind == "procedure":
+        sheet.update(
+            _procedure_fact_sheet(
+                candidate,
+                group,
+                verified_packages=verified_packages,
+                prior_counts=prior_counts,
+            )
+        )
+    return sheet
+
+
 def _build_grading_messages(
     candidates: Sequence[LessonCandidate],
     fact_sheets: Mapping[str, Mapping[str, Any]],
@@ -1367,19 +1650,28 @@ def _build_grading_messages(
 
     system = SystemMessage(
         content=(
-            "你是离线经验分级器：你会看到若干过程卡候选，以及 harness 为每张卡统计的事实单"
-            "（支持的 run、这些 run 里该子过程的结局一致性、app_scope 是否在 App-KB 有验证包名、"
-            "是否已被历史批次独立提炼过）。请判断每张卡能否直接作为参考卡使用。"
+            "你是离线经验分级器：你会看到若干候选（单条规则 rule 或多步过程卡 procedure），"
+            "以及 harness 为每条候选统计的事实单（引用的 run 与结局、每个 run 的报错回执数、"
+            "跨多少个不同任务复现、历史上被独立提炼过多少次、是否与已注入的经验在同一 scope 下"
+            "表达相反主张；过程卡另有 app_scope 是否在 App-KB 验证过等卡片事实）。"
+            "harness 只做事实核验与簿记，最终判断权在你。"
             "只输出严格 JSON 对象 {\"grades\": [{\"lesson_id\": ..., \"grade\": ..., "
             "\"basis\": ...}]}，不要 Markdown、解释或代码围栏。"
-            "grade 只能是 auto_approved 或 needs_review：拿得准就填 auto_approved；"
-            "只有在非常拿不准时才填 needs_review，它不阻塞任何事，只是进人审队列。"
+            "grade 只能是 auto_approved 或 needs_review。"
+            "请注意两个方向的风险并不对称：错误注入一条伪经验，会在未来所有同类任务里误导"
+            "actor 的行为，代价远高于把一条好经验留给人审（needs_review 不阻塞任何事，"
+            "只是进人工队列）。因此只有同时满足以下三条才填 auto_approved："
+            "一是事实单显示的证据真实且无矛盾（引用的 run 确实存在、结局支持这条表述、"
+            "conflicts_with_approved 为空）；"
+            "二是表述可执行（读了就知道下一步该做什么，而不是空泛的提醒）；"
+            "三是即使判断错了也不危险（照做最多绕点路，不会漏改关键信息或误导其他任务）。"
+            "任何一条不满足，或你只是拿不准，一律填 needs_review。"
             "basis 写一句判断依据（中文），缺失或非法的 grade 一律按 needs_review 处理。"
         )
     )
     human = HumanMessage(
         content=(
-            "为以下过程卡候选分级：\n"
+            "为以下候选分级：\n"
             + json.dumps(
                 {
                     "candidates": [item.to_dict() for item in candidates],
@@ -1415,12 +1707,12 @@ def _parse_grades(response: Any) -> dict[str, tuple[str, str]]:
 
 
 def _grading_records(
-    procedures: Sequence[LessonCandidate],
+    candidates: Sequence[LessonCandidate],
     fact_sheets: Mapping[str, Mapping[str, Any]],
     grades: Mapping[str, tuple[str, str]],
 ) -> dict[str, dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
-    for candidate in procedures:
+    for candidate in candidates:
         grade, basis = grades.get(candidate.lesson_id, ("needs_review", ""))
         if grade not in _GRADES:
             grade = "needs_review"
@@ -1441,34 +1733,44 @@ def _apply_self_grading(
     store: "LessonStore",
     token_budget: int | None,
     appkb_dir: str | os.PathLike[str] | None,
+    ledgers: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Grade procedure candidates with a second model call over fact sheets.
+    """Grade every candidate with a second model call over fact sheets.
 
-    Both calls are charged to the ``distill`` ledger role.  Any failure
-    (budget, transport, malformed grades) is fail-open: every candidate stays
-    at ``needs_review`` rather than being dropped.
+    Rules and procedure cards travel the same path (WP-DISTILL-AUTO): the
+    harness only supplies facts, the model owns the verdict.  Both calls are
+    charged to the ``distill`` ledger role.  Any failure (budget, transport,
+    malformed grades) is fail-open: every candidate stays at ``needs_review``
+    rather than being dropped.
     """
 
-    procedures = [item for item in candidates if item.kind == "procedure"]
-    if not procedures:
+    if not candidates:
         return {}
     verified_packages = _verified_appkb_packages(appkb_dir)
     prior_counts = _procedure_proposal_counts(store.events_path)
+    recurrence = _recurrence_counts(store.events_path)
+    approved_lessons = [
+        item for item in store.lessons() if lesson_injectable(item)
+    ]
+    active_ledgers = ledgers or {}
     fact_sheets = {
-        item.lesson_id: _procedure_fact_sheet(
+        item.lesson_id: _candidate_fact_sheet(
             item,
             group,
+            ledgers=active_ledgers,
             verified_packages=verified_packages,
             prior_counts=prior_counts,
+            recurrence=recurrence,
+            approved_lessons=approved_lessons,
         )
-        for item in procedures
+        for item in candidates
     }
     grades: dict[str, tuple[str, str]] = {}
-    messages = _build_grading_messages(procedures, fact_sheets)
+    messages = _build_grading_messages(candidates, fact_sheets)
     request_estimate = estimate_context_tokens(messages)
     if token_budget is not None and ledger.total + request_estimate > token_budget:
         # Out of budget: keep every candidate at needs_review, drop nothing.
-        return _grading_records(procedures, fact_sheets, grades)
+        return _grading_records(candidates, fact_sheets, grades)
     try:
         response = model.invoke(messages)
     except Exception:  # noqa: BLE001 - grading is advisory, never fatal
@@ -1483,7 +1785,7 @@ def _apply_self_grading(
             grades = _parse_grades(response)
         except (TypeError, ValueError, json.JSONDecodeError):
             grades = {}
-    return _grading_records(procedures, fact_sheets, grades)
+    return _grading_records(candidates, fact_sheets, grades)
 
 
 @dataclass(frozen=True)
@@ -1556,12 +1858,13 @@ def _distill_batch(
     if token_budget is not None and ledger.total > token_budget:
         return 1, []
     try:
-        candidates = _validate_model_candidates(response, batch, ledgers)
+        candidates = _validate_model_candidates(response, batch)
     except (TypeError, ValueError, json.JSONDecodeError):
         return 1, []
     if not candidates:
         return 0, []
-    # Second call: the harness supplies per-card facts, the model self-grades.
+    # Second call: the harness supplies per-card facts, the model self-grades
+    # every candidate — rules and procedure cards alike.
     grading = _apply_self_grading(
         candidates,
         batch,
@@ -1570,18 +1873,18 @@ def _distill_batch(
         store=store,
         token_budget=token_budget,
         appkb_dir=appkb_dir,
+        ledgers=ledgers,
     )
     proposed: list[LessonCandidate] = []
     for candidate in candidates:
-        evaluation = evaluate_promotion(
-            candidate,
-            batch,
-            approved_lessons=store.lessons(status="approved"),
-        )
         metadata = grading.get(candidate.lesson_id)
-        graded = evaluation.candidate
-        if metadata is not None and metadata["grade"] != graded.status:
-            graded = replace(graded, status=metadata["grade"])
+        # The verdict is the grader's; there is no harness-evaluated status any
+        # more, only fail-open ``needs_review`` when the grade is unusable.
+        graded = (
+            candidate
+            if metadata is None or metadata["grade"] == candidate.status
+            else replace(candidate, status=metadata["grade"])
+        )
         prior = store.get(graded.lesson_id)
         saved = store.propose(
             graded,
@@ -1611,10 +1914,11 @@ def distill_lessons(
     has been processed, including when the batch was rejected, so processed
     episodes are never replayed.
 
-    WP-WF1 adds a second model call: procedure-card candidates are returned with
-    a harness-computed fact sheet and the model grades each one
-    ``auto_approved`` or ``needs_review`` (see :func:`_apply_self_grading`).
-    ``appkb_dir`` is the App-KB root used to verify ``app_scope`` packages.
+    A second model call self-grades every surviving candidate: the harness
+    supplies a fact sheet, the model answers ``auto_approved`` or
+    ``needs_review``, and that verdict becomes the lesson's status (see
+    :func:`_apply_self_grading`).  ``appkb_dir`` is the App-KB root used to
+    verify ``app_scope`` packages.
     """
 
     events_path = Path(experience_events)

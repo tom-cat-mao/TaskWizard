@@ -100,53 +100,6 @@ def _model_candidate(episodes: list[dict], *, text: str | None = None) -> dict:
     }
 
 
-def _candidate_dict(
-    run_ids: list[str],
-    task_keys: list[str],
-    *,
-    text: str = "示例规则",
-) -> dict:
-    return {
-        "lesson_id": "les_123456789abc",
-        "schema_v": 1,
-        "version": 1,
-        "status": "proposed",
-        "text": text,
-        "scope": {
-            "device": "serial-1",
-            "app": "com.example.travel",
-            "app_version": None,
-        },
-        "evidence": [{"run_id": rid, "note": "outcome pattern"} for rid in run_ids],
-        "support_count": len(run_ids),
-        "task_keys": task_keys,
-        "conflicts": [],
-        "created_ts": 1.0,
-        "source": "distill",
-    }
-
-
-def _experience_event(
-    run_id: str,
-    step: int,
-    tool: str,
-    result_class: str = "ok",
-) -> dict:
-    return {
-        "type": "experience_event",
-        "schema_v": 1,
-        "run_id": run_id,
-        "step": step,
-        "ts": float(step),
-        "tool": tool,
-        "result_class": result_class,
-        "app_package": None,
-        "device_scope": "device:serial-1",
-        "intent": None,
-        "note": None,
-    }
-
-
 class _FakeModel:
     def __init__(self, response: str) -> None:
         self.response = response
@@ -229,7 +182,7 @@ def test_repeat_identical_distill_cannot_demote_reviewed_lesson(tmp_path):
     assert len(events) == 2
 
 
-def test_changed_distill_evidence_creates_reported_proposed_revision(tmp_path):
+def test_changed_distill_evidence_creates_reported_graded_revision(tmp_path):
     events_path = tmp_path / "experience/events.jsonl"
     lessons_dir = tmp_path / "lessons"
     first_batch = [
@@ -261,12 +214,13 @@ def test_changed_distill_evidence_creates_reported_proposed_revision(tmp_path):
     )
 
     assert second.proposed[0].version == 2
-    assert second.proposed[0].status == "proposed"
+    # The self-grading verdict rides along with the new proposal version.
+    assert second.proposed[0].status == "needs_review"
     events = LessonStore(lessons_dir).events_path.read_text(encoding="utf-8")
     assert "lesson_superseded" in events
 
 
-def test_distill_valid_json_writes_only_proposed_and_charges_distill(tmp_path):
+def test_distill_valid_json_writes_only_proposal_states_and_charges_distill(tmp_path):
     episodes = [
         _episode(
             "run-0", success=False, goal="打开旅行应用", reason="target_missing", ts=1
@@ -293,8 +247,10 @@ def test_distill_valid_json_writes_only_proposed_and_charges_distill(tmp_path):
     assert result.groups_considered == 1
     assert result.groups_rejected == 0
     assert len(result.proposed) == 1
-    assert result.proposed[0].status == "proposed"
-    assert result.tokens_by_role == {"distill": 18}
+    # A rule's status is the self-grading verdict now, never a harness default:
+    # the second call here is not a grade object, so it fails open.
+    assert result.proposed[0].status == "needs_review"
+    assert result.tokens_by_role == {"distill": 36}
     assert "打开旅行应用" in str(model.calls)
     events = (tmp_path / "lessons/events.jsonl").read_text(encoding="utf-8")
     assert '"type": "lesson_proposed"' in events
@@ -360,7 +316,8 @@ def test_distill_watermark_processes_each_episode_exactly_once(tmp_path):
 
     assert first.groups_considered == 1
     assert first.groups_rejected == 0
-    assert len(first_model.calls) == 1
+    # Two calls per batch now: propose, then self-grade the survivors.
+    assert len(first_model.calls) == 2
     assert "run-0" in str(first_model.calls[0])
     assert "run-1" in str(first_model.calls[0])
     assert json.loads((lessons_dir / "distill_state.json").read_text()) == {
@@ -407,154 +364,6 @@ def test_distill_without_new_episodes_writes_no_state(tmp_path):
     assert result.tokens_by_role == {}
     assert model.calls == []
     assert not (tmp_path / "lessons/distill_state.json").exists()
-
-
-def test_distill_skips_candidate_without_a_proven_citation_pattern(tmp_path):
-    """A candidate whose citations do not prove an eligible pattern is skipped."""
-
-    episodes = [
-        _episode("run-0", success=False, goal="打开 A", reason="failed", ts=1),
-        _episode("run-1", success=True, goal="查询机票", reason="finished", ts=2),
-    ]
-    events_path = tmp_path / "experience/events.jsonl"
-    _write_episodes(events_path, episodes)
-    candidate = _model_candidate([episodes[0]])
-    candidate["task_keys"] = ["open_app"]
-
-    result = distill_lessons(
-        events_path,
-        tmp_path / "lessons",
-        model=_FakeModel(json.dumps([candidate], ensure_ascii=False)),
-    )
-
-    assert result.groups_considered == 1
-    assert result.groups_rejected == 0
-    assert result.proposed == ()
-
-
-def test_distill_mixed_batch_skips_success_only_and_keeps_contrastive(tmp_path):
-    """Per-candidate validation drops success-only rules but keeps eligible ones."""
-
-    episodes = [
-        _episode("run-0", success=False, goal="打开旅行应用", reason="failed", ts=1),
-        _episode("run-1", success=True, goal="打开旅行应用", reason="finished", ts=2),
-        _episode("run-2", success=True, goal="查询机票", reason="finished", ts=3),
-    ]
-    events_path = tmp_path / "experience/events.jsonl"
-    _write_episodes(events_path, episodes)
-
-    success_only = _candidate_dict(
-        ["run-1", "run-2"],
-        ["open_app", "search_flight"],
-        text="仅引用成功的规则",
-    )
-    contrastive = _candidate_dict(
-        ["run-0", "run-1", "run-2"],
-        ["open_app", "search_flight"],
-        text="失败早于成功的规则",
-    )
-
-    result = distill_lessons(
-        events_path,
-        tmp_path / "lessons",
-        model=_FakeModel(json.dumps([success_only, contrastive], ensure_ascii=False)),
-    )
-
-    assert result.groups_considered == 1
-    assert result.groups_rejected == 0
-    assert len(result.proposed) == 1
-    assert result.proposed[0].text == "失败早于成功的规则"
-
-
-def test_distill_repeated_failure_requires_shared_tool_prefix(tmp_path):
-    """Same termination code is not enough; the failure path must look similar."""
-
-    episodes = [
-        _episode("run-0", success=False, goal="打开 A", reason="loop_fuse", ts=1),
-        _episode("run-1", success=False, goal="查询机票", reason="loop_fuse", ts=2),
-        _episode("run-2", success=False, goal="设置 WiFi", reason="loop_fuse", ts=3),
-    ]
-    events_path = tmp_path / "experience/events.jsonl"
-    _write_episodes(
-        events_path,
-        [
-            *episodes,
-            _experience_event("run-0", 1, "launch_app"),
-            _experience_event("run-0", 2, "tap"),
-            _experience_event("run-0", 3, "type_text"),
-            _experience_event("run-1", 1, "tap"),
-            _experience_event("run-1", 2, "swipe"),
-            _experience_event("run-2", 1, "long_press"),
-        ],
-    )
-    candidate = _candidate_dict(
-        ["run-0", "run-1", "run-2"],
-        ["open_app", "search_flight"],
-        text="同 reason 不同路径的规则",
-    )
-
-    result = distill_lessons(
-        events_path,
-        tmp_path / "lessons",
-        model=_FakeModel(json.dumps([candidate], ensure_ascii=False)),
-    )
-
-    assert result.groups_considered == 1
-    assert result.groups_rejected == 0
-    assert result.proposed == ()
-
-
-def test_distill_repeated_failure_accepts_shared_tool_prefix(tmp_path):
-    """Repeated failures with the same reason and shared tool prefix are valid."""
-
-    episodes = [
-        _episode("run-0", success=False, goal="打开 A", reason="loop_fuse", ts=1),
-        _episode("run-1", success=False, goal="查询机票", reason="loop_fuse", ts=2),
-        _episode("run-2", success=False, goal="设置 WiFi", reason="loop_fuse", ts=3),
-    ]
-    events_path = tmp_path / "experience/events.jsonl"
-    _write_episodes(
-        events_path,
-        [
-            *episodes,
-            _experience_event("run-0", 1, "launch_app"),
-            _experience_event("run-0", 2, "wait"),
-            _experience_event("run-0", 3, "tap"),
-            _experience_event("run-0", 4, "read_screen"),
-            _experience_event("run-0", 5, "type_text"),
-            _experience_event("run-1", 1, "launch_app"),
-            _experience_event("run-1", 2, "tap"),
-            _experience_event("run-1", 3, "type_text"),
-            _experience_event("run-2", 1, "launch_app"),
-            _experience_event("run-2", 2, "tap"),
-            _experience_event("run-2", 3, "type_text"),
-        ],
-    )
-    candidate = _candidate_dict(
-        ["run-0", "run-1", "run-2"],
-        ["open_app", "search_flight"],
-        text="同 reason 同路径的规则",
-    )
-
-    result = distill_lessons(
-        events_path,
-        tmp_path / "lessons",
-        model=_FakeModel(json.dumps([candidate], ensure_ascii=False)),
-    )
-
-    assert result.groups_considered == 1
-    assert result.groups_rejected == 0
-    assert len(result.proposed) == 1
-    assert result.proposed[0].text == "同 reason 同路径的规则"
-
-
-def test_distill_system_prompt_requires_failure_anchored_evidence():
-    from phone_agent.v2.evolution import _build_distill_messages
-
-    messages = _build_distill_messages([], {})
-    system = messages[0].content
-    assert "候选的 evidence 必须锚定失败" in system
-    assert "仅引用成功 run 的候选会被丢弃" in system
 
 
 def test_distill_budget_rejects_before_model_call(tmp_path):

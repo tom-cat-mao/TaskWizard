@@ -281,8 +281,10 @@ def test_distill_two_calls_emit_rule_and_auto_approved_procedure(tmp_path):
 
     assert len(model.calls) == 2
     assert result.groups_rejected == 0
+    # Every candidate is self-graded now: the rule wears the grader's verdict,
+    # not a harness default of `proposed`.
     statuses = {item.kind: item.status for item in result.proposed}
-    assert statuses == {"rule": "proposed", "procedure": "auto_approved"}
+    assert statuses == {"rule": "auto_approved", "procedure": "auto_approved"}
     # Both calls are charged to the distill role.
     assert result.tokens_by_role == {"distill": 36}
 
@@ -322,17 +324,30 @@ def test_distill_grading_prompt_carries_candidates_and_fact_sheets(tmp_path):
     assert sheet["app_scope"] == APP
 
 
-def test_distill_without_procedures_makes_no_grading_call(tmp_path):
+def test_distill_grades_a_rule_only_batch_with_the_same_second_call(tmp_path):
+    """Self-grading is unified: a rule gets call 2 just like a procedure card."""
+
     events_path = tmp_path / "experience/events.jsonl"
     _write_episodes(events_path, _default_batch())
     model = _ScriptedModel(
-        json.dumps({"rules": [_rule_payload(["run-0", "run-1"], ["search_flight"])]}, ensure_ascii=False)
+        json.dumps(
+            {"rules": [_rule_payload(["run-0", "run-1"], ["search_flight"])], "procedures": []},
+            ensure_ascii=False,
+        ),
+        _grading_reply("needs_review", "只在单任务里出现"),
     )
 
     result = distill_lessons(events_path, tmp_path / "lessons", model=model)
 
-    assert len(model.calls) == 1
-    assert [item.kind for item in result.proposed] == ["rule"]
+    assert len(model.calls) == 2
+    assert [(item.kind, item.status) for item in result.proposed] == [
+        ("rule", "needs_review")
+    ]
+    grading_payload = _human_payload(model.calls[1])
+    assert [item["kind"] for item in grading_payload["candidates"]] == ["rule"]
+    sheet = next(iter(grading_payload["fact_sheets"].values()))
+    assert sheet["kind"] == "rule"
+    assert sheet["support_count_verified"] == 2
 
 
 @pytest.mark.parametrize(
@@ -341,12 +356,10 @@ def test_distill_without_procedures_makes_no_grading_call(tmp_path):
         (lambda: _procedure_payload(["run-ghost", "run-1"], ["search_flight", "search_hotel"]), "fabricated run id"),
         (lambda: _procedure_payload(["run-1", "run-2"], ["search_flight", "search_hotel"], steps=["tap(ax_3@e7)", "选店进入"]), "mark id step"),
         (lambda: _procedure_payload(["run-1", "run-2"], ["search_flight", "search_hotel"], steps=["在坐标 500,800 点击", "选店进入"]), "coordinate step"),
-        # Both cited runs belong to the same task bucket: no cross-task repeat.
-        (lambda: _procedure_payload(["run-0", "run-1"], ["search_flight"]), "single task only"),
     ],
 )
 def test_distill_skips_procedure_failing_the_evidence_gate(tmp_path, payload, reason):
-    """Fabricated citations, mechanically bound steps, or single-task flow."""
+    """Fabricated citations or steps mechanically bound to one screen."""
 
     events_path = tmp_path / "experience/events.jsonl"
     _write_episodes(events_path, _default_batch())
@@ -359,6 +372,43 @@ def test_distill_skips_procedure_failing_the_evidence_gate(tmp_path, payload, re
 
     assert result.proposed == (), reason
     assert len(model.calls) == 1
+
+
+def test_distill_keeps_single_task_procedure_for_the_grader(tmp_path):
+    """Cross-task recurrence is a grader fact now, never a harness gate."""
+
+    events_path = tmp_path / "experience/events.jsonl"
+    _write_episodes(events_path, _default_batch())
+    model = _ScriptedModel(
+        json.dumps(
+            {
+                "rules": [],
+                "procedures": [_procedure_payload(["run-0", "run-1"], ["search_flight"])],
+            },
+            ensure_ascii=False,
+        ),
+        _grading_reply("needs_review", "只在单一任务里出现"),
+    )
+
+    result = distill_lessons(events_path, tmp_path / "lessons", model=model)
+
+    assert len(model.calls) == 2
+    assert [(item.kind, item.status) for item in result.proposed] == [
+        ("procedure", "needs_review")
+    ]
+    sheet = next(iter(_human_payload(model.calls[1])["fact_sheets"].values()))
+    assert sheet["recurs_in_tasks"] == 1
+    assert sheet["task_count"] == 1
+
+
+def test_grading_prompt_states_the_asymmetric_risk_of_auto_approval():
+    from phone_agent.v2.evolution import _build_grading_messages
+
+    system = _build_grading_messages([], {})[0].content
+    # The grader must know a wrong injection costs more than a slow review.
+    assert "风险并不对称" in system
+    assert "needs_review" in system
+    assert "conflicts_with_approved" in system
 
 
 # --- fact sheet -----------------------------------------------------------
@@ -628,18 +678,23 @@ def test_injection_gate_matrix(tmp_path):
     lessons = store.lessons()
     expected = {
         approved_rule.lesson_id: True,
-        auto_rule.lesson_id: False,
+        # auto_approved crosses the gate for any kind now; a wrong card is
+        # corrected by human CLI / dream demotion, not by a prior restraint.
+        auto_rule.lesson_id: True,
         auto_procedure.lesson_id: True,
         review_procedure.lesson_id: False,
     }
-    # lesson_injectable 是谓词（procedure 通道用 auto_approved 放行）；
-    # rule 注入通道只选 kind=rule，过程卡不泄漏为单行 rule（WF3 修复）。
+    # lesson_injectable 是谓词（approved 任意 kind 放行，auto_approved 也不限 kind）；
+    # rule 注入通道仍只选 kind=rule，过程卡不泄漏为单行 rule（WF3 修复）。
     assert {item.lesson_id: lesson_injectable(item) for item in lessons} == expected
 
     selected = select_lessons_for_injection(
         lessons_dir, device_scope="device:serial-1", max_items=10, max_tokens=800
     )
-    assert {item.lesson_id for item in selected} == {approved_rule.lesson_id}
+    assert {item.lesson_id for item in selected} == {
+        approved_rule.lesson_id,
+        auto_rule.lesson_id,
+    }
 
 
 def test_demote_lands_procedure_in_needs_review_and_rule_in_proposed(tmp_path):
