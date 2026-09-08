@@ -64,7 +64,7 @@ flowchart LR
 
 ## 提炼、晋升与回注（已实现）
 
-- **提炼**：`--distill` 离线蒸馏——按水位线取新档案整批交给 LLM（每张卡含目标原文、逐步 intent/note 账本与结局，上限 40 条，处理后推进水位线不重复消费），产出候选经验（严格 schema，证据必须引用真实 run、support_count 与证据一致）；证据校验**逐候选**放行：一张卡不合格只跳过它，不再整批拒绝（同批其余合格候选照常晋升）；蒸馏 prompt 明确要求候选证据**锚定失败**——要么同时引用失败与成功 run 且至少一次失败早于成功（先踩坑后绕开），要么引用 ≥2 次可复现的失败；仅引用成功 run 的卡被丢弃；`repeated_failure` 型经验要求相同失败原因 **且**共享有效工具前缀（前 3 个工具、剔除 `wait`/`read_screen`）才算同一个可复现的坑；
+- **提炼**：`--distill` 离线蒸馏——按水位线取新档案整批交给 LLM（每张卡含目标原文、逐步 intent/note 账本与结局，外加 harness 机械算出的 struggle_markers：报错步/弯路重走/finish 驳回数，上限 40 条，处理后推进水位线不重复消费）。harness 只做三件事：**核验客观事实**（严格 JSON、证据 run_id/task_keys/scope 必须逐字引自本批次、kind 形状、steps 不得含坐标/mark id/工具字面量）、**供给事实表**、**自填簿记字段**（lesson_id/support_count/时间戳等，模型只输出语义字段）。语义判断全部归第二次调用的模型自评；仅引用成功 run 的卡不再被丢弃，改由自评结合事实表定夺；
 - **晋升**：Rule-of-3（≥3 次独立出现、跨 ≥2 任务、0 冲突）+ 人工审批（`--review-lessons` / `--approve-lesson` / `--revoke-lesson`），版本链可撤销（supersede 即下线，重新批准才恢复注入）；
 - **维护**：dream 对账——证据档案被折叠后不再够格的 approved 经验自动降回草案（`lesson_demoted`，需重新人审）；并按"注入组 vs 未注入组"成功率统计每条经验的实际效果，更差的列入建议撤销清单（只提醒，不自动撤）；
 - **回注**（`PHONE_AGENT_MEMORY_RAG=on`）：已批准的经验在 run 开局以"参考提示"身份注入（上限 3 条 / 800 token，设备 scope 过滤，run 内钉死该代）；注入的 lesson id 写入 trace 与 episode 档案，用于事后度量"注入是否有帮助"；
@@ -74,7 +74,7 @@ flowchart LR
 
 ### 过程卡（procedure card，WP-WF 已落地）
 
-lesson 管道的第二种产物：rule 是单条行为规则，过程卡是多步流程经验（`kind=procedure`，字段 `steps`（纯语义步，禁坐标/工具参数）+ `pitfalls` + `app_scope`）。蒸馏一次调用同产两类候选；过程卡走**自判分级**——harness 只供事实单（支持 run/结局一致性/app 包名是否验证过/是否跨批次复现），模型拿得准直接 `auto_approved` 可注入，非常拿不准才落 `needs_review` 等人看（不阻塞）；rule 维持人审不变。
+lesson 管道的第二种产物：rule 是单条行为规则，过程卡是多步流程经验（`kind=procedure`，字段 `steps`（纯语义步，禁坐标/工具参数）+ `pitfalls` + `app_scope`）。蒸馏第一次调用同产两类候选，第二次调用对**两类统一自判分级**——harness 只供事实单（证据结局/每 run 报错回执数/跨任务复现数/历史同题次数/与已批准课的矛盾/support 实算，过程卡加 app 包名是否验证过），模型按非对称风险标尺定级：拿得准直接 `auto_approved` 可注入（**两类均可**），拿不准落 `needs_review`（不阻塞）；人类 CLI 是纠正通道而非闸门，dream 降等负责回收错课。
 
 匹配是硬过滤加软排序：app 包名精确相等（绝不用 embedding）+ goal 与卡摘要 cosine top-1（阈值 0.30，真实数据扫描拐点）。注入两个时机、与 rule 各占额度（卡单独 1 张/约 300 token）：run 开局注入通用卡；首次 `launch_app` 成功后注入该 app 的专属卡（下一个模型调用一次性出现）。`on` 档注入，`shadow` 只记录。离线评估：`replay --channel procedure [--sweep] [--calibrate]`（无时间旅行；`--calibrate` 为冷启动阈值调优专用，不参与通道判定）。
 
