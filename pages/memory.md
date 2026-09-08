@@ -66,7 +66,7 @@ flowchart LR
 
 - **提炼**：`--distill` 离线蒸馏——按水位线取新档案整批交给 LLM（每张卡含目标原文、逐步 intent/note 账本与结局，外加 harness 机械算出的 struggle_markers：报错步/弯路重走/finish 驳回数，上限 40 条，处理后推进水位线不重复消费）。harness 只做三件事：**核验客观事实**（严格 JSON、证据 run_id/task_keys/scope 必须逐字引自本批次、kind 形状、steps 不得含坐标/mark id/工具字面量）、**供给事实表**、**自填簿记字段**（lesson_id/support_count/时间戳等，模型只输出语义字段）。语义判断全部归第二次调用的模型自评；仅引用成功 run 的卡不再被丢弃，改由自评结合事实表定夺；
 - **晋升**：蒸馏自判分级为主（auto_approved 两类均可注入），人工 CLI（`--approve-lesson` / `--revoke-lesson`）是纠正通道而非闸门，版本链可撤销（supersede 即下线，重新批准才恢复注入）；
-- **维护**：dream 对账——证据档案被折叠后不再够格的 approved 经验自动降回草案（`lesson_demoted`，需重新人审）；并按"注入组 vs 未注入组"成功率统计每条经验的实际效果，更差的列入建议撤销清单（只提醒，不自动撤）；
+- **维护**：dream 对账——证据档案被折叠后不再够格的 approved 经验自动降回草案（`lesson_demoted`，停止注入，需重新批准）；并按"注入组 vs 未注入组"成功率统计每条经验的实际效果，更差的列入建议撤销清单（只提醒，不自动撤）；
 - **回注**（`PHONE_AGENT_MEMORY_RAG=on`）：已批准的经验在 run 开局以"参考提示"身份注入（上限 3 条 / 800 token，设备 scope 过滤，run 内钉死该代）；注入的 lesson id 写入 trace 与 episode 档案，用于事后度量"注入是否有帮助"；
 - **约束**：只有 approved / auto_approved 可被注入；proposed/needs_review/revoked 永不注入；shadow/off 档完全不注入。召回侧加固：embedder 在 capability 挂载时后台线程预热（on/shadow 且配置了索引才触发）；选择器异常留痕（trace `recall_selection_error` + stats 错误计数），fail-open 语义不变。
 
