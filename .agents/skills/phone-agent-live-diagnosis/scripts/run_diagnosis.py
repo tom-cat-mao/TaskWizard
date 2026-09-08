@@ -638,7 +638,7 @@ def run_dry(args: argparse.Namespace, run_dir: Path) -> tuple[Any, Any]:
     model = ScriptedToolModel(responses=responses)
 
     model_mod = types.ModuleType("phone_agent.v2.model")
-    model_mod.build_chat_model = lambda cfg: model
+    model_mod.build_chat_model = lambda cfg, *args, **kwargs: model
     session_mod = types.ModuleType("phone_agent.v2.session")
     session_mod.PhoneSession = lambda cfg: session
     tools_mod = types.ModuleType("phone_agent.v2.tools")
