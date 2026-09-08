@@ -281,7 +281,7 @@ def seeded_agent(tmp_path, monkeypatch):
 
     modules = {
         "phone_agent.v2.model": _fake_module(
-            "phone_agent.v2.model", build_chat_model=lambda config: model
+            "phone_agent.v2.model", build_chat_model=lambda config, *args, **kwargs: model
         ),
         "phone_agent.v2.session": _fake_module(
             "phone_agent.v2.session", PhoneSession=lambda config: session
@@ -323,7 +323,7 @@ def test_run_skips_seeding_when_taskdoc_disabled(tmp_path, monkeypatch):
 
     modules = {
         "phone_agent.v2.model": _fake_module(
-            "phone_agent.v2.model", build_chat_model=lambda config: model
+            "phone_agent.v2.model", build_chat_model=lambda config, *args, **kwargs: model
         ),
         "phone_agent.v2.session": _fake_module(
             "phone_agent.v2.session", PhoneSession=lambda config: session

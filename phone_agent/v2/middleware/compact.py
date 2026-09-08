@@ -540,11 +540,9 @@ class CompactMiddleware(AgentMiddleware):
         name = getattr(self.config, "memory_model", None)
         if name:
             try:
-                from dataclasses import replace
+                from phone_agent.v2.model import build_role_model
 
-                from phone_agent.v2.model import build_chat_model
-
-                self._memory_model = build_chat_model(replace(self.config, model_name=name))
+                self._memory_model = build_role_model(self.config, role="memory")
                 return self._memory_model
             except Exception:  # noqa: BLE001 - fall back to the injected main model
                 self._memory_model = None

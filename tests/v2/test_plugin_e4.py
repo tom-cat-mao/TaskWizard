@@ -107,7 +107,7 @@ def captured_agent(tmp_path, monkeypatch):
     )
 
     model_mod = types.ModuleType("phone_agent.v2.model")
-    model_mod.build_chat_model = lambda config: model
+    model_mod.build_chat_model = lambda config, *args, **kwargs: model
     session_mod = types.ModuleType("phone_agent.v2.session")
     session_mod.PhoneSession = lambda config: session
     tools_mod = types.ModuleType("phone_agent.v2.tools")
@@ -193,7 +193,7 @@ def test_extra_middleware_appended_after_bridges(tmp_path, monkeypatch):
     model = _ScriptedModel(responses=[AIMessage(content="完成")])
 
     model_mod = types.ModuleType("phone_agent.v2.model")
-    model_mod.build_chat_model = lambda config: model
+    model_mod.build_chat_model = lambda config, *args, **kwargs: model
     session_mod = types.ModuleType("phone_agent.v2.session")
     session_mod.PhoneSession = lambda config: session
     tools_mod = types.ModuleType("phone_agent.v2.tools")

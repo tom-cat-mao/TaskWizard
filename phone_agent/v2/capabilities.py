@@ -513,6 +513,38 @@ def _register_cli(ctx: CapabilityAssemblyContext, names: Sequence[str]) -> None:
             ctx.add_cli_command(name, handler)
 
 
+def _apply_providers(ctx: CapabilityAssemblyContext) -> None:
+    """Mount the S4 provider registry as the ``provider_registry`` service.
+
+    Reuses the registry the harness already built for the actor model (the
+    ``_provider_registry`` side channel on config) when present; otherwise
+    assembles one from config.  Fail-open: an unusable models.json leaves the
+    service unmounted and every role build degrades to the legacy
+    single-gateway path.  Plugins register extra providers through
+    :func:`phone_agent.v2.providers.register_provider` on this service.
+    """
+
+    config = ctx.service("config")
+    registry = getattr(config, "_provider_registry", None)
+    if registry is None:
+        try:
+            from phone_agent.v2.providers import build_provider_registry
+
+            registry = build_provider_registry(config)
+        except Exception:  # noqa: BLE001 - provider layer must never crash assembly
+            registry = None
+    if registry is not None:
+        # Leave the same handle on config so auxiliary role builds (compact,
+        # verify, safety reviewer, distill) resolve providers without reaching
+        # into the assembly context.  Best-effort: some test configs reject
+        # attribute writes.
+        try:
+            config._provider_registry = registry
+        except Exception:  # noqa: BLE001 - side channel is best-effort
+            pass
+        ctx.register_service("provider_registry", registry)
+
+
 def _apply_taskdoc(ctx: CapabilityAssemblyContext) -> None:
     bus = ctx.service("event_bus")
     if bus is not None:
@@ -828,6 +860,13 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
 
     registry = CapabilityRegistry()
     for spec in (
+        CapabilitySpec(
+            "providers",
+            "Model providers",
+            "on",
+            apply=_owned_apply("providers", _apply_providers),
+            release=_owned_release("providers"),
+        ),
         CapabilitySpec(
             "taskdoc",
             "TaskDoc",

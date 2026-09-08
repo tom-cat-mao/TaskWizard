@@ -373,13 +373,21 @@ class V2Config:
     cf_access_client_id: str | None = None
     cf_access_client_secret: str | None = None
     # Side-model used by auto-compact and offline lesson distillation; each
-    # falls back to the main model when unset.
+    # falls back to the main model when unset. Values may carry
+    # ``provider:model`` addressing (S4 provider registry) or a bare model name.
     memory_model: str | None = None
     # finish-verifier model (S2 §4.3); falls back to the main model when unset.
     verifier_model: str | None = None
     # safety-reviewer model (S2 §3.3); falls back to verifier_model then the main
     # model when unset.
     safety_reviewer_model: str | None = None
+    # S4 provider layer: extra models.json file (highest-priority candidate on
+    # top of the user/project level files). Absent/blank disables it.
+    models_file: str | None = None
+    # S4 thinking level: off|minimal|low|medium|high; empty (default) sends no
+    # thinking param. Translated per provider via thinking_level_map +
+    # thinking_format; unsupported endpoints omit the param silently.
+    thinking: str = ""
     # External capability plugins (WP-PLUGIN-C). ``plugins_enabled`` is the master
     # switch (env ``PHONE_AGENT_PLUGINS``, default on); an empty manifest is a
     # no-op with zero behavior change. ``plugin_manifest`` overrides the
@@ -606,6 +614,12 @@ class V2Config:
             memory_model=_env_opt_str("PHONE_AGENT_MEMORY_MODEL"),
             verifier_model=_env_opt_str("PHONE_AGENT_VERIFIER_MODEL"),
             safety_reviewer_model=_env_opt_str("PHONE_AGENT_SAFETY_REVIEWER_MODEL"),
+            models_file=_env_opt_str("PHONE_AGENT_MODELS_FILE"),
+            thinking=_env_choice(
+                "PHONE_AGENT_THINKING",
+                "",
+                ("", "off", "minimal", "low", "medium", "high"),
+            ),
             plugins_enabled=_env_bool_default_true("PHONE_AGENT_PLUGINS", True),
             plugin_manifest=_env_opt_str("PHONE_AGENT_PLUGIN_MANIFEST"),
             plugin_index=_env_str("PHONE_AGENT_PLUGIN_INDEX", "plugins/index.json"),

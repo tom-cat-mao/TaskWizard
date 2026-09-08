@@ -706,7 +706,7 @@ def _install_wf4c_mini_modules(monkeypatch):
     import types
 
     modules = {
-        "phone_agent.v2.model": ("build_chat_model", lambda config: model),
+        "phone_agent.v2.model": ("build_chat_model", lambda config, *args, **kwargs: model),
         "phone_agent.v2.session": ("PhoneSession", lambda config: session),
         "phone_agent.v2.tools": (
             "build_tools",

@@ -120,7 +120,7 @@ def _install_fake_modules(monkeypatch, session: _FakeSession, model, tools_build
     """Inject the duck-typed v2 modules the agent imports lazily."""
 
     model_mod = types.ModuleType("phone_agent.v2.model")
-    model_mod.build_chat_model = lambda config: model
+    model_mod.build_chat_model = lambda config, *args, **kwargs: model
     session_mod = types.ModuleType("phone_agent.v2.session")
     session_mod.PhoneSession = lambda config: session
     tools_mod = types.ModuleType("phone_agent.v2.tools")

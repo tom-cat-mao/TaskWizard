@@ -681,7 +681,7 @@ def _install_launching_mini_modules(monkeypatch, tmp_path):
 
     model = Model()
     modules = {
-        "phone_agent.v2.model": ("build_chat_model", lambda config: model),
+        "phone_agent.v2.model": ("build_chat_model", lambda config, *args, **kwargs: model),
         "phone_agent.v2.session": ("PhoneSession", lambda config: session),
         "phone_agent.v2.tools": (
             "build_tools",
