@@ -23,9 +23,9 @@ TaskWizard 采用 thin-loop v2：模型每轮观察真实设备、决定一个�
 - **App-KB 自积累记忆**：同步本机应用名称；验证启动成功后沉淀非敏感别名，并累计成功反馈。同一 run 中未知中文名失败、回执列出的包名随后启动成功时，自动把该中文名写为 `learned` 别名（隐式纠正，证据闭环）。dream 还能从最小化工具事件识别“启动 A→1–2 步内明确自述开错并退出→成功启动 B”，删除错误 learned 映射并写入 B；用户可通过 CLI 写入最高信任的 `user` 别名或忘记 user/learned 别名。
 - **类型化 App 名解析**：统一做 NFKC/大小写/空白归一化，再从 exact、lexical、pinyin、embedding 四路生成候选；候选携带 `match_type` / `authority`，默认按证据类型与三态代价决策，`rank_score` 只参与排序和分差。歧义时只返回排序后的 top-K，装机事实与 launch policy 仍独立 fail-closed。
 - **经验数据面**：每次 run 结束以固定 schema 落盘 episode outcome 与工具结果分类（字符串原文照存，工具事件另含模型逐步自述的 intent/note；schema 之外的内容直接丢弃），持久化分角色 token 账本；数据采集全程 observe-only，并审计本轮实际注入的 lesson id。
-- **经验提炼与晋升**：离线 `--distill` 从证据充足的 episode 组生成 proposed lesson（两类产物：单条 rule 与多步过程卡 procedure，后者由蒸馏自判 `auto_approved` / `needs_review`）；rule 的 Rule-of-3 通过后仍须人工 approve。仅 `PHONE_AGENT_MEMORY_RAG=on` 时，approved lesson 与自批通过的过程卡才在 run 开局以"参考、非规则"的 L0 Mirror 受控注入。
+- **经验提炼与晋升**：离线 `--distill` 以水位线批次蒸馏 episode，产出单条 rule 与多步过程卡 procedure 两类候选；第二次调用对照事实单统一自判分级 `auto_approved` / `needs_review`（拿不准一律 needs_review），人工 CLI 是纠正通道而非闸门。仅 `PHONE_AGENT_MEMORY_RAG=on` 时，approved / auto_approved lesson 才受控注入：规则在 run 开局以"参考、非规则"的 L0 Mirror 注入，过程卡按三个确定性时机投递（见下）。
 - **RAG shadow 召回**：sqlite-vec + FTS5 混合检索历史 episode 与 App 别名；默认只写 trace 并按实际启动应用统计命中率，绝不注入 actor 上下文。
-- **能力装配层 + 事件总线**：十个内建能力经稳定 `cap_id` 与 `apply/release` 生命周期挂载；所有策略行为都是事件总线上的监听器，LangChain 栈只剋桥接器（嵌套顺序 = 注册顺序，safety 恒居最内）。能力快照每次 run 写入 trace 与 episode。
+- **能力装配层 + 事件总线**：十个内建能力经稳定 `cap_id` 与 `apply/release` 生命周期挂载；所有策略行为都是事件总线上的监听器，LangChain 栈只剩桥接器（嵌套顺序 = 注册顺序，safety 恒居最内）。能力快照每次 run 写入 trace 与 episode。
 - **插件系统**：外部插件以 CapabilitySpec 挂入同一装配层——pip 包声明 `taskwizard.capabilities` entry point，或 `plugin add` 本地目录；插件包可携带应用词表注入 App-KB。API 暂为 provisional v1。
 - **长任务可控**：token 预算限制成本，两级 auto-compact 在接近上下文窗口时保留关键状态。
 
@@ -55,7 +55,7 @@ App 名解析默认 `PHONE_AGENT_RESOLVER_DECISION_MODE=typed`：lexical / pinyi
 .venv/bin/python main_v2.py --learn-alias "小红书=com.xingin.xhs"  # 写入最高信任 user 别名
 .venv/bin/python main_v2.py --forget-alias "小红书"                # 删除该名称的 user/learned 别名
 .venv/bin/python main_v2.py --rebuild-vec  # 从 episode/App-KB 全量重建语义索引
-.venv/bin/python main_v2.py --distill     # 离线蒸馏，只写 proposed lesson
+.venv/bin/python main_v2.py --distill     # 离线蒸馏，自判分级落 auto_approved / needs_review
 .venv/bin/python main_v2.py --review-lessons
 .venv/bin/python main_v2.py --approve-lesson <lesson-id>
 .venv/bin/python main_v2.py --revoke-lesson <lesson-id> "原因"
@@ -68,7 +68,7 @@ RAG 默认 `PHONE_AGENT_MEMORY_RAG=shadow`。每次 run 结束会把通过
 增量写入 sqlite-vec；dream 负责从 JSON 权威源补漏并清除失效项。App alias 通过静态 registry
 与 learned/user 名称做确定性 mention 匹配，episode 独立走默认 top-1 语义榜（门槛 0.50）。向量模型
 `Qwen/Qwen3-Embedding-0.6B` 仅在索引或非空 episode 召回第一次真正 embed 时懒加载；
-`PHONE_AGENT_MEMORY_RAG=on` 会在 run 开局一次性注入人审 approved lesson 与自批通过的过程卡，默认上限为
+`PHONE_AGENT_MEMORY_RAG=on` 会在 run 开局一次性注入 approved / auto_approved lesson（人工批准与蒸馏自批两类皆可），默认上限为
 `PHONE_AGENT_LESSON_INJECT_MAX=3` 条、`PHONE_AGENT_LESSON_INJECT_TOKENS=800` 估算 token；
 设备 scope 必须匹配，开局未知 app 时不会选择 app 级 lesson。提示明确标为历史参考而非规则，
 lesson 视图缺失或损坏时 fail-open。`shadow` 仍只做 trace 召回与命中统计，`off` 不召回也不注入。
@@ -79,9 +79,12 @@ lesson 视图缺失或损坏时 fail-open。`shadow` 仍只做 trace 召回与�
 过程卡（procedure）走同一索引的独立召回通道：可注入的过程卡按 `title + steps` 建向量进入 `procedure`
 namespace，run-end 增量与 dream 对账都随 lesson 状态同步（变为可注入即写入，撤销/降级即删除）。选择先做
 app 包名精确相等 + device scope 硬过滤，再按 embedding cosine 取 top-1，阈值 `recall.PROCEDURE_MIN_SCORE`
-（默认 0.50，待离线扫描后调整）。注入额度与 rule 各占：过程卡每次最多 1 张、约 300 token，超出则截断
-steps，提示标注"参考不是规则"并具名来源卡 id。该通道目前全程 shadow：只把每轮的候选数/过滤后数/命中与
-未命中原因记入 `recall_stats.json`，两个注入点尚未接线。
+（默认 0.30，真实 episode 数据标定）。注入额度独立于 rule：过程卡每次最多 1 张、约 300 token，app 规则每个
+App ≤2 条/200 token，超出则截断，提示标注"参考不是规则"并具名来源卡 id。注入有三个确定性时机，共享「每包每
+run 至多一次」去重：run 开局选通用卡；mention 预取——goal 文本经 typed resolver 判为 resolved 的 App（≤2 个）
+在规划前预取其卡 + app 专属规则；进场注入——`launch_app` 成功或前台包检测进入 App 时送该 App 的卡 + 规则
+（`PHONE_AGENT_FOREGROUND_EVENT_BLOCKED_PACKAGES` 可向前台包过滤名单追加）。`on` 档注入，`shadow` 只把
+每轮的候选数/命中与未命中原因记入 `recall_stats.json`。
 runner 的 `control.jsonl` 接受 `revoke_lesson` 紧急撤销消息：它会立即把 lesson store 标为 revoked，
 并让本 run 的后续注入点排除该 id。已经发送给模型的历史消息不可撤回，不会伪装成已从上下文删除。
 
@@ -94,12 +97,18 @@ Web 控制台默认只监听 `127.0.0.1:8080`：输入任务后可实时查看�
 `PHONE_AGENT_EPISODE_KEEP` / `PHONE_AGENT_EPISODE_ARCHIVE_DAYS` 将旧全文折叠为无原文的类别成功率统计。
 
 `PHONE_AGENT_EVOLUTION=manual` 仅开放显式离线命令；候选写入
-`memory/lessons/{events.jsonl,lessons.json}`。蒸馏以水位线批次处理新 episode（上限 40 条），看到完整任务过程卡片（目标原文 + 逐步 intent/note 账本 + 结局），输出先经严格
-schema、证据与 scope 校验，再以 proposed 状态落盘；证据校验是逐候选跳过而非整批拒绝，`repeated_failure` 经验需 ≥2 条被引用的失败共享相同 reason 与相同有效工具前缀（前 3 个工具，排除 wait/read_screen）；Rule-of-3 也只产生"可供人工晋升"结论。
-蒸馏分两次调用：第一次产出 `{"rules": [...], "procedures": [...]}`，过程卡的 steps 必须是语义步（坐标/mark id/工具参数会被丢弃）且子过程需在 ≥2 个不同任务中重复出现；harness 为每张过程卡算事实单（支持 run、结局一致性、app_scope 是否有 App-KB 验证包名、是否已被历史批次提炼过），第二次调用据此给每张卡判 `auto_approved` 或 `needs_review` 并写一句依据，grade/依据/事实单只落 `events.jsonl`。
+`memory/lessons/{events.jsonl,lessons.json}`。蒸馏以水位线批次处理新 episode（上限 40 条），call-1 输入含
+完整目标、逐步 intent/note 账本与机械算出的 struggle_markers（报错步、弯路重走、finish 驳回数），输出
+`{"rules": [...], "procedures": [...]}`。harness 拒绝的只有客观错误：严格 JSON、证据 run_id/task_keys/scope
+必须逐字引自本批次、kind 形状（procedure 须有非空 steps + app_scope）、语义步（不含坐标/mark id/工具字面量）；
+证据校验逐候选跳过而非整批拒绝。无失败锚定与复现硬门槛。
+第二次调用对照 harness 事实单（证据结局、每 run 报错回执数、跨任务复现数、与已批准课的矛盾、support 实算，
+过程卡加 app_scope 包名验证）对两类候选统一自判分级 `auto_approved` / `needs_review` 并写一句依据——非对称
+风险标尺，拿不准一律 `needs_review`；分级失败 fail-open 同样落 `needs_review`。grade/依据/事实单只落
+`events.jsonl`。
 dream 会对账：证据被折叠后不再够格的 approved 与 auto_approved 经验自动降回草案（lesson_demoted，过程卡落到 needs_review），并按注入组/未注入组成功率给出建议撤销清单（仅提醒）。
-离线管线不参与 actor prompt；proposed/needs_review/revoked 永不注入，`auto_approved` 只对过程卡生效。默认 `shadow` 继续只观测，只有显式
-`PHONE_AGENT_MEMORY_RAG=on` 才按上述边界把 approved lesson 与自批过程卡注入一次，并在 trace 与 episode 记录 id。
+离线管线不参与 actor prompt；proposed/needs_review/revoked 永不注入，approved / auto_approved（两类皆可）才可注入。默认 `shadow` 继续只观测，只有显式
+`PHONE_AGENT_MEMORY_RAG=on` 才按上述边界注入，并在 trace 与 episode 记录 id。
 
 exemplar（成功先例回注）通道尚未上线，其离线评估用 `python -m phone_agent.v2.replay`：它按时间序在内存 `VecIndex` 里重放 `memory/experience/events.jsonl`，模拟每次 run 开局只能看到先于它结束的 episode，输出 coverage/relevance/steps-delta 三道闸的 JSON 指标；全程 observe-only，不触碰生产索引。
 
@@ -107,7 +116,7 @@ exemplar（成功先例回注）通道尚未上线，其离线评估用 `python 
 
 ## 插件与扩展
 
-策略层全事件化（栈上只剋桥接器），插件与内建能力共用同一装配层，可挂事件监听器、工具、提示块、run hooks、CLI 命令。
+策略层全事件化（栈上只剩桥接器），插件与内建能力共用同一装配层，可挂事件监听器、工具、提示块、run hooks、CLI 命令。
 
 ```bash
 .venv/bin/python main_v2.py plugin add ./my-plugin   # 或 pip 安装声明了 taskwizard.capabilities entry point 的包

@@ -128,6 +128,7 @@
 | `PHONE_AGENT_LESSONS_DIR` | path | `memory/lessons` | 经验库存储目录 |
 | `PHONE_AGENT_LESSON_INJECT_MAX` | int | `3` | 单次注入的经验条数上限 |
 | `PHONE_AGENT_LESSON_INJECT_TOKENS` | int | `800` | 注入内容的 token 上限 |
+| `PHONE_AGENT_FOREGROUND_EVENT_BLOCKED_PACKAGES` | csv | 空 | app/launched 进场注入的前台包过滤补充名单；叠加内建系统包名单 |
 
 ## 任务板与记录
 
@@ -139,3 +140,13 @@
 | `PHONE_AGENT_DIAG_EVIDENCE` | bool | `false` | 诊断证据流（live-diagnosis 用） |
 | `PHONE_AGENT_DIAG_UNREDACTED` | bool | `false` | 本机诊断全保真模式 |
 | `PHONE_AGENT_RUNS_DIR` | path | `memory/runs` | runner 子进程运行目录（事件/控制通道） |
+| `PHONE_AGENT_DELIVERABLE` | bool | `true` | run 级 HTML 产出物能力（`write_document`/`update_document`） |
+| `PHONE_AGENT_DELIVERABLE_DIR` | path | `outputs/deliverables` | 产出物目录；文件固定为 `<run_id>.html`，上限 256 KiB |
+
+## 插件
+
+| 变量 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `PHONE_AGENT_PLUGINS` | bool | `true` | 外部插件总开关；`false` 关闭全部插件，内建能力不受影响 |
+| `PHONE_AGENT_PLUGIN_MANIFEST` | path | `<repo>/.taskwizard.toml` | 项目级插件清单路径覆盖 |
+| `PHONE_AGENT_PLUGIN_INDEX` | str | `plugins/index.json` | `plugin search` 索引源（URL 或本地 json） |
