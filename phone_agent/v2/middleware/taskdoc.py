@@ -211,8 +211,8 @@ class TaskDocInjector:
         header = _FLOW_HEADER["cn" if _is_cn(self.lang) else "en"].format(n=len(lines))
         return header + "\n" + "\n".join(lines)
 
-    def make_delta(self, messages: list) -> list[Any] | None:
-        """Return the messages to add (RemoveMessage + fresh SystemMessage) or ``None``."""
+    def _render_block(self, messages: list) -> str | None:
+        """Render the pinned ``[TASK_DOC]`` block (+ flow line), or ``None``."""
 
         doc = getattr(self.session, "task_doc", None)
         if doc is None:
@@ -230,6 +230,19 @@ class TaskDocInjector:
         flow = self._flow_block(messages)
         if flow:
             block = block + "\n\n" + flow
+        return block
+
+    def make_delta(self, messages: list) -> list[Any] | None:
+        """Return the messages to add (RemoveMessage + fresh SystemMessage) or ``None``.
+
+        Legacy reducer delta for the LangChain-middleware path
+        (``TaskDocMiddleware``). The ``model/pre_request`` listener
+        (``__call__``) never emits ``RemoveMessage``.
+        """
+
+        block = self._render_block(messages)
+        if block is None:
+            return None
 
         new_id = f"{TASKDOC_ID_PREFIX}{uuid.uuid4().hex}"
         out: list[Any] = []
@@ -242,12 +255,26 @@ class TaskDocInjector:
         return out
 
     def __call__(self, messages: list, _next: Callable[[Any], Any]) -> Any:
-        """``model/pre_request`` waterfall listener: transform then delegate."""
+        """``model/pre_request`` waterfall listener: full list in, full list out.
 
-        delta = self.make_delta(messages)
-        if delta is None:
+        Returns the complete transformed transcript — the previous pinned copy
+        (matched by id) is dropped and the fresh ``[TASK_DOC]`` block is
+        appended at the tail. Never emits a ``RemoveMessage``: the pre-request
+        bridge alone converts a full-list transform into the single legal
+        LangGraph update. Deriving the flow line here always sees a real full
+        transcript, so it stays truthful across compaction.
+        """
+
+        block = self._render_block(messages)
+        if block is None:
             return _next(messages)
-        return _next(list(messages) + delta)
+        out = list(messages)
+        if self._injected_id is not None:
+            out = [m for m in out if getattr(m, "id", None) != self._injected_id]
+        new_id = f"{TASKDOC_ID_PREFIX}{uuid.uuid4().hex}"
+        out.append(SystemMessage(content=block, id=new_id))
+        self._injected_id = new_id
+        return _next(out)
 
 
 class TaskDocMiddleware(AgentMiddleware):

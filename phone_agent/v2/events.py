@@ -48,8 +48,11 @@ Payload contracts for the plugin events:
 
 ``MODEL_PRE_REQUEST`` / ``"model/pre_request"``
     Applied with :meth:`EventBus.waterfall`. Payload is a copy of the model
-    request messages list. Listeners receive ``(payload, next)`` and may
-    return a replacement list, optionally wrapping the result of ``next``.
+    request messages list. Listeners receive ``(payload, next)`` and follow a
+    **full message list in, full message list out** contract: they return the
+    complete transformed transcript and must never put a ``RemoveMessage``
+    into the payload — the pre-request bridge alone converts the final list
+    into the single legal LangGraph ``REMOVE_ALL`` update.
 
 ``MODEL_REQUEST`` / ``"model/request"``
     Applied with :meth:`EventBus.waterfall`. Payload is the model call request
