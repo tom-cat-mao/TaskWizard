@@ -33,6 +33,11 @@ SUPPORTED_THINKING_FORMATS = (
 # (model does not support thinking -> omit the param silently).
 THINKING_MAP_UNSET = object()
 
+# Legal per-role thinking levels (models.json ``roles`` section).  An absent
+# or null value means "not written" (inherit the global level); unlike the
+# config env var there is no empty-string level here.
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high")
+
 
 @dataclass(frozen=True)
 class ProviderCompat:
@@ -146,6 +151,23 @@ class ProviderSpec:
 
     def get_model(self, model_id: str) -> ModelSpec | None:
         return self.models.get(model_id)
+
+
+@dataclass(frozen=True)
+class RoleSpec:
+    """Session-level per-role call configuration (models.json ``roles`` section).
+
+    ``model`` is a model reference (bare name or ``provider:model``) applied
+    only when the role's own env var is unset (same specificity -> env wins);
+    ``sampling_params`` is the highest-precedence sampling tier
+    (model entry < config env < roles); ``thinking`` overrides the global
+    thinking level for this role only.  ``None``/empty fields mean "not
+    written" — the legacy chain/config behavior passes through untouched.
+    """
+
+    model: str | None = None
+    sampling_params: dict = field(default_factory=dict)
+    thinking: str | None = None
 
 
 @dataclass(frozen=True)
