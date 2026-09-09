@@ -34,7 +34,9 @@ from phone_agent.v2.providers.loader import (
     ModelsFileError,
     build_provider_registry,
     candidate_paths,
+    load_raw_document,
     load_raw_file,
+    parse_models_document,
     parse_models_json,
 )
 from phone_agent.v2.providers.registry import (
@@ -43,12 +45,14 @@ from phone_agent.v2.providers.registry import (
     ProviderRegistryError,
     UnknownProviderError,
 )
-from phone_agent.v2.providers.roles import ROLES, resolve_role_ref
+from phone_agent.v2.providers.roles import ROLES, get_role_specs, resolve_role_ref
 from phone_agent.v2.providers.types import (
+    THINKING_LEVELS,
     ModelSpec,
     ProviderCompat,
     ProviderSpec,
     ResolvedModel,
+    RoleSpec,
 )
 
 
@@ -116,12 +120,17 @@ __all__ = [
     "candidate_paths",
     "effective_compat",
     "get_api_builder",
+    "get_role_specs",
+    "load_raw_document",
     "load_raw_file",
+    "parse_models_document",
     "parse_models_json",
     "register_api_builder",
     "register_provider",
     "registered_api_types",
     "resolve_role_ref",
+    "RoleSpec",
+    "THINKING_LEVELS",
     "translate_thinking",
     "unregister_api_builder",
 ]
