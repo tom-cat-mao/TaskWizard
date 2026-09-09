@@ -521,7 +521,11 @@ def _apply_providers(ctx: CapabilityAssemblyContext) -> None:
     assembles one from config.  Fail-open: an unusable models.json leaves the
     service unmounted and every role build degrades to the legacy
     single-gateway path.  Plugins register extra providers through
-    :func:`phone_agent.v2.providers.register_provider` on this service.
+    :func:`phone_agent.v2.providers.register_provider` on this service, and
+    custom transports (api -> builder mappings) through
+    :func:`phone_agent.v2.providers.register_api_builder` — both callable
+    directly from a plugin ``apply`` hook (assembly-time; the transport
+    registry is a process-global table, so no per-run ctx plumbing is needed).
     """
 
     config = ctx.service("config")
