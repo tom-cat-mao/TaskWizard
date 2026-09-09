@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from langchain_core.language_models.chat_models import BaseChatModel
@@ -100,6 +100,54 @@ def _legacy_role_build(config: "V2Config", role: str) -> "BaseChatModel":
     return build_chat_model(active)
 
 
+class _ConfigThinkingView:
+    """Read-only config view with only ``thinking`` overridden (P2 roles).
+
+    Lets the registry build path apply ``roles.<role>.thinking`` without
+    mutating or requiring a dataclass copy of the caller's config: every
+    other attribute (sampling, transport defaults, ...) passes through to
+    the inner config untouched.
+    """
+
+    def __init__(self, inner: "V2Config", thinking: str) -> None:
+        self._inner = inner
+        self._thinking = thinking
+
+    @property
+    def thinking(self) -> str:
+        return self._thinking
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _build_via_registry(config: "V2Config", *, role: str, registry: "ProviderRegistry") -> "BaseChatModel":
+    """Registry build path shared by build_chat_model/build_role_model.
+
+    Applies the models.json ``roles`` section (P2): ``roles.<role>.model``
+    feeds reference resolution (via ``resolve_role_ref``), the role's
+    ``sampling_params`` becomes the highest-precedence ``role_sampling`` tier,
+    and its ``thinking`` overrides the global level for this role only.
+    """
+
+    from phone_agent.v2.providers import build_model_from_resolved, resolve_role_ref
+    from phone_agent.v2.providers.roles import get_role_specs
+
+    ref = resolve_role_ref(config, role, registry=registry)
+    resolved = registry.resolve(ref)
+    spec = get_role_specs(registry).get(role)
+    active = config
+    if spec is not None:
+        if spec.thinking:
+            active = _ConfigThinkingView(config, spec.thinking)
+        return build_model_from_resolved(
+            resolved,
+            active,
+            role_sampling=spec.sampling_params or None,
+        )
+    return build_model_from_resolved(resolved, active)
+
+
 def build_role_model(
     config: "V2Config",
     *,
@@ -112,6 +160,9 @@ def build_role_model(
     ``_provider_registry`` side channel the harness leaves on config after
     assembling the actor model, then a lazily assembled registry from config
     (covers CLI paths such as ``--distill`` that never construct an agent).
+    When the registry carries a models.json ``roles`` section (P2), the
+    role's file entry applies: model reference (env tier still wins),
+    sampling params (highest tier), and per-role thinking override.
     Every registry/models.json failure fails open to the legacy
     single-gateway path with the role's model name substituted.
     """
@@ -124,14 +175,7 @@ def build_role_model(
         registry = build_provider_registry(config)
     if registry is not None:
         try:
-            from phone_agent.v2.providers import (
-                build_model_from_resolved,
-                resolve_role_ref,
-            )
-
-            ref = resolve_role_ref(config, role)
-            resolved = registry.resolve(ref)
-            return build_model_from_resolved(resolved, config)
+            return _build_via_registry(config, role=role, registry=registry)
         except Exception as exc:  # noqa: BLE001 - provider layer fails open
             logger.warning(
                 "provider registry path failed for role %s (%s); "
@@ -155,8 +199,10 @@ def build_chat_model(
     headers, sampling forwarding, ``parallel_tool_calls=False`` default).
     Passing a ``registry`` switches to the role-based provider path: the role's
     reference (bare model name or ``provider:model``) is resolved against the
-    registry and built through the matching api builder; any failure degrades
-    to the legacy path with the role's model name substituted.
+    registry and built through the matching api builder; the models.json
+    ``roles`` section (P2) applies its per-role sampling/thinking overrides;
+    any failure degrades to the legacy path with the role's model name
+    substituted.
 
     Sampling params (temperature/top_p/frequency_penalty) are forwarded as-is;
     the gateway + tool_calls + image_url content blocks are all verified compatible
@@ -166,14 +212,7 @@ def build_chat_model(
     if registry is None:
         return _build_legacy(config)
     try:
-        from phone_agent.v2.providers import (
-            build_model_from_resolved,
-            resolve_role_ref,
-        )
-
-        ref = resolve_role_ref(config, role)
-        resolved = registry.resolve(ref)
-        return build_model_from_resolved(resolved, config)
+        return _build_via_registry(config, role=role, registry=registry)
     except Exception as exc:  # noqa: BLE001 - provider layer fails open
         logger.warning(
             "provider registry path failed for role %s (%s); "

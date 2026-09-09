@@ -1,19 +1,26 @@
-"""models.json two-level loader with pi-style merge semantics (S4).
+"""models.json single-level loader with explicit-file priority (S4/P2).
 
 Search order (lowest to highest priority; later files win):
 
-1. user level   ``~/.config/taskwizard/models.json``
-2. project level ``.taskwizard.models.json`` (cwd)
-3. ``PHONE_AGENT_MODELS_FILE`` (V2Config.models_file) — an explicit extra file
+1. project level ``.taskwizard.models.json`` (cwd)
+2. ``PHONE_AGENT_MODELS_FILE`` (V2Config.models_file) — an explicit extra file
+
+(The former user-level ``~/.config/taskwizard/models.json`` layer was removed:
+one project, one registry — no hidden global state.)
 
 Merge semantics (pi-style): providers merge by id, models upsert by id, and a
 provider entry that only carries baseUrl/headers/compat keeps the existing
-model catalog intact.  Values (apiKey, baseUrl, header values) support
-``$ENV`` / ``${ENV}`` interpolation via :mod:`providers.values`.
+model catalog intact.  Top-level ``roles`` entries (per-role session-level
+call configuration, :class:`~phone_agent.v2.providers.types.RoleSpec`) upsert
+wholesale per role name — the later file's entry for a role replaces the
+earlier one.  Values (apiKey, baseUrl, header values) support ``$ENV`` /
+``${ENV}`` interpolation via :mod:`providers.values`.
 
-Every parse error is a :class:`ModelsFileError`; :func:`build_provider_registry`
-converts any failure into ``None`` (log + fall back to the legacy
-single-gateway behavior) — the provider layer never crashes a run.
+Role-section schema is fail-closed (:class:`ModelsFileError`): unknown role
+names and illegal thinking levels are rejected at parse time.  As with every
+parse error, :func:`build_provider_registry` converts the failure into
+``None`` (log + fall back to the legacy single-gateway behavior) — the
+provider layer never crashes a run.
 """
 
 from __future__ import annotations
@@ -23,7 +30,10 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from phone_agent.v2.providers.roles import ROLES
 from phone_agent.v2.providers.types import (
+    RoleSpec,
+    THINKING_LEVELS,
     ProviderCompat,
     ProviderSpec,
     ModelSpec,
@@ -56,16 +66,14 @@ class ModelsFileError(Exception):
     """A models.json file is malformed or references undefined env vars."""
 
 
-def user_models_path() -> Path:
-    """User-level registry file (computed lazily so tests can monkeypatch HOME)."""
-
-    return Path.home() / ".config" / "taskwizard" / "models.json"
-
-
 def candidate_paths(config: Any = None) -> list[Path]:
-    """Return the ordered models.json candidates (low -> high priority)."""
+    """Return the ordered models.json candidates (low -> high priority).
 
-    paths = [user_models_path(), Path.cwd() / PROJECT_MODELS_NAME]
+    Single-level (P2): the project file plus, when configured, the explicit
+    ``PHONE_AGENT_MODELS_FILE`` — no user-level layer.
+    """
+
+    paths = [Path.cwd() / PROJECT_MODELS_NAME]
     env_file = getattr(config, "models_file", None)
     if env_file:
         paths.append(Path(env_file))
@@ -218,29 +226,91 @@ def _parse_provider(provider_id: str, data: Any, *, env: dict[str, str]) -> Prov
     )
 
 
-def parse_models_json(data: Any, *, env: dict[str, str] | None = None) -> dict[str, ProviderSpec]:
-    """Parse a raw models.json document into ``{provider_id: ProviderSpec}``."""
+def _parse_role_entry(role: str, data: Any) -> RoleSpec:
+    """Parse one ``roles.<name>`` entry; fail closed on schema violations."""
 
     if not isinstance(data, dict):
-        raise ModelsFileError("models.json root must be an object")
-    providers_data = data.get("providers")
-    if providers_data is None:
+        raise ModelsFileError(
+            f"roles.{role} must be an object, got {type(data).__name__}"
+        )
+    model = data.get("model")
+    if model is not None:
+        if not isinstance(model, str):
+            raise ModelsFileError(f"roles.{role}.model must be a string")
+        model = model.strip() or None  # empty string counts as not written
+    sampling = data.get("samplingParams")
+    if sampling is None:
+        sampling = {}
+    elif not isinstance(sampling, dict):
+        raise ModelsFileError(f"roles.{role}.samplingParams must be an object")
+    thinking = data.get("thinking")
+    if thinking is not None and (
+        not isinstance(thinking, str) or thinking not in THINKING_LEVELS
+    ):
+        raise ModelsFileError(
+            f"roles.{role}.thinking must be one of {THINKING_LEVELS}, got {thinking!r}"
+        )
+    return RoleSpec(model=model, sampling_params=dict(sampling), thinking=thinking)
+
+
+def _parse_roles(data: dict[str, Any]) -> dict[str, RoleSpec]:
+    """Parse the top-level ``roles`` section (empty dict when absent)."""
+
+    roles_data = data.get("roles")
+    if roles_data is None:
         return {}
-    if not isinstance(providers_data, dict):
-        raise ModelsFileError("'providers' must be an object")
-    env_map = env  # None = resolve against os.environ (values.py default)
-    parsed: dict[str, ProviderSpec] = {}
-    for provider_id, entry in providers_data.items():
-        try:
-            parsed[str(provider_id)] = _parse_provider(str(provider_id), entry, env=env_map)
-        except ModelsFileError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - normalize to ModelsFileError
-            raise ModelsFileError(f"provider {provider_id!r}: {exc}") from exc
+    if not isinstance(roles_data, dict):
+        raise ModelsFileError("'roles' must be an object")
+    parsed: dict[str, RoleSpec] = {}
+    for name, entry in roles_data.items():
+        role = str(name)
+        if role not in ROLES:
+            raise ModelsFileError(
+                f"unknown role {role!r} in 'roles' (expected one of {ROLES})"
+            )
+        parsed[role] = _parse_role_entry(role, entry)
     return parsed
 
 
-def load_raw_file(path: Path) -> dict[str, ProviderSpec]:
+def parse_models_document(
+    data: Any, *, env: dict[str, str] | None = None
+) -> tuple[dict[str, ProviderSpec], dict[str, RoleSpec]]:
+    """Parse a raw models.json document into ``(providers, roles)``.
+
+    ``providers`` may be absent (a roles-only file is valid); the ``roles``
+    section is always validated, even through the providers-only wrapper
+    :func:`parse_models_json`.
+    """
+
+    if not isinstance(data, dict):
+        raise ModelsFileError("models.json root must be an object")
+    parsed: dict[str, ProviderSpec] = {}
+    providers_data = data.get("providers")
+    if providers_data is not None:
+        if not isinstance(providers_data, dict):
+            raise ModelsFileError("'providers' must be an object")
+        env_map = env  # None = resolve against os.environ (values.py default)
+        for provider_id, entry in providers_data.items():
+            try:
+                parsed[str(provider_id)] = _parse_provider(str(provider_id), entry, env=env_map)
+            except ModelsFileError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - normalize to ModelsFileError
+                raise ModelsFileError(f"provider {provider_id!r}: {exc}") from exc
+    return parsed, _parse_roles(data)
+
+
+def parse_models_json(data: Any, *, env: dict[str, str] | None = None) -> dict[str, ProviderSpec]:
+    """Parse a raw models.json document into ``{provider_id: ProviderSpec}``.
+
+    The ``roles`` section (if any) is validated as a side effect; use
+    :func:`parse_models_document` to read it.
+    """
+
+    return parse_models_document(data, env=env)[0]
+
+
+def load_raw_document(path: Path) -> tuple[dict[str, ProviderSpec], dict[str, RoleSpec]]:
     """Load and parse one models.json file; failures raise ModelsFileError."""
 
     try:
@@ -251,7 +321,13 @@ def load_raw_file(path: Path) -> dict[str, ProviderSpec]:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ModelsFileError(f"malformed JSON in {path}: {exc}") from exc
-    return parse_models_json(data)
+    return parse_models_document(data)
+
+
+def load_raw_file(path: Path) -> dict[str, ProviderSpec]:
+    """Providers view of :func:`load_raw_document` (roles validated, not returned)."""
+
+    return load_raw_document(path)[0]
 
 
 def build_provider_registry(config: Any = None) -> Any:
@@ -260,10 +336,18 @@ def build_provider_registry(config: Any = None) -> Any:
     The gateway provider is synthesized from V2Config (id ``"gateway"``,
     openai-completions, headers from ``build_default_headers`` so UA/CF Access
     survive) and models.json entries are applied on top via upsert semantics.
+    Parsed ``roles`` sections are attached to the returned registry as its
+    dynamic ``roles`` attribute (``dict[str, RoleSpec]``; empty dict when no
+    file declares roles; later files upsert wholesale per role name —
+    :class:`ProviderRegistry` itself stays provider-generic, the attach is
+    loader-side).  Read it back through
+    :func:`phone_agent.v2.providers.roles.get_role_specs`, which tolerates
+    registries built elsewhere (no attribute).
 
-    Fail-open contract: any error (missing env var, malformed JSON, unsupported
-    api, filesystem failure) logs a warning and returns ``None`` so callers
-    degrade to the legacy single-gateway behavior instead of crashing a run.
+    Fail-open contract: any error (missing env var, malformed JSON, unknown
+    role/thinking value, unsupported api, filesystem failure) logs a warning
+    and returns ``None`` so callers degrade to the legacy single-gateway
+    behavior instead of crashing a run.
     """
 
     from phone_agent.v2.providers.registry import (
@@ -288,11 +372,15 @@ def build_provider_registry(config: Any = None) -> Any:
             models={model_name: ModelSpec(id=model_name, name=model_name)} if model_name else {},
         )
         registry.register(gateway)
+        roles: dict[str, RoleSpec] = {}
         for path in candidate_paths(config):
             if not path.exists():
                 continue
-            for provider_id, spec in load_raw_file(path).items():
+            providers, file_roles = load_raw_document(path)
+            for provider_id, spec in providers.items():
                 registry.override(spec)
+            roles.update(file_roles)
+        registry.roles = roles  # loader-side attach (see docstring)
         return registry
     except Exception as exc:  # noqa: BLE001 - provider layer must never crash a run
         logger.warning("provider registry unavailable, using legacy gateway path: %s", exc)
