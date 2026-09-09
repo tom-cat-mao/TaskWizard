@@ -47,7 +47,25 @@ App 名解析默认 `PHONE_AGENT_RESOLVER_DECISION_MODE=typed`：lexical / pinyi
 `PHONE_AGENT_ALIAS_OVERWRITE=on|off` 控制 dream 的错误别名覆盖（默认 `on`）；`PHONE_AGENT_ALIAS_OVERWRITE_NOTES` 是逗号分隔的明确自述词表，默认 `开错,不对,不是,错了,wrong app`。事件只保存命中的词，不保存完整模型 note。
 `PHONE_AGENT_DELIVERABLE=on|off` 控制 `deliverable` 能力（默认 `on`）；开启后模型可把文档成果写入 `PHONE_AGENT_DELIVERABLE_DIR/<run_id>.html`（默认 `outputs/deliverables`），只能创建或全量更新本 run 的 UTF-8 单页 HTML，大小上限 256 KiB。成功路径会进入 episode 的可选 `deliverable_path` 字段，生产 trace 只记录 HTML 字节数，不记录正文。
 
-**模型提供方插件（models.json）**：默认零配置——所有角色都走 `.env` 里的 `PHONE_AGENT_MODEL` 网关，行为与旧版逐字段一致。需要多提供方/多模型时放一个 `models.json`（项目级 `.taskwizard.models.json` 或用户级 `~/.taskwizard/models.json`，`PHONE_AGENT_MODELS_FILE` 可显式指定，pi 风格两层合并）：声明 `providers`（`api: openai-completions | anthropic-messages | google-generative-ai`、`baseUrl`、`apiKey: "$ENV_VAR"`、每模型 `contextWindow/maxTokens/samplingParams/thinkingLevelMap`），之后角色环境变量（`PHONE_AGENT_MODEL`、`PHONE_AGENT_MEMORY_MODEL`、`PHONE_AGENT_VERIFIER_MODEL`、`PHONE_AGENT_SAFETY_REVIEWER_MODEL`；distill 沿用 memory 回落链）都可以写成 `provider:model` 把某个角色路由到第二模型，例如让 actor 留在本地网关、让 memory/verifier 走 `claude:claude-sonnet-4-5`。`PHONE_AGENT_THINKING=off|minimal|low|medium|high` 按模型声明的 `thinkingLevelMap` 翻译为各家思考配置，不支持的静默省略。`--list-models` 打印当前生效的提供方注册表。第三方插件也可以在装配期注册自己的 provider。未识别的 model 名落到默认 gateway 合成条目；未识别的 provider 快速失败并给出可见错误。
+**模型提供方插件（models.json）**：默认零配置——所有角色都走 `.env` 里的 `PHONE_AGENT_MODEL` 网关，行为与旧版逐字段一致。需要多提供方/多模型时放一个 `models.json`（项目根 `.taskwizard.models.json`，`PHONE_AGENT_MODELS_FILE` 可显式指定且优先；单层结构，无用户级文件）：声明 `providers`（`api: openai-completions | anthropic-messages | google-generative-ai`、`baseUrl`、`apiKey: "$ENV_VAR"`、每模型 `contextWindow/maxTokens/samplingParams/thinkingLevelMap`），之后角色环境变量（`PHONE_AGENT_MODEL`、`PHONE_AGENT_MEMORY_MODEL`、`PHONE_AGENT_VERIFIER_MODEL`、`PHONE_AGENT_SAFETY_REVIEWER_MODEL`；distill 沿用 memory 回落链）都可以写成 `provider:model` 把某个角色路由到第二模型，例如让 actor 留在本地网关、让 memory/verifier 走 `claude:claude-sonnet-4-5`。`PHONE_AGENT_THINKING=off|minimal|low|medium|high` 按模型声明的 `thinkingLevelMap` 翻译为各家思考配置，不支持的静默省略。`--list-models` 打印当前生效的提供方注册表。第三方插件也可以在装配期注册自己的 provider。未识别的 model 名落到默认 gateway 合成条目；未识别的 provider 快速失败并给出可见错误。
+
+**roles 段（每角色调用配置）**：`models.json` 顶层可选 `roles` 段，为五个角色（`actor`/`memory`/`verifier`/`safety_reviewer`/`distill`）单独指定模型与调用参数：
+
+```json
+{
+  "roles": {
+    "verifier": {
+      "model": "claude:claude-sonnet-4-5",
+      "samplingParams": { "temperature": 0 },
+      "thinking": "low"
+    }
+  }
+}
+```
+
+优先级规则是"针对性强的赢，同针对性 env 赢文件"：采样参数取 模型条目 < 全局环境变量 < `roles.<role>.samplingParams`；模型选择取 角色环境变量 > `roles.<role>.model` > 原回落链——注意 actor 的 `PHONE_AGENT_MODEL` 总是已设置，所以 `roles.actor.model` 不会生效；思考级别取 全局 `PHONE_AGENT_THINKING` < `roles.<role>.thinking`。未知角色名或非法 thinking 值会在加载时报错（fail-closed）。
+
+**自定义传输协议**：插件可在装配期通过 `phone_agent.v2.providers` 的 `register_api_builder(api_type, fn, *, override=False)` 注册 DSH 式 api 构建器，覆盖内建传输须 `override=True`；构建器签名为 `(provider, model, config, *, sampling, headers, level, compat) -> BaseChatModel`，未注册的 api 在派发时 fail-closed 并列出已注册类型。
 
 ```bash
 .venv/bin/python main_v2.py "打开设置进入 WLAN" --device-id <serial>

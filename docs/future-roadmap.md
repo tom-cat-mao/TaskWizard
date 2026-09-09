@@ -2,7 +2,7 @@
 
 > 本文档记录 roadmap 的阶段进展与未来方向。硬性执行约束见仓库根 `AGENTS.md`（P0 表）；v2 模块契约以 `phone_agent/v2/` docstring 为准（重构规格文档属工作稿，不入库）；历史批次执行任务书见 `docs/archive/`。
 >
-> **最新状态（2026-09-09）**：经验数据面（WP-I）、RAG shadow 回想（WP-I2）、隐式纠正（WP-I3）、能力注册表（WP-J）、观测加固（WP-O）、compact 记忆状态与缓存计量（WP-M）、经验提炼+晋升（WP-L）、受控经验回注（WP-A3，自进化闭环完成）、runner 子进程化（WP-R）、能力挂载层（WP-C2）、**插件系统全量（WP-PLUGIN A–E）**、**workflow 记忆（WP-WF1–3）**、**蒸馏全自动（WP-DISTILL-AUTO）**、**注入多源化（WP-WF4）**、**上下文与记忆加固（WP-MEMFIX：model/pre_request 瀑布纯全列表变换 + 桥接唯一 RemoveMessage；token 计量算工具参数/CJK 感知/无 usage 计双向；蒸馏游标 `(ts_end, run_id)` 失败重试 3 次放弃；撤销后重提自动降格；规则渲染行成本装箱；过程卡投递前权威视图复检；replay 口径正名 app_grounded_hit_rate + 重叠 run 不前视；任务板结构预算）**、**模型提供方插件（WP-PROVIDER：两层 models.json 注册表、三种 API 构建器、五角色 `provider:model` 路由、`PHONE_AGENT_THINKING` 思考级别翻译、`--list-models`，零配置逐字段回归，插件可注册 provider）**均已落地。通用长期记忆与经验注入已实现。剩余方向：prefix-cache 优化（评审中）、插件 API 真实插件验证（S3）、按任务复杂度的动态模型路由（远期）。
+> **最新状态（2026-09-09）**：经验数据面（WP-I）、RAG shadow 回想（WP-I2）、隐式纠正（WP-I3）、能力注册表（WP-J）、观测加固（WP-O）、compact 记忆状态与缓存计量（WP-M）、经验提炼+晋升（WP-L）、受控经验回注（WP-A3，自进化闭环完成）、runner 子进程化（WP-R）、能力挂载层（WP-C2）、**插件系统全量（WP-PLUGIN A–E）**、**workflow 记忆（WP-WF1–3）**、**蒸馏全自动（WP-DISTILL-AUTO）**、**注入多源化（WP-WF4）**、**上下文与记忆加固（WP-MEMFIX：model/pre_request 瀑布纯全列表变换 + 桥接唯一 RemoveMessage；token 计量算工具参数/CJK 感知/无 usage 计双向；蒸馏游标 `(ts_end, run_id)` 失败重试 3 次放弃；撤销后重提自动降格；规则渲染行成本装箱；过程卡投递前权威视图复检；replay 口径正名 app_grounded_hit_rate + 重叠 run 不前视；任务板结构预算）**、**模型提供方插件（WP-PROVIDER：单层 models.json 注册表、三种 API 构建器 + DSH 式可注册传输注册表（`register_api_builder`）、五角色 `provider:model` 路由、models.json `roles` 段每角色 model/sampling/thinking 调用配置、`PHONE_AGENT_THINKING` 思考级别翻译、`--list-models`，零配置逐字段回归，插件可注册 provider）**均已落地。通用长期记忆与经验注入已实现。剩余方向：prefix-cache 优化（评审中）、插件 API 真实插件验证（S3）、按任务复杂度的动态模型路由（远期）。
 
 ---
 

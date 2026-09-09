@@ -19,14 +19,26 @@
 
 ### 多提供方（models.json）
 
-默认零配置：所有角色走上面的网关，与旧版行为一致。声明额外提供方/模型时使用两层 `models.json`（项目级 `.taskwizard.models.json` 或用户级 `~/.taskwizard/models.json`，pi 风格合并，后者被前者覆盖），之后各角色模型变量都可写成 `provider:model` 路由到第二模型。
+默认零配置：所有角色走上面的网关，与旧版行为一致。声明额外提供方/模型时使用单层 `models.json`（项目根 `.taskwizard.models.json`，`PHONE_AGENT_MODELS_FILE` 显式指定时优先；用户级文件已不再读取），之后各角色模型变量都可写成 `provider:model` 路由到第二模型。
 
 | 变量 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `PHONE_AGENT_MODELS_FILE` | path | 无 | 显式指定 models.json，优先级最高 |
 | `PHONE_AGENT_THINKING` | `off`/`minimal`/`low`/`medium`/`high` | 不发送 | 思考级别；按模型声明的 `thinkingLevelMap` 翻译为各家原生配置（Anthropic budget_tokens / OpenAI reasoning_effort / Gemini thinkingConfig），不支持的静默省略 |
 
-models.json 条目字段：`api`（`openai-completions`/`anthropic-messages`/`google-generative-ai`）、`baseUrl`、`apiKey`（支持 `"$ENV_VAR"` 引用）、`headers`、`compat`（如 `thinkingFormat`）、`models[]`（`id`、`contextWindow`、`maxTokens`、`samplingParams`、`thinkingLevelMap`）、`modelOverrides`。采样参数合并顺序：模型条目 < 环境变量 < 角色覆盖。`--list-models` 打印生效注册表。
+models.json 条目字段：`api`（`openai-completions`/`anthropic-messages`/`google-generative-ai`）、`baseUrl`、`apiKey`（支持 `"$ENV_VAR"` 引用）、`headers`、`compat`（如 `thinkingFormat`）、`models[]`（`id`、`contextWindow`、`maxTokens`、`samplingParams`、`thinkingLevelMap`）、`modelOverrides`、可选顶层 `roles` 段（见下）。采样参数合并顺序：模型条目 < 环境变量 < 角色覆盖。`--list-models` 打印生效注册表。
+
+#### roles 段（每角色调用配置）
+
+`models.json` 顶层可选 `roles` 段，键为角色名，值为该角色的调用配置：
+
+| 键 | 说明 | 优先级 |
+|---|---|---|
+| `roles.<role>.model` | 模型引用（裸模型名或 `provider:model`） | 角色环境变量 > 此处 > 原回落链；actor 的 `PHONE_AGENT_MODEL` 总是已设置，故 `roles.actor.model` 不生效 |
+| `roles.<role>.samplingParams` | 采样参数对象 | 模型条目 < 全局环境变量 < 此处（最强） |
+| `roles.<role>.thinking` | `off`/`minimal`/`low`/`medium`/`high` | 全局 `PHONE_AGENT_THINKING` < 此处 |
+
+`<role>` ∈ `actor`/`memory`/`verifier`/`safety_reviewer`/`distill`；未知角色名或非法 thinking 值加载时报错（fail-closed）。
 
 ## 运行控制
 
