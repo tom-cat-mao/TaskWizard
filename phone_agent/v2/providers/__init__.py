@@ -5,6 +5,10 @@ Public surface:
 * :class:`ProviderRegistry` / :func:`build_provider_registry` — the registry
   and its config-driven assembly (built-in gateway + models.json).
 * :func:`build_model_from_resolved` — api -> BaseChatModel builders.
+* :func:`register_api_builder` / :func:`unregister_api_builder` /
+  :func:`registered_api_types` — the DSH-style transport registry: custom
+  ``api`` -> builder mappings (or atomic built-in replacement), callable from
+  a plugin ``apply`` hook just like :func:`register_provider`.
 * :func:`resolve_role_ref` — the five LLM roles' fallback chains.
 * :func:`register_provider` — the plugin-facing helper for adding a provider
   through the capability context.
@@ -20,7 +24,11 @@ from typing import Any
 from phone_agent.v2.providers.builders import (
     build_model_from_resolved,
     effective_compat,
+    get_api_builder,
+    register_api_builder,
+    registered_api_types,
     translate_thinking,
+    unregister_api_builder,
 )
 from phone_agent.v2.providers.loader import (
     ModelsFileError,
@@ -107,9 +115,13 @@ __all__ = [
     "build_provider_registry",
     "candidate_paths",
     "effective_compat",
+    "get_api_builder",
     "load_raw_file",
     "parse_models_json",
+    "register_api_builder",
     "register_provider",
+    "registered_api_types",
     "resolve_role_ref",
     "translate_thinking",
+    "unregister_api_builder",
 ]
