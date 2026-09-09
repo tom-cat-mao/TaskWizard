@@ -17,6 +17,29 @@
 | `PHONE_AGENT_HTTP_HEADERS` | str | 无 | 附加请求头，格式 `K1=V1;K2=V2` |
 | `PHONE_AGENT_USER_AGENT` | str | 内置 UA | 覆盖默认 User-Agent |
 
+### 多提供方（models.json）
+
+默认零配置：所有角色走上面的网关，与旧版行为一致。声明额外提供方/模型时使用单层 `models.json`（项目根 `.taskwizard.models.json`，`PHONE_AGENT_MODELS_FILE` 显式指定时优先；用户级文件已不再读取），之后各角色模型变量都可写成 `provider:model` 路由到第二模型。
+
+| 变量 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `PHONE_AGENT_MODELS_FILE` | path | 无 | 显式指定 models.json，优先级最高 |
+| `PHONE_AGENT_THINKING` | `off`/`minimal`/`low`/`medium`/`high` | 不发送 | 思考级别；按模型声明的 `thinkingLevelMap` 翻译为各家原生配置（Anthropic budget_tokens / OpenAI reasoning_effort / Gemini thinkingConfig），不支持的静默省略 |
+
+models.json 条目字段：`api`（`openai-completions`/`anthropic-messages`/`google-generative-ai`）、`baseUrl`、`apiKey`（支持 `"$ENV_VAR"` 引用）、`headers`、`compat`（如 `thinkingFormat`）、`models[]`（`id`、`contextWindow`、`maxTokens`、`samplingParams`、`thinkingLevelMap`）、`modelOverrides`、可选顶层 `roles` 段（见下）。采样参数合并顺序：模型条目 < 环境变量 < 角色覆盖。`--list-models` 打印生效注册表。
+
+#### roles 段（每角色调用配置）
+
+`models.json` 顶层可选 `roles` 段，键为角色名，值为该角色的调用配置：
+
+| 键 | 说明 | 优先级 |
+|---|---|---|
+| `roles.<role>.model` | 模型引用（裸模型名或 `provider:model`） | 角色环境变量 > 此处 > 原回落链；actor 的 `PHONE_AGENT_MODEL` 总是已设置，故 `roles.actor.model` 不生效 |
+| `roles.<role>.samplingParams` | 采样参数对象 | 模型条目 < 全局环境变量 < 此处（最强） |
+| `roles.<role>.thinking` | `off`/`minimal`/`low`/`medium`/`high` | 全局 `PHONE_AGENT_THINKING` < 此处 |
+
+`<role>` ∈ `actor`/`memory`/`verifier`/`safety_reviewer`/`distill`；未知角色名或非法 thinking 值加载时报错（fail-closed）。
+
 ## 运行控制
 
 | 变量 | 类型 | 默认值 | 说明 |
@@ -35,6 +58,8 @@
 | `PHONE_AGENT_COMPACT` | bool | `true` | auto-compact 总开关 |
 | `PHONE_AGENT_COMPACT_WARN_RATIO` | float | `0.75` | 上下文占窗口比例达到此值时提醒模型收敛 |
 | `PHONE_AGENT_COMPACT_TRIGGER_RATIO` | float | `0.92` | 达到此值时生成 handoff 摘要并折叠历史 |
+| `PHONE_AGENT_COMPACT_SCHEMA_RESERVE` | int | `3000` | T1/T2 比较时为随每轮请求发送的序列化工具 schema 预留的 token 数（估算不可见部分） |
+| `PHONE_AGENT_COMPACT_OUTPUT_RESERVE` | int | `2000` | T1/T2 比较时为下一轮回复预留的 token 数 |
 | `PHONE_AGENT_CONTEXT_WINDOW` | int | 按模型推断，兜底 `256000` | 手动覆盖上下文窗口大小 |
 | `PHONE_AGENT_MEMORY_MODEL` | str | 主模型 | compact 摘要使用的模型 |
 | `PHONE_AGENT_IMAGE_KEEP` | int | `2` | 历史中保留的含图消息数 |

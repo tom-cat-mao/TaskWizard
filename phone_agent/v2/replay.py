@@ -18,31 +18,34 @@ channel rebuilds the lesson card pool from the lesson event log.
     the cross-app ``general`` pool) and its soft ranking (cosine between the
     goal vector and the card ``title + steps`` vector), and take the top-1.
 
-Relevance is a proxy, not a measurement (procedure channel)
-    Offline replay can only score a *proxy* for semantic relevance:
+``app_grounded_hit_rate`` is NOT semantic relevance (procedure channel)
+    Offline replay can only score a *proxy*:
 
     * the app half is free — the hard filter already guarantees that a hit
       card's ``app_scope`` is a package the episode really launched, so an
-      app-scoped hit is relevant by construction and can never be a false
+      app-scoped hit is app-grounded by construction and can never be a false
       positive on that axis;
     * the semantic half degenerates into "the top-1 cosine cleared
       ``min_score``", i.e. vector similarity to the goal text, which is *not*
       evidence that the card's steps actually applied to that goal.
 
-    So ``relevance_rate`` (relevant / covered) really measures "of the covered
-    episodes, how many were app-grounded rather than served by the cross-app
-    ``general`` pool" — episodes with no launch receipt can never score
-    relevant, which biases the rate down.  It is a floor, not an estimate, of
-    true semantic alignment.  Whether an injected card actually helps is an
-    online question: design §6 cuts the control group, so only injection ids
-    land in the trace/episode for later analysis.
+    The metric formerly (mis)named ``relevance_rate`` is therefore
+    ``app_grounded_hit_rate``: of the covered episodes, how many were
+    app-grounded rather than served by the cross-app ``general`` pool.
+    Episodes with no launch receipt can never score an app-grounded hit,
+    which biases the rate down.  It is a floor, not an estimate, of true
+    semantic alignment — an unrelated card from the *right* app counts as an
+    app-grounded hit, so the number must never be read as "the card was
+    relevant".  Whether an injected card actually helps is an online
+    question: design §6 cuts the control group, so only injection ids land in
+    the trace/episode for later analysis.
 
 steps-delta is N/A (procedure channel)
     A card is distilled *from* the episodes that would have to form its
     counterfactual, so there is no step count to subtract and no way to replay
     an alternative history.  The gate is reported as ``N/A`` and is excluded
     from the verdict: the procedure channel passes or fails on coverage and
-    relevance alone.
+    the app-grounded hit rate alone.
 """
 
 from __future__ import annotations
@@ -80,7 +83,7 @@ PROCEDURE_SWEEP_START = 0.30
 PROCEDURE_SWEEP_STOP = 0.70
 PROCEDURE_SWEEP_STEP = 0.05
 PROCEDURE_COVERAGE_TARGET = 0.30
-PROCEDURE_RELEVANCE_TARGET = 0.60
+PROCEDURE_APP_GROUNDED_TARGET = 0.60
 
 _STEPS_DELTA_NA: dict[str, Any] = {
     "applicable": False,
@@ -105,9 +108,14 @@ def replay_exemplar_metrics(
 ) -> dict[str, Any]:
     """Replay episodes chronologically and score the exemplar channel.
 
-    The replay simulates each run's start-of-run recall window: a run may only
-    see episodes that ended before it.  An in-memory ``VecIndex`` is rebuilt from
-    the experience log so the metric never mutates production indexes.
+    The replay simulates each run's start-of-run recall window under a strict
+    no-lookahead guard: a candidate episode is eligible only when
+    ``candidate.ts_end < query.ts_start``.  Episodes are indexed in ``ts_end``
+    order (production behavior: always attempt to index, even below the
+    quality gate), but overlapping runs make ``ts_end`` order alone
+    insufficient — without the guard a query run could recall a candidate that
+    had not even started yet.  An in-memory ``VecIndex`` is rebuilt from the
+    experience log so the metric never mutates production indexes.
     """
 
     events_path = Path(experience_dir) / "events.jsonl"
@@ -142,6 +150,18 @@ def replay_exemplar_metrics(
                     min_score=min_score,
                     now=now,
                 )
+                query_ts_start = float(event.get("ts_start", 0.0) or 0.0)
+                # Strict no-lookahead guard: a candidate is eligible only when
+                # it ended before this run started (overlapping runs never
+                # qualify, even though the index already holds them).
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if _ended_before_start(
+                        run_by_id.get(str(candidate.get("ref_id"))),
+                        query_ts_start,
+                    )
+                ]
                 if candidates:
                     top = candidates[0]
                     runs_with_candidates += 1
@@ -229,6 +249,20 @@ def replay_exemplar_metrics(
         },
         "details": details,
     }
+
+
+def _ended_before_start(
+    candidate_event: Mapping[str, Any] | None, query_ts_start: float
+) -> bool:
+    """No-lookahead eligibility: ``candidate.ts_end < query.ts_start``."""
+
+    if candidate_event is None:
+        return False
+    try:
+        candidate_ts_end = float(candidate_event.get("ts_end", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return candidate_ts_end < query_ts_start
 
 
 def _event_ts(event: Mapping[str, Any], *, floor: float) -> float:
@@ -395,11 +429,19 @@ def replay_procedure_metrics(
     top-1 ranking against the goal.  ``steps_delta`` is reported as N/A — see
     the module docstring.
 
+    The hit-rate metric is ``app_grounded_hit_rate`` — of the covered
+    episodes, how many were hit by an app-grounded card rather than the
+    cross-app ``general`` pool.  It is **not** semantic relevance: candidates
+    are already hard-filtered to the episode's launched packages, so an
+    unrelated card from the right app counts as an app-grounded hit (see the
+    module docstring).
+
     ``calibrate=True`` drops the no-time-travel invariant: every episode is
     scored against the **final** injectable pool.  This exists solely for
     threshold tuning on cold-start data (cards distilled from the very
     episodes being replayed are otherwise invisible to all of them); its
-    numbers must never feed ``channel_recommended``.
+    numbers must never feed ``channel_recommended`` — the output is marked
+    ``calibrate_only`` and the verdict is forced ``False``.
     """
 
     events_path = Path(experience_dir) / "events.jsonl"
@@ -447,7 +489,7 @@ def replay_procedure_metrics(
                 "hit_app_scope": None,
                 "hit_score": None,
                 "covered": False,
-                "relevant": False,
+                "app_grounded_hit": False,
                 "_goal": str(event.get("goal_text", "")),
                 "_packages": packages,
                 "_candidates": candidates,
@@ -488,7 +530,12 @@ def replay_procedure_metrics(
             row["hit_app_scope"] = hit.app_scope
             row["hit_score"] = hit_score
             row["covered"] = hit_score >= min_score
-            row["relevant"] = row["covered"] and hit.app_scope in row["_packages"]
+            # NOT semantic relevance: candidates were already hard-filtered to
+            # this episode's launched packages, so this only records whether
+            # the top-1 hit came from the app pool (vs the ``general`` pool).
+            row["app_grounded_hit"] = (
+                row["covered"] and hit.app_scope in row["_packages"]
+            )
 
     details: list[dict[str, Any]] = []
     for row in rows:
@@ -502,15 +549,17 @@ def replay_procedure_metrics(
 
     runs_with_pool = sum(1 for row in rows if row["queried"] and row["pool_size"] > 0)
     covered = sum(1 for row in rows if row["covered"])
-    relevant = sum(1 for row in rows if row["relevant"])
+    app_grounded_hits = sum(1 for row in rows if row["app_grounded_hit"])
     coverage_rate = round(covered / runs_total, 6) if runs_total else 0.0
     coverage_rate_over_pool = (
         round(covered / runs_with_pool, 6) if runs_with_pool else 0.0
     )
-    relevance_rate = round(relevant / covered, 6) if covered else 0.0
+    app_grounded_hit_rate = (
+        round(app_grounded_hits / covered, 6) if covered else 0.0
+    )
 
     coverage_ok = coverage_rate >= PROCEDURE_COVERAGE_TARGET
-    relevance_ok = relevance_rate >= PROCEDURE_RELEVANCE_TARGET
+    app_grounded_ok = app_grounded_hit_rate >= PROCEDURE_APP_GROUNDED_TARGET
 
     return {
         "channel": "procedure",
@@ -526,22 +575,27 @@ def replay_procedure_metrics(
         "runs_queried": sum(1 for row in rows if row["queried"]),
         "runs_with_pool": runs_with_pool,
         "covered": covered,
-        "relevant": relevant,
+        "app_grounded_hits": app_grounded_hits,
         "coverage_rate": coverage_rate,
         "coverage_rate_over_pool": coverage_rate_over_pool,
-        "relevance_rate": relevance_rate,
+        "app_grounded_hit_rate": app_grounded_hit_rate,
         "steps_delta": dict(_STEPS_DELTA_NA),
         "gates": {
             "coverage_ok": coverage_ok,
-            "relevance_ok": relevance_ok,
+            "app_grounded_ok": app_grounded_ok,
             "delta_ok": None,
             "delta_note": "n/a",
-            "channel_recommended": coverage_ok and relevance_ok,
+            "channel_recommended": (
+                coverage_ok and app_grounded_ok if not calibrate else False
+            ),
         },
         "targets": {
             "coverage": PROCEDURE_COVERAGE_TARGET,
-            "relevance": PROCEDURE_RELEVANCE_TARGET,
+            "app_grounded": PROCEDURE_APP_GROUNDED_TARGET,
         },
+        # calibrate runs break no-time-travel for threshold tuning only:
+        # their numbers must never feed the channel verdict.
+        "calibrate_only": bool(calibrate),
         "details": details,
     }
 
@@ -564,18 +618,24 @@ def sweep_procedure_thresholds(
     start: float = PROCEDURE_SWEEP_START,
     stop: float = PROCEDURE_SWEEP_STOP,
     step: float = PROCEDURE_SWEEP_STEP,
-    relevance_target: float = PROCEDURE_RELEVANCE_TARGET,
+    app_grounded_target: float = PROCEDURE_APP_GROUNDED_TARGET,
     calibrate: bool = False,
 ) -> dict[str, Any]:
     """Score the procedure channel across a ``min_score`` grid.
 
     The replay runs once: every row keeps its top-1 score, so each threshold
     just re-counts the same per-episode scores.  The recommended knee is the
-    threshold with the **highest coverage** among those whose relevance clears
-    ``relevance_target``; ties break on higher relevance, then on the loosest
-    threshold (more recall at equal quality).  When no threshold reaches the
-    relevance target the recommendation is ``None`` and the reason says so
-    rather than silently returning a threshold that failed the gate.
+    threshold with the **highest coverage** among those whose
+    ``app_grounded_hit_rate`` clears ``app_grounded_target``; ties break on
+    higher hit rate, then on the loosest threshold (more recall at equal
+    quality).  When no threshold reaches the target the recommendation is
+    ``None`` and the reason says so rather than silently returning a threshold
+    that failed the gate.
+
+    ``calibrate=True`` keeps the sweep usable for cold-start threshold tuning
+    (that is its purpose) but marks the output ``calibrate_only``: the
+    underlying replay broke no-time-travel, so these numbers describe the
+    final pool, never the channel as it would have run.
     """
 
     result = replay_procedure_metrics(
@@ -596,41 +656,44 @@ def sweep_procedure_thresholds(
             for row in rows
             if row["hit_score"] is not None and row["hit_score"] >= threshold
         ]
-        relevant = [row for row in covered if row["relevant"]]
+        app_grounded = [
+            row for row in covered if row["app_grounded_hit"]
+        ]
         table.append(
             {
                 "min_score": threshold,
                 "covered": len(covered),
-                "relevant": len(relevant),
+                "app_grounded_hits": len(app_grounded),
                 "coverage_rate": (
                     round(len(covered) / runs_total, 6) if runs_total else 0.0
                 ),
-                "relevance_rate": (
-                    round(len(relevant) / len(covered), 6) if covered else 0.0
+                "app_grounded_hit_rate": (
+                    round(len(app_grounded) / len(covered), 6) if covered else 0.0
                 ),
             }
         )
 
     eligible = [
-        row for row in table if row["relevance_rate"] >= relevance_target
+        row for row in table if row["app_grounded_hit_rate"] >= app_grounded_target
     ]
     if eligible:
         best = max(
             eligible,
-            key=lambda row: (row["coverage_rate"], row["relevance_rate"], -row["min_score"]),
+            key=lambda row: (row["coverage_rate"], row["app_grounded_hit_rate"], -row["min_score"]),
         )
         reason = (
-            "highest coverage among thresholds whose relevance >= "
-            f"{relevance_target}; ties break on relevance, then the loosest threshold"
+            "highest coverage among thresholds whose app_grounded_hit_rate >= "
+            f"{app_grounded_target}; ties break on the hit rate, then the loosest threshold"
         )
     elif table:
         best = max(
             table,
-            key=lambda row: (row["relevance_rate"], row["coverage_rate"], -row["min_score"]),
+            key=lambda row: (row["app_grounded_hit_rate"], row["coverage_rate"], -row["min_score"]),
         )
         reason = (
-            f"no threshold reached relevance >= {relevance_target}; showing the "
-            "best-relevance row for inspection — the channel is not recommended"
+            f"no threshold reached app_grounded_hit_rate >= {app_grounded_target}; "
+            "showing the best hit-rate row for inspection — the channel is not"
+            " recommended"
         )
     else:
         best = None
@@ -644,9 +707,10 @@ def sweep_procedure_thresholds(
         "channel": "procedure",
         "status": result["status"],
         "note": result["note"],
+        "calibrate_only": bool(calibrate),
         "runs_total": runs_total,
         "runs_with_pool": result["runs_with_pool"],
-        "relevance_target": relevance_target,
+        "app_grounded_target": app_grounded_target,
         "thresholds": table,
         "recommended": None if best is None else dict(best),
         "recommended_reason": reason,

@@ -96,6 +96,9 @@ openautoglm-vs-deepagents.html
 # Agent long-term memory (runtime state, never commit)
 memory/
 
+# Local model provider registry (S4): may contain $ENV-resolved key material
+.taskwizard.models.json
+
 # Local working documents — never tracked
 docs/
 

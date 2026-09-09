@@ -273,7 +273,9 @@ def test_reviewer_records_shared_ledger_with_reported_or_estimated_usage(
     ledger = UsageLedger()
     session = SimpleNamespace(usage_ledger=ledger)
     model = _FakeModel(_response("REVERSIBLE", reported))
-    monkeypatch.setattr("phone_agent.v2.model.build_chat_model", lambda config: model)
+    monkeypatch.setattr(
+        "phone_agent.v2.model.build_role_model", lambda config, **kwargs: model
+    )
 
     reviewer = build_safety_reviewer(_ReviewerConfig(), session=session)
 

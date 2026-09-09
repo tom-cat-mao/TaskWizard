@@ -622,10 +622,17 @@ def run_dry(args: argparse.Namespace, run_dir: Path) -> tuple[Any, Any]:
     session = DrySession(config)
     responses = [
         _tool_call("read_screen", {}, "c1"),
+        # A4/S3 transition discipline: a route item enters as in_progress and
+        # only then completes (with evidence) — never created already-completed.
+        _tool_call(
+            "update_task_doc",
+            {"items": [{"id": "s1", "content": "打开设置页", "status": "in_progress"}]},
+            "c2",
+        ),
         _tool_call(
             "update_task_doc",
             {"items": [{"id": "s1", "content": "打开设置页", "status": "completed", "evidence_note": "screen#1 设置页可见"}]},
-            "c2",
+            "c2b",
         ),
         _tool_call("tap", {"target_mark_id": "ax_1"}, "c3"),
         _tool_call(
@@ -638,7 +645,7 @@ def run_dry(args: argparse.Namespace, run_dir: Path) -> tuple[Any, Any]:
     model = ScriptedToolModel(responses=responses)
 
     model_mod = types.ModuleType("phone_agent.v2.model")
-    model_mod.build_chat_model = lambda cfg: model
+    model_mod.build_chat_model = lambda cfg, *args, **kwargs: model
     session_mod = types.ModuleType("phone_agent.v2.session")
     session_mod.PhoneSession = lambda cfg: session
     tools_mod = types.ModuleType("phone_agent.v2.tools")

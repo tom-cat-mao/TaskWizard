@@ -24,7 +24,13 @@ from typing import Any, Callable, Mapping
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import hook_config
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from phone_agent.v2.capabilities import (
     CapabilityAssemblyContext,
@@ -188,8 +194,14 @@ def _first_observation_content(
 class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
     """Bridge ``model/pre_request`` event listeners into the middleware stack.
 
-    Listeners registered on the event bus may return a replacement messages
-    list; when no listener changes the payload this middleware is a no-op.
+    The waterfall contract is **full message list in, full message list out**:
+    listeners transform the transcript and never emit ``RemoveMessage``. The
+    bridge mints the single legal LangGraph update — one ``REMOVE_ALL``
+    sentinel followed by the complete transformed list — so ``add_messages``
+    replaces state verbatim with the chain's output. A listener that leaked a
+    ``RemoveMessage`` into the payload would survive ``add_messages``
+    (``right[remove_all_idx + 1:]`` is taken verbatim, no further removals are
+    resolved) and kill the next model call at the wire converter.
     """
 
     def __init__(self, event_bus: EventBus) -> None:
@@ -204,16 +216,20 @@ class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
         )
         if result is messages:
             return None
-        # Circuit-breaker sentinels become a graph jump. A listener may also return
-        # a dict that already carries ``jump_to="end"`` plus optional messages.
+        # Circuit-breaker sentinels become a graph jump. A listener may also
+        # return a dict that already carries ``jump_to="end"`` plus optional
+        # messages (the hard budget ceiling) — pass it through unchanged.
         if result is JUMP_END:
             return {"jump_to": "end"}
         if isinstance(result, dict):
             if result.get("jump_to") == "end":
                 return result
-            if "messages" in result:
-                return result
-        return {"messages": result}
+            if "messages" not in result:
+                return None
+            # Legacy-shaped update dict without a jump: normalize to the full
+            # message list it carries and run it through the same single mint.
+            result = result["messages"] or []
+        return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *result]}
 
     @hook_config(can_jump_to=["end"])
     async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:  # noqa: ANN001
@@ -444,7 +460,20 @@ class ThinPhoneAgent:
         self.session.event_bus = self.event_bus
         self.usage_ledger = UsageLedger()
         self.session.usage_ledger = self.usage_ledger
-        self.model = build_chat_model(config)
+        # S4 provider registry: assembled once here (built-in gateway +
+        # models.json), reused by the actor build below, the ``providers``
+        # capability (ctx service ``provider_registry``), and every auxiliary
+        # role build via the ``_provider_registry`` side channel on config.
+        # Fail-open: an unusable models.json yields None and every role build
+        # degrades to the legacy single-gateway path.
+        from phone_agent.v2.providers import build_provider_registry
+
+        self.provider_registry = build_provider_registry(config)
+        try:
+            config._provider_registry = self.provider_registry
+        except Exception:  # noqa: BLE001 - side channel is best-effort
+            pass
+        self.model = build_chat_model(config, role="actor", registry=self.provider_registry)
         build_base_tools = getattr(tools_module, "build_base_tools", None)
         native_tool_assembly = callable(build_base_tools)
 
@@ -913,7 +942,9 @@ class ThinPhoneAgent:
         suffix = str(getattr(self, "_app_kb_prompt_suffix", ""))
         return PromptBlock(suffix, placement="system_suffix") if suffix else None
 
-    def _prepare_lesson_injection(self, device_scope: str) -> None:
+    def _prepare_lesson_injection(
+        self, device_scope: str, goal_text: str = ""
+    ) -> None:
         """Freeze one approved-only L0 lesson snapshot for this run."""
 
         self._run_injected_lessons: list[Any] = []
@@ -927,6 +958,7 @@ class ThinPhoneAgent:
                 device_scope=device_scope,
                 max_items=getattr(self.config, "lesson_inject_max", 3),
                 max_tokens=getattr(self.config, "lesson_inject_tokens", 800),
+                goal_text=goal_text or None,
             )
             revoked = set(getattr(self, "_revoked_lesson_ids", set()))
             self._run_injected_lessons = [
@@ -1086,7 +1118,9 @@ class ThinPhoneAgent:
             and getattr(self.config, "memory_rag", "off") == "on"
         ):
             state["device_scope"] = self._experience_device_scope()
-        self._prepare_lesson_injection(str(state["device_scope"]))
+        self._prepare_lesson_injection(
+            str(state["device_scope"]), goal_text=str(state.get("task", ""))
+        )
         self._prepare_procedure_injection(str(state["task"]))
 
     def _recall_run_end(self, state: dict[str, Any]) -> None:
@@ -1243,9 +1277,19 @@ class ThinPhoneAgent:
                 trace_payload["reason"] = "device_scope_unavailable"
             else:
                 embedder = self._recall_embedder_instance()
+                # Scoped selection-error observers: the shadow index reports
+                # to the recall capability's mount registry when one is
+                # mounted (otherwise this index gets its own empty registry
+                # and stays silent).
+                capability_ctx = getattr(self, "_capability_ctx", None)
                 with VecIndex(
                     getattr(self.config, "vec_db", "memory/vec.db"),
                     embedder=embedder,
+                    selection_error_observers=(
+                        capability_ctx.service("recall_selection_observers")
+                        if capability_ctx is not None
+                        else None
+                    ),
                 ) as index:
                     self._shadow_candidates = index.recall(
                         task,
@@ -1535,7 +1579,9 @@ class ThinPhoneAgent:
                 or getattr(self.config, "memory_rag", "off") == "on"
             ):
                 run_state["device_scope"] = self._experience_device_scope()
-            self._prepare_lesson_injection(str(run_state["device_scope"]))
+            self._prepare_lesson_injection(
+                str(run_state["device_scope"]), goal_text=str(run_state.get("task", ""))
+            )
         device_scope = str(run_state["device_scope"])
         self._emit_run_event(RUN_START, run_state)
         # Reset per-run one-shot flags so a reused agent behaves like a fresh run

@@ -393,10 +393,22 @@ def _demoted_status(candidate: LessonCandidate) -> str:
     return "needs_review" if candidate.kind == "procedure" else "proposed"
 
 
-def _replay_lesson_events(events_path: Path) -> dict[str, LessonCandidate]:
+def _replay_lesson_events(
+    events_path: Path,
+) -> tuple[dict[str, LessonCandidate], set[str]]:
+    """Rebuild the current lesson view plus the durable revocation guard.
+
+    The guard is the set of lesson ids that a human revoked and has not
+    re-accepted by a human approval since.  It is derived from the
+    authoritative event log, so it survives process restarts and view rebuilds;
+    only ``lesson_approved`` clears an entry — superseding a revoked lesson
+    keeps the guard until the replacement is actually approved.
+    """
+
     current: dict[str, LessonCandidate] = {}
+    revoked_guard: set[str] = set()
     if not events_path.exists():
-        return current
+        return current, revoked_guard
     with events_path.open("r", encoding="utf-8") as stream:
         for line in stream:
             try:
@@ -428,8 +440,10 @@ def _replay_lesson_events(events_path: Path) -> dict[str, LessonCandidate]:
                     continue
                 if kind == "lesson_approved" and candidate.status in _APPROVABLE_STATUSES:
                     current[lesson_id] = replace(candidate, status="approved")
+                    revoked_guard.discard(lesson_id)
                 elif kind == "lesson_revoked" and candidate.status != "revoked":
                     current[lesson_id] = replace(candidate, status="revoked")
+                    revoked_guard.add(lesson_id)
                 elif (
                     kind == "lesson_demoted"
                     and candidate.status in _DEMOTABLE_STATUSES
@@ -441,7 +455,7 @@ def _replay_lesson_events(events_path: Path) -> dict[str, LessonCandidate]:
                     )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
-    return current
+    return current, revoked_guard
 
 
 class LessonStore:
@@ -454,7 +468,7 @@ class LessonStore:
         self._lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
         self.events_path.touch(exist_ok=True)
-        self._lessons = _replay_lesson_events(self.events_path)
+        self._lessons, self._revoked_guard = _replay_lesson_events(self.events_path)
         self._write_view()
 
     def lessons(self, *, status: str | None = None) -> list[LessonCandidate]:
@@ -513,8 +527,16 @@ class LessonStore:
                 # even when v1 was approved; it still requires another human
                 # approval and can never inherit approved status automatically.
                 # A freshly graded procedure card keeps the verdict it was filed
-                # with (proposed, needs_review, or auto_approved).
+                # with (proposed, needs_review, or auto_approved) — unless the
+                # id sits under the revocation guard (S2): a human revoked this
+                # lesson and has not re-approved since, so the offline pipeline
+                # must never resurrect it as injectable.  The re-proposal is
+                # accepted as new evidence but lands demoted, and only the
+                # human CLI can make it injectable again.
                 saved = replace(candidate, version=prior.version + 1)
+                guarded = candidate.lesson_id in self._revoked_guard
+                if guarded:
+                    saved = replace(saved, status=_demoted_status(saved))
                 self._append(
                     self._proposal_event(
                         "lesson_superseded",
@@ -526,6 +548,18 @@ class LessonStore:
                         fact_sheet=fact_sheet,
                     )
                 )
+                if guarded:
+                    self._append(
+                        {
+                            "type": "revoked_reproposal_demoted",
+                            "schema_v": 1,
+                            "ts": time.time(),
+                            "lesson_id": saved.lesson_id,
+                            "version": saved.version,
+                            "status": saved.status,
+                            "fingerprint": _revoked_reproposal_fingerprint(saved),
+                        }
+                    )
             self._lessons[saved.lesson_id] = saved
             self._write_view()
             return saved
@@ -548,6 +582,9 @@ class LessonStore:
                 }
             )
             self._lessons[lesson_id] = approved
+            # A human approval re-accepts the current version: it is the only
+            # key that lifts the revocation guard (S2).
+            self._revoked_guard.discard(lesson_id)
             self._write_view()
             return approved
 
@@ -571,6 +608,7 @@ class LessonStore:
                 }
             )
             self._lessons[lesson_id] = revoked
+            self._revoked_guard.add(lesson_id)
             self._write_view()
             return revoked
 
@@ -709,6 +747,17 @@ def _proposal_payload(candidate: LessonCandidate) -> dict[str, Any]:
     return payload
 
 
+def _revoked_reproposal_fingerprint(candidate: LessonCandidate) -> str:
+    """Stable fingerprint of one revocation-guard demotion (audit/dedup key)."""
+
+    payload = json.dumps(
+        ["revoked_reproposal_demoted", candidate.lesson_id, candidate.version],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def load_lessons(
     lessons_dir: str | os.PathLike[str] = "memory/lessons",
 ) -> list[LessonCandidate]:
@@ -769,6 +818,32 @@ def proposal_metadata(
     return metadata
 
 
+def lessons_view_path(lessons_dir: str | os.PathLike[str]) -> Path:
+    """Return the materialized lesson view file for ``lessons_dir``.
+
+    Single home for the view filename so runtime consumers (e.g. the
+    procedure-card injector's delivery gate) can stat the snapshot for cache
+    keying without duplicating — or naming — the path themselves.
+    """
+
+    return Path(lessons_dir) / "lessons.json"
+
+
+def read_lessons_snapshot(
+    lessons_dir: str | os.PathLike[str],
+) -> list[LessonCandidate]:
+    """Public read-only view of ``lessons.json`` (fail-open to empty).
+
+    The authoritative current-version lesson snapshot for runtime consumers
+    that must re-check injectability at delivery time (e.g. the procedure-card
+    injector's post-selection revocation check).  Strictly read-only: opening a
+    runtime run must never create or rebuild lesson state, and a missing or
+    damaged view yields no lessons rather than an exception.
+    """
+
+    return _read_lessons_snapshot(lessons_dir)
+
+
 def _read_lessons_snapshot(lessons_dir: str | os.PathLike[str]) -> list[LessonCandidate]:
     """Read ``lessons.json`` read-only; a damaged view fails open to empty.
 
@@ -789,12 +864,109 @@ def _read_lessons_snapshot(lessons_dir: str | os.PathLike[str]) -> list[LessonCa
         return []
 
 
+def _lexical_terms(text: str) -> frozenset[str]:
+    """Cheap deterministic relevance terms: Latin word tokens + CJK bigrams.
+
+    Chinese carries no whitespace tokens, so adjacent CJK characters fold into
+    character bigrams (works reasonably for Chinese overlap); Latin/digit runs
+    become lowercase word tokens.  No embeddings, no extra dependencies.
+    """
+
+    normalized = _single_line(text).casefold()
+    terms = set(re.findall(r"[a-z0-9]+", normalized))
+    cjk = re.findall(r"[\u4e00-\u9fff]", normalized)
+    terms.update(a + b for a, b in zip(cjk, cjk[1:]))
+    return frozenset(terms)
+
+
+def _goal_relevance(goal_terms: frozenset[str], lesson: LessonCandidate) -> float:
+    """Fraction of the goal's terms the lesson text echoes (0.0-1.0)."""
+
+    if not goal_terms:
+        return 0.0
+    lesson_terms = _lexical_terms(lesson.text)
+    if not lesson_terms:
+        return 0.0
+    return len(goal_terms & lesson_terms) / len(goal_terms)
+
+
+def _legacy_lesson_order(lesson: LessonCandidate) -> tuple[int, float, str]:
+    return -lesson.version, -lesson.created_ts, lesson.lesson_id
+
+
+def _rank_lessons(
+    eligible: Sequence[LessonCandidate], goal_text: str | None
+) -> list[LessonCandidate]:
+    """Order candidates by goal relevance, degrading to the legacy order.
+
+    With a non-empty goal, lessons sort by lexical overlap with the goal first
+    (ties broken by the legacy ``(-version, -created_ts, id)`` key).  When no
+    goal is given — or no lesson shares a single term with it — the legacy
+    order is kept unchanged so behaviour degrades gracefully.
+    """
+
+    legacy = sorted(eligible, key=_legacy_lesson_order)
+    goal = _single_line(goal_text or "")
+    if not goal:
+        return legacy
+    goal_terms = _lexical_terms(goal)
+    scored = [(_goal_relevance(goal_terms, lesson), lesson) for lesson in eligible]
+    if not any(score > 0.0 for score, _lesson in scored):
+        return legacy
+    scored.sort(
+        key=lambda pair: (
+            -pair[0],
+            -pair[1].version,
+            -pair[1].created_ts,
+            pair[1].lesson_id,
+        )
+    )
+    return [lesson for _score, lesson in scored]
+
+
+def _lesson_rule_line(lesson: LessonCandidate, index: int) -> str:
+    """The per-item line exactly as both injection points render it.
+
+    Mirrors ``agent.py``'s run-start mirror and ``procedure.py``'s
+    ``[APP_RULES]`` section: a numbered line carrying the source label.
+    """
+
+    scope_label = "全局 scope" if lesson.scope["device"] is None else "设备 scope"
+    return f"{index}. {lesson.text}（来源 {lesson.lesson_id} · {scope_label}）"
+
+
+def _pack_first_fit(
+    candidates: Sequence[LessonCandidate], *, max_items: int, max_tokens: int
+) -> list[LessonCandidate]:
+    """First-fit packing over the exact rendered per-item cost.
+
+    Each candidate is weighed by the tokens of the line the injector will
+    actually render (numbering + source label included), so one long rule can
+    no longer evict every shorter rule behind it: an item that does not fit the
+    remaining budget is skipped and smaller ones keep their place until the
+    item cap or the budget is reached.
+    """
+
+    selected: list[LessonCandidate] = []
+    used = 0
+    for lesson in candidates:
+        if len(selected) >= max_items:
+            break
+        cost = estimate_text_tokens(_lesson_rule_line(lesson, len(selected) + 1))
+        if cost > max_tokens - used:
+            continue
+        selected.append(lesson)
+        used += cost
+    return selected
+
+
 def select_lessons_for_injection(
     lessons_dir: str | os.PathLike[str],
     *,
     device_scope: str | None,
     max_items: int,
     max_tokens: int,
+    goal_text: str | None = None,
 ) -> list[LessonCandidate]:
     """Read a bounded approved-only run-start snapshot from ``lessons.json``.
 
@@ -802,7 +974,9 @@ def select_lessons_for_injection(
     runtime run must never create or rebuild lesson state.  A missing or damaged
     materialized view fails open to no injection.  App-scoped lessons are
     excluded because the foreground app is not yet known at run start; a future
-    event-triggered injector may resolve that narrower scope.
+    event-triggered injector may resolve that narrower scope.  ``goal_text``
+    (the run goal, when available) re-ranks the eligible rules by cheap lexical
+    relevance; without it the legacy newest-version order stands.
     """
 
     try:
@@ -830,14 +1004,8 @@ def select_lessons_for_injection(
         and lesson.scope["app"] is None
         and lesson.scope["app_version"] is None
     ]
-    selected = sorted(
-        eligible,
-        key=lambda lesson: (-lesson.version, -lesson.created_ts, lesson.lesson_id),
-    )[:item_limit]
-
-    while selected and sum(estimate_text_tokens(item.text) for item in selected) > token_limit:
-        selected.pop()
-    return selected
+    ranked = _rank_lessons(eligible, goal_text)
+    return _pack_first_fit(ranked, max_items=item_limit, max_tokens=token_limit)
 
 
 # WP-WF4-C: the app-entrance / mention-prefetch rule mirror keeps its own
@@ -854,6 +1022,7 @@ def select_app_rules_for_injection(
     device_scope: str | None,
     max_items: int = APP_RULES_MAX_ITEMS,
     max_tokens: int = APP_RULES_MAX_TOKENS,
+    goal_text: str | None = None,
 ) -> list[LessonCandidate]:
     """Read a bounded approved-only app-rule snapshot from ``lessons.json``.
 
@@ -866,7 +1035,8 @@ def select_app_rules_for_injection(
     must equal ``app_package`` exactly; the device scope follows the run-start
     rule (global matches anywhere, a pinned device only on that device); and
     version-scoped rules never inject because the running app version is
-    unknowable here.
+    unknowable here.  ``goal_text`` re-ranks by cheap lexical relevance the
+    same way; without it the legacy newest-version order stands.
     """
 
     package = str(app_package or "").strip()
@@ -894,14 +1064,8 @@ def select_app_rules_for_injection(
         and lesson.scope["device"] in {None, local_device or None}
         and lesson.scope["app_version"] is None
     ]
-    selected = sorted(
-        eligible,
-        key=lambda lesson: (-lesson.version, -lesson.created_ts, lesson.lesson_id),
-    )[:item_limit]
-
-    while selected and sum(estimate_text_tokens(item.text) for item in selected) > token_limit:
-        selected.pop()
-    return selected
+    ranked = _rank_lessons(eligible, goal_text)
+    return _pack_first_fit(ranked, max_items=item_limit, max_tokens=token_limit)
 
 
 def emergency_revoke_lesson(
@@ -1908,6 +2072,12 @@ class DistillResult:
     proposed: tuple[LessonCandidate, ...]
     tokens_total: int
     tokens_by_role: dict[str, int]
+    # Batch bookkeeping (S2): ``retried`` marks a failed batch that stays
+    # pending for the next distill run (the cursor did not move); ``abandoned``
+    # counts batches given up after repeated failed attempts on the same
+    # batch signature.
+    retried: bool = False
+    abandoned: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1916,32 +2086,60 @@ class DistillResult:
             "proposed": [item.to_dict() for item in self.proposed],
             "tokens_total": self.tokens_total,
             "tokens_by_role": dict(self.tokens_by_role),
+            "retried": self.retried,
+            "abandoned": self.abandoned,
         }
 
 
 _DISTILL_BATCH_MAX = 40
 _DISTILL_STATE_FILE = "distill_state.json"
+# A batch that keeps failing is retried on the next distill run; after this
+# many consecutive failed attempts on the same batch signature the cursor is
+# advanced past it and the data loss is made explicit and audible
+# (``distill_batch_abandoned`` event) — fail-open, but never silent.
+_DISTILL_MAX_ATTEMPTS = 3
 
 
 def _distill_state_path(lessons_dir: str | os.PathLike[str]) -> Path:
     return Path(lessons_dir) / _DISTILL_STATE_FILE
 
 
-def _read_distill_watermark(lessons_dir: str | os.PathLike[str]) -> float:
-    """Return the last processed ts_end; missing or corrupt state means 0.0."""
+def _read_distill_state(lessons_dir: str | os.PathLike[str]) -> dict[str, Any]:
+    """Return the persisted distill state; missing or corrupt state means empty."""
 
     try:
         payload = json.loads(
             _distill_state_path(lessons_dir).read_text(encoding="utf-8")
         )
-        value = float(payload["last_ts_end"])
-    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
-        return 0.0
-    return value if math.isfinite(value) else 0.0
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
-def _write_distill_watermark(lessons_dir: str | os.PathLike[str], value: float) -> None:
-    _atomic_write(_distill_state_path(lessons_dir), {"last_ts_end": float(value)})
+def _distill_cursor(state: Mapping[str, Any]) -> tuple[float, str]:
+    """Return the ``(ts_end, run_id)`` processing cursor.
+
+    The cursor is lexicographic: episodes are only eligible when their
+    ``(ts_end, run_id)`` sort key is strictly after it, so episodes sharing one
+    timestamp are never silently dropped by the batch cap.  A legacy state file
+    that only carries ``last_ts_end`` keeps working — the missing run id reads
+    as the empty string, which sorts before every real run id.
+    """
+
+    try:
+        ts_end = float(state.get("last_ts_end", 0.0))
+    except (TypeError, ValueError):
+        ts_end = 0.0
+    if not math.isfinite(ts_end) or ts_end < 0:
+        ts_end = 0.0
+    run_id = state.get("last_run_id")
+    return ts_end, run_id if isinstance(run_id, str) else ""
+
+
+def _write_distill_state(
+    lessons_dir: str | os.PathLike[str], state: Mapping[str, Any]
+) -> None:
+    _atomic_write(_distill_state_path(lessons_dir), dict(state))
 
 
 def _distill_batch(
@@ -1955,27 +2153,35 @@ def _distill_batch(
     token_budget: int | None,
     ledgers: Mapping[str, Sequence[Mapping[str, Any]]],
     appkb_dir: str | os.PathLike[str] | None,
-) -> tuple[int, list[LessonCandidate]]:
-    """Run one batch through the model and persist whatever it supports."""
+) -> tuple[str, str | None, int, list[LessonCandidate]]:
+    """Run one batch through the model and persist whatever it supports.
+
+    Returns ``(outcome, error_type, rejected, proposed)``.  ``outcome`` is
+    ``"processed"`` (the model call completed, with or without candidates),
+    ``"skipped"`` (consumed but rejected by a deterministic budget rule), or
+    ``"failed"`` (transport or parse failure — the batch stays pending and is
+    retried by the next distill run).  ``error_type`` is the exception class
+    name of a failure, else ``None``.
+    """
 
     try:
         response = model.invoke(messages)
-    except Exception:  # noqa: BLE001 - reject this offline batch, keep the watermark
+    except Exception as exc:  # noqa: BLE001 - transient failure: retry later
         ledger.record("distill", estimate_tokens=request_estimate)
-        return 1, []
+        return "failed", type(exc).__name__, 1, []
     ledger.record(
         "distill",
         response,
         estimate_tokens=request_estimate + estimate_message_tokens(response),
     )
     if token_budget is not None and ledger.total > token_budget:
-        return 1, []
+        return "skipped", None, 1, []
     try:
         candidates = _validate_model_candidates(response, batch)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return 1, []
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return "failed", type(exc).__name__, 1, []
     if not candidates:
-        return 0, []
+        return "processed", None, 0, []
     # Second call: the harness supplies per-card facts, the model self-grades
     # every candidate — rules and procedure cards alike.
     grading = _apply_self_grading(
@@ -2010,7 +2216,86 @@ def _distill_batch(
         )
         if prior is None or saved.version > prior.version:
             proposed.append(saved)
-    return 0, proposed
+    return "processed", None, 0, proposed
+
+
+def _batch_signature(batch: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Return the sorted run-id signature identifying one distill batch."""
+
+    return [str(item.get("run_id", "")) for item in batch]
+
+
+def _append_distill_event(store: LessonStore, event: Mapping[str, Any]) -> None:
+    """Best-effort append of a distill bookkeeping event (audit only)."""
+
+    try:
+        with store._lock:
+            store._append(event)
+    except OSError:
+        pass
+
+
+def _register_batch_failure(
+    store: LessonStore,
+    lessons_dir: str | os.PathLike[str],
+    state: Mapping[str, Any],
+    *,
+    signature: Sequence[str],
+    batch_key: tuple[float, str],
+    error_type: str,
+) -> bool:
+    """Record one failed batch attempt in the distill state; abandon on the third.
+
+    The cursor never moves on a failure, so the next distill run reselects the
+    same batch (fail-open: a transient model outage must never become a
+    permanent skip).  After ``_DISTILL_MAX_ATTEMPTS`` consecutive failures of
+    the same batch signature the cursor is advanced past the batch and the loss
+    is made explicit with a ``distill_batch_abandoned`` event.  Returns
+    ``True`` when the batch was abandoned.
+    """
+
+    cursor_ts, cursor_run = _distill_cursor(state)
+    prior = state.get("failed_batch")
+    attempts = 0
+    if isinstance(prior, dict) and list(prior.get("run_ids") or []) == list(signature):
+        try:
+            attempts = max(0, int(prior.get("attempts", 0) or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+    attempts += 1
+    if attempts < _DISTILL_MAX_ATTEMPTS:
+        _write_distill_state(
+            lessons_dir,
+            {
+                "last_ts_end": cursor_ts,
+                "last_run_id": cursor_run,
+                "failed_batch": {
+                    "run_ids": list(signature),
+                    "attempts": attempts,
+                    "last_error": error_type,
+                },
+            },
+        )
+        return False
+    # Three strikes: keep going (never block the offline pipeline) but make
+    # the dropped batch audible instead of silently skipping it forever.
+    _write_distill_state(
+        lessons_dir, {"last_ts_end": batch_key[0], "last_run_id": batch_key[1]}
+    )
+    _append_distill_event(
+        store,
+        {
+            "type": "distill_batch_abandoned",
+            "schema_v": 1,
+            "ts": time.time(),
+            "reason": "repeated_model_failure",
+            "run_ids": list(signature),
+            "batch_size": len(signature),
+            "attempts": attempts,
+            "last_error": error_type,
+        },
+    )
+    return True
 
 
 def distill_lessons(
@@ -2022,13 +2307,23 @@ def distill_lessons(
     token_budget: int | None = None,
     appkb_dir: str | os.PathLike[str] | None = None,
 ) -> DistillResult:
-    """Distill one watermarked batch of episodes into proposed lessons only.
+    """Distill one cursor-bounded batch of episodes into graded lesson candidates.
 
-    Every episode newer than the persisted ``last_ts_end`` watermark is distilled
-    ungrouped in a single model call, so the distiller sees complete task
-    processes instead of per-app cohorts.  The watermark advances once the batch
-    has been processed, including when the batch was rejected, so processed
-    episodes are never replayed.
+    Episodes are ordered by ``(ts_end, run_id)`` and only those strictly after
+    the persisted ``(last_ts_end, last_run_id)`` cursor are eligible, capped at
+    ``_DISTILL_BATCH_MAX`` — a same-timestamp overflow episode is picked up by
+    the next batch because the cursor records the run id, and a legacy
+    float-only state file keeps working.
+
+    The cursor advances only when the batch was actually processed: the model
+    call completed (with or without candidates), or the batch was
+    consumed-but-rejected by a deterministic budget rule (a
+    ``distill_batch_skipped`` event records the reason).  A transport or parse
+    failure leaves the cursor in place and records the failed batch (run ids +
+    attempt count) in the state file, so the next distill run retries it; after
+    three failed attempts on the same batch signature the cursor is advanced
+    past the batch and a ``distill_batch_abandoned`` event makes the data loss
+    explicit (see :func:`_register_batch_failure`).
 
     A second model call self-grades every surviving candidate: the harness
     supplies a fact sheet, the model answers ``auto_approved`` or
@@ -2039,12 +2334,13 @@ def distill_lessons(
 
     events_path = Path(experience_events)
     episodes = _episode_rows(events_path)
-    watermark = _read_distill_watermark(lessons_dir)
+    state = _read_distill_state(lessons_dir)
+    cursor = _distill_cursor(state)
     batch = sorted(
         (
             item
             for item in episodes
-            if float(item.get("ts_end", 0.0) or 0.0) > watermark
+            if _episode_sort_key(item) > cursor
         ),
         key=_episode_sort_key,
     )[:_DISTILL_BATCH_MAX]
@@ -2054,11 +2350,16 @@ def distill_lessons(
 
     store = LessonStore(lessons_dir)
     ledgers = _tool_ledgers(events_path)
+    signature = _batch_signature(batch)
+    batch_key = max(_episode_sort_key(item) for item in batch)
     rejected = 0
     proposed: list[LessonCandidate] = []
+    outcome = "failed"
+    error_type = "UnexpectedError"
+    skip_reason = ""
     try:
         if token_budget is not None and active_ledger.total >= token_budget:
-            rejected = 1
+            rejected, outcome, skip_reason = 1, "skipped", "token_budget"
         else:
             messages = _build_distill_messages(batch, ledgers)
             request_estimate = estimate_context_tokens(messages)
@@ -2066,9 +2367,9 @@ def distill_lessons(
                 token_budget is not None
                 and active_ledger.total + request_estimate > token_budget
             ):
-                rejected = 1
+                rejected, outcome, skip_reason = 1, "skipped", "token_budget"
             else:
-                rejected, proposed = _distill_batch(
+                outcome, error_type, rejected, proposed = _distill_batch(
                     batch,
                     messages=messages,
                     request_estimate=request_estimate,
@@ -2079,28 +2380,64 @@ def distill_lessons(
                     ledgers=ledgers,
                     appkb_dir=appkb_dir,
                 )
-    finally:
-        _write_distill_watermark(
+    except Exception as exc:  # noqa: BLE001 - record the failed batch, re-raise
+        _register_batch_failure(
+            store,
             lessons_dir,
-            max(float(item.get("ts_end", 0.0) or 0.0) for item in batch),
+            state,
+            signature=signature,
+            batch_key=batch_key,
+            error_type=type(exc).__name__,
         )
+        raise
+
+    retried = False
+    abandoned = 0
+    if outcome in {"processed", "skipped"}:
+        _write_distill_state(
+            lessons_dir, {"last_ts_end": batch_key[0], "last_run_id": batch_key[1]}
+        )
+        if outcome == "skipped":
+            _append_distill_event(
+                store,
+                {
+                    "type": "distill_batch_skipped",
+                    "schema_v": 1,
+                    "ts": time.time(),
+                    "reason": skip_reason,
+                    "run_ids": signature,
+                    "batch_size": len(signature),
+                },
+            )
+    else:
+        if _register_batch_failure(
+            store,
+            lessons_dir,
+            state,
+            signature=signature,
+            batch_key=batch_key,
+            error_type=error_type,
+        ):
+            abandoned = 1
+        else:
+            retried = True
     return DistillResult(
         groups_considered=1,
         groups_rejected=rejected,
         proposed=tuple(proposed),
         tokens_total=active_ledger.total,
         tokens_by_role=active_ledger.by_role(),
+        retried=retried,
+        abandoned=abandoned,
     )
 
 
 def build_distill_model(config: Any) -> Any:
     """Build memory_model when configured, otherwise the main model."""
 
-    from phone_agent.v2.model import build_chat_model
+    from phone_agent.v2.model import build_role_model
 
-    name = getattr(config, "memory_model", None)
-    active_config = replace(config, model_name=name) if name else config
-    return build_chat_model(active_config)
+    return build_role_model(config, role="distill")
 
 
 def approve_lesson(store: LessonStore, lesson_id: str) -> LessonCandidate:
@@ -2139,10 +2476,12 @@ __all__ = [
     "evaluate_promotion",
     "evidence_loss_reason",
     "lesson_injectable",
+    "lessons_view_path",
     "load_lessons",
     "make_lesson_id",
     "proposal_metadata",
     "read_episode_outcomes",
+    "read_lessons_snapshot",
     "select_app_rules_for_injection",
     "select_lessons_for_injection",
 ]

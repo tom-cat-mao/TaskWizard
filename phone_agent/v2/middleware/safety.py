@@ -443,12 +443,9 @@ def build_safety_reviewer(
         return None
 
     try:
-        from dataclasses import replace
+        from phone_agent.v2.model import build_role_model
 
-        from phone_agent.v2.model import build_chat_model
-
-        rcfg = replace(config, model_name=model_name)
-        model = build_chat_model(rcfg)
+        model = build_role_model(config, role="safety_reviewer")
     except Exception:  # noqa: BLE001 - unbuildable reviewer -> fail-closed (None)
         return None
 
