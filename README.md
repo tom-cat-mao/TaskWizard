@@ -57,7 +57,7 @@ cp .env.example .env
 | 观测与参考图 | 原子观测（前后台一致 + 单次采样）；失败但已取到有效截图时返回标注过的未验证参考图 | [架构](https://tom-cat-mao.github.io/TaskWizard/architecture/) |
 | 安全预警制 | 风险动作先预警（不执行、不叫人），模型显式确认后才执行；四档模式 | [安全模式](https://tom-cat-mao.github.io/TaskWizard/safety/) |
 | 可信完成 | TaskDoc 任务板 + 流程线；finish 两段式，独立上下文验收器复核（故障 fail-open 记 `skipped`） | [架构](https://tom-cat-mao.github.io/TaskWizard/architecture/) |
-| 成本控制 | token 预算达到阈值后停止；已发有效 finish 复核包可续办一次真实确认；两级 auto-compact | [配置参考](https://tom-cat-mao.github.io/TaskWizard/configuration/) |
+| 成本控制 | token 阈值与一次有效 finish 确认续办；独立 32k 软工作目标与有界成组压缩 | [配置参考](https://tom-cat-mao.github.io/TaskWizard/configuration/) |
 | 应用记忆 | App-KB 别名与启动事实；隐式纠正、dream 整理、用户纠正入口 | [记忆与自进化](https://tom-cat-mao.github.io/TaskWizard/memory/) |
 | 经验与回注 | episode 档案（固定 schema、隐私白名单）+ 离线蒸馏自判分级 + `MEMORY_RAG=on` 受控注入 | [记忆与自进化](https://tom-cat-mao.github.io/TaskWizard/memory/) |
 | 产出物 | `write_document` / `update_document` 写成本 run 的单页 HTML | [Web 控制台](https://tom-cat-mao.github.io/TaskWizard/console/) |
@@ -67,6 +67,8 @@ cp .env.example .env
 | 本地控制台 | 固定顶栏 + 设备栏 + 任务工作区（步骤/任务板/应用库/记忆/产出页签，人工确认置顶）；runner 子进程执行、可重连回放；可选模型流式增量面板 | [Web 控制台](https://tom-cat-mao.github.io/TaskWizard/console/) |
 
 完成复核后若又尝试了普通操作，即使命令结果未知，也需要重新取得复核包才能在 token 边界续办确认。
+
+自定义模型尚未声明上下文能力时，压缩仍保留无法识别的 Provider 续接信息；只有明确的重复调用表示或 SDK 记账字段可以忽略。
 
 ## 文档
 

@@ -133,6 +133,11 @@ provider、无法构建的显式引用不会静默改用其它 gateway；唯显�
 | `PHONE_AGENT_COMPACT` | bool | `true` | auto-compact 总开关 |
 | `PHONE_AGENT_COMPACT_WARN_RATIO` | float | `0.75` | 上下文占窗口比例达到此值时提醒模型收敛 |
 | `PHONE_AGENT_COMPACT_TRIGGER_RATIO` | float | `0.92` | 达到此值时生成 handoff 摘要并折叠历史 |
+| `PHONE_AGENT_CONTEXT_WORK_TARGET` | int | `32000` | 完整模型输入的软工作目标，含工具、任务板、历史与图片；`0` 只关闭该目标，物理窗口与 T1/T2 仍有效 |
+| `PHONE_AGENT_COMPACT_TARGET_RATIO` | float | `0.7` | 压缩后的软工作目标比例，必须大于 0、小于 1；保护内容无法达到软目标时不强行删除，物理容量风险仍可转为容量修复 |
+| `PHONE_AGENT_COMPACT_SUMMARY_TOKENS` | int | `2000` | 摘要表达及接受上限；超长摘要不提交，不是价格预算 |
+| `PHONE_AGENT_COMPACT_MIN_REDUCTION_TOKENS` | int | `1000` | 普通工作压缩至少释放的输入 tokens，与相对门槛同时满足；已超物理容量且恢复准入的正净缩减修复除外 |
+| `PHONE_AGENT_COMPACT_MIN_REDUCTION_RATIO` | float | `0.1` | 普通工作压缩至少释放原输入的比例；不得大于等于 1 |
 | `PHONE_AGENT_COMPACT_SCHEMA_RESERVE` | int | `3000` | T1/T2 比较时为随每轮请求发送的序列化工具 schema 预留的 token 数（估算不可见部分） |
 | `PHONE_AGENT_COMPACT_OUTPUT_RESERVE` | int | `2000` | T1/T2 比较时为下一轮回复预留的 token 数 |
 | `PHONE_AGENT_CONTEXT_WINDOW` | int | 按实际构建的 actor 推断，兜底 `256000` | 手动覆盖上下文窗口大小；显式值优先，未设置时按**实际构建**的 actor 模型（含构建降级后的备用目标）窗口推断 |
@@ -148,6 +153,16 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 `FINISH_VERIFY=off` 不使用这份续办额度。独立验收器的拒绝与故障 `skipped` 语义保持原样。
 复核后再次委托执行普通工具时，旧复核立即失效；即使命令可能已派发但回执失败、没有新观测，也不能
 沿用旧复核续办。续办响应中被预算直接拒绝、未委托执行的普通工具不会撤销同响应的合法确认机会。
+
+工作目标不改变 `contextWindow`。每轮先清理旧图/marks，再按实际模型的可选 context support 估算；provider 已计入工具定义时不重复加 schema reserve。未知/native 内容使用明确的启发式估算，不视为零成本；这不等同于真实 provider tokenizer。
+
+语义压缩只归并完整的已闭合 AI/工具组，保留原始任务、当前 TaskDoc、最新完整组、活跃图/marks 和 opaque 依赖；不截 HTML 调用参数。摘要模型输入过长时按完整组分段后合并，单组装不下则跳过。单次压缩最多 8 次逻辑摘要调用（含本层重试/合并，不包含 SDK 内部 HTTP 重试）；每次调用前检查已有 run token 预算，耗尽后不再付摘要调用。失败、超长或净缩减不足时保留已经完成必要图像清理的基线，不提交部分摘要。最终发送前还需对实际模型、最新 pins 与工具定义做容量准入，不能在 fallback 内单独截断一份临时历史。
+
+软目标不能阻止合法的物理容量修复。例如最新必留 HTML 组大于 32k 的低水位、但仍能放进实际模型窗口时，接近/超过物理阈值的请求会按物理目标重新规划。已超窗口的请求只要正净缩减并恢复准入，不能被普通软收益门槛拒绝；完整工具组、原生依赖与观测仍保留。压缩完成但软目标未达到会记录 `soft_target_unattainable`，不冒充已达到 32k。
+
+原生签名可位于标准 text/image block 的嵌套 `extras` 中，估算与保护会递归识别。普通 SDK function-call id 对照表不因此永久占住压缩边界。若自定义 Provider 把原生签名放在必须移除的旧图片或 OBS marks 块上，当前没有可验证的合法重放投影：micro 在改任何消息前预检并报告 `native_context_pruning_conflict`，不会搬动签名或保留额外旧图。最新 K 的签名块保持原样；同消息其他文本块有签名不妨碍无签名旧图清理。
+
+未识别的非空 `additional_kwargs` 默认作为可能的 Provider 续接载荷保留，并作非零序列化估算。只有已经被结构化调用表示覆盖的 `tool_calls` / `function_call` 和已确认的 `__openai_function_call_ids__` 对照表属于例外；不能因为某个字段不在已知签名列表中，就认为可以丢弃。
 
 ## 界面落地（Grounding）
 
