@@ -19,6 +19,15 @@ from typing import Any
 
 _SUPPORT_ATTRIBUTE = "_taskwizard_context_support"
 _CACHE_FIELDS = frozenset({"cache_control", "prompt_cache_breakpoint"})
+_CACHE_PARAMETERS = frozenset(
+    {
+        "prompt_cache_options",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "cache_control",
+        "cached_content",
+    }
+)
 _DISPATCH_FIELDS = frozenset(
     {
         "model",
@@ -33,7 +42,57 @@ _DISPATCH_FIELDS = frozenset(
         "context_management",
         "stream",
         "streaming",
+        "system",
+        "system_instruction",
+        "contents",
+        "history",
+        "conversation",
+        "truncation",
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "response_format",
+        "text",
+        "generation_config",
+        "stop",
+        "stop_sequences",
+        "temperature",
+        "top_p",
+        "reasoning",
+        "reasoning_effort",
+        "extra_headers",
+        "extra_query",
+        "model_kwargs",
+        "top_k",
+        "n",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "output_config",
+        "thinking",
+        "timeout",
+        "max_retries",
+        "headers",
+        "base_url",
+        "api_key",
+        "prompt",
+        "prompt_template",
+        "system_prompt",
+        "response_schema",
+        "response_mime_type",
+        "automatic_function_calling",
+        "include",
+        "store",
+        "background",
+        "service_tier",
+        "verbosity",
+        "model_name",
+        "model_id",
     }
+)
+_SEMANTIC_PARAMETER_NAMES = frozenset(
+    "".join(character for character in name.casefold() if character.isalnum())
+    for name in _DISPATCH_FIELDS
 )
 
 
@@ -182,13 +241,52 @@ def _without_cache(messages: Any) -> list[Any]:
     return result
 
 
-def _cache_only_overrides(settings: dict[str, Any]) -> bool:
-    if _DISPATCH_FIELDS.intersection(settings):
+def _cache_only_overrides(settings: dict[str, Any], support: Any) -> bool:
+    # A plugin may name additional cache parameters, but cannot reclassify
+    # semantic dispatch/history/output settings as cache metadata.
+    declared = getattr(support, "cache_parameter_names", ())
+    if not isinstance(declared, (tuple, list, set, frozenset)) or any(
+        not isinstance(name, str) for name in declared
+    ):
         return False
-    extra_body = settings.get("extra_body")
-    return extra_body is None or (
-        isinstance(extra_body, dict) and not _DISPATCH_FIELDS.intersection(extra_body)
+
+    def semantic_name(name: str) -> bool:
+        return (
+            "".join(c for c in name.casefold() if c.isalnum())
+            in _SEMANTIC_PARAMETER_NAMES
+        )
+
+    def contains_semantic_fields(value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(
+                (isinstance(name, str) and semantic_name(name))
+                or contains_semantic_fields(item)
+                for name, item in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(contains_semantic_fields(item) for item in value)
+        return False
+
+    allowed = frozenset(
+        name
+        for name in _CACHE_PARAMETERS | frozenset(declared)
+        if not semantic_name(name)
     )
+
+    def cache_parameters(values: dict[str, Any]) -> bool:
+        for name, value in values.items():
+            if name == "extra_body":
+                if (
+                    not isinstance(value, dict)
+                    or "extra_body" in value
+                    or not cache_parameters(value)
+                ):
+                    return False
+            elif name not in allowed or contains_semantic_fields(value):
+                return False
+        return True
+
+    return cache_parameters(settings)
 
 
 def prepare_model_messages(
@@ -201,22 +299,26 @@ def prepare_model_messages(
     graph messages. Runtime cache failure never turns into semantic compaction.
     """
     baseline = deepcopy(list(messages or []))
+    support = get_context_support(model)
+    method = getattr(support, "prepare", None)
+    if not callable(method):
+        # Legacy models and estimate-only plugins retain their own legal wire
+        # metadata. New attempt decorations are never canonical in the harness.
+        return PreparedModelMessages(baseline)
     for message in baseline:
         if hasattr(message, "content"):
             message.content = _clean_content(message.content)
-    method = getattr(get_context_support(model), "prepare", None)
-    if callable(method):
-        try:
-            result = method(model, deepcopy(baseline), tools=tools)
-            if (
-                isinstance(result, PreparedModelMessages)
-                and isinstance(result.model_kwargs, dict)
-                and _cache_only_overrides(result.model_kwargs)
-                and _without_cache(result.messages) == _without_cache(baseline)
-            ):
-                return result
-        except Exception:  # noqa: BLE001 - optional cache preparation fails open
-            pass
+    try:
+        result = method(model, deepcopy(baseline), tools=tools)
+        if (
+            isinstance(result, PreparedModelMessages)
+            and isinstance(result.model_kwargs, dict)
+            and _cache_only_overrides(result.model_kwargs, support)
+            and _without_cache(result.messages) == _without_cache(baseline)
+        ):
+            return result
+    except Exception:  # noqa: BLE001 - optional cache preparation fails open
+        pass
     return PreparedModelMessages(baseline)
 
 

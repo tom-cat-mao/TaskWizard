@@ -73,6 +73,8 @@ Gemini 缓存资源；压缩/内容变化使旧端点失效。未知网关保持
 Provider 的 context 支持对象跟随实际模型。内建输入估算仍是启发式，工具 schema 有实物时计入并声明覆盖，
 未提供工具时保留额外 reserve；不会声称精确 tokenizer 计数或远程计数已实现。`contextWindow` 与真实构造的
 输出上限分别报告，不能因 cache hit 把输入从逻辑窗口扣除。
+输出 cap 与实际协议使用同一 SDK 本地序列化依据，包含 alias 合并与最终 HTTP `extra_body` 覆盖；
+无法确定有效 cap 时报告 unknown，不把看起来更小的 binding 字段当作实际输出上限。
 
 `streaming`（`off`/`on`，可写在模型条目、`modelOverrides` 与 `roles.<role>`）控制该模型/角色的流式调用，优先级为 **角色 > 模型条目 > `PHONE_AGENT_STREAMING`**：模型条目的声明视为端点能力事实（某模型端点不能流式时，即使全局开也可保持 `off`），角色声明是最具体的调用级覆盖。有效决策被翻译为各协议正式参数（OpenAI/Anthropic/Google 的传输层 `streaming`），由 SDK 流式接收并聚合出完整消息；`off`/未声明不下发该参数，默认构建不变。非法取值由严格解析函数（显式校验路径）fail-closed 报错；运行时装配逐项跳过并计入 `declaration_warnings`。
 

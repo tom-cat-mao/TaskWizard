@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -138,9 +138,28 @@ def _snake(name: str) -> str:
     return _CAMEL_TO_SNAKE.get(name, name)
 
 
+def _validate_context_choices(data: Any) -> None:
+    """Validate selection-bearing fields independently of unrelated fields.
+
+    In lenient parsing a malformed header, number, or extraBody must not mask
+    an invalid explicit protocol/cache choice and turn it into a default call.
+    """
+    if not isinstance(data, dict):
+        return
+    choices = {
+        _snake(str(key)): value for key, value in data.items()
+        if _snake(str(key)) in {"request_api", "cache_policy"}
+    }
+    try:
+        ProviderCompat(**choices)
+    except ValueError as exc:
+        raise ContextDeclarationError(str(exc)) from exc
+
+
 def _parse_compat(data: Any) -> ProviderCompat:
     if not isinstance(data, dict):
         raise ModelsFileError(f"compat must be an object, got {type(data).__name__}")
+    _validate_context_choices(data)
     kwargs: dict[str, Any] = {}
     for key, value in data.items():
         field = _snake(str(key))
@@ -195,6 +214,13 @@ def _parse_model(data: Any, *, env: dict[str, str]) -> tuple[str, ModelSpec]:
     if not model_id:
         raise ModelsFileError("model entry requires an 'id'")
     kwargs: dict[str, Any] = {"id": model_id}
+    compat = data.get("compat")
+    if compat is not None:
+        try:
+            kwargs["compat"] = _parse_compat(compat)
+        except ContextDeclarationError as exc:
+            exc.model_id = model_id
+            raise
     name = data.get("name")
     if name is not None:
         kwargs["name"] = str(name)
@@ -226,13 +252,6 @@ def _parse_model(data: Any, *, env: dict[str, str]) -> tuple[str, ModelSpec]:
         if not isinstance(headers, dict):
             raise ModelsFileError("model headers must be an object")
         kwargs["headers"] = resolve_headers(headers, env=env)
-    compat = data.get("compat")
-    if compat is not None:
-        try:
-            kwargs["compat"] = _parse_compat(compat)
-        except ContextDeclarationError as exc:
-            exc.model_id = model_id
-            raise
     return model_id, ModelSpec(**kwargs)
 
 
@@ -241,6 +260,7 @@ def _apply_model_override(existing: ModelSpec, patch: Any) -> ModelSpec:
 
     if not isinstance(patch, dict):
         raise ModelsFileError("modelOverrides entries must be objects")
+    _validate_context_choices(patch.get("compat"))
     fields: dict[str, Any] = {
         "name": existing.name,
         "context_window": existing.context_window,
@@ -274,6 +294,14 @@ def _apply_model_override(existing: ModelSpec, patch: Any) -> ModelSpec:
     return ModelSpec(id=existing.id, **fields)
 
 
+def _resolve_context_warning(warnings: list[DeclarationWarning] | None, name: str) -> None:
+    """Keep historical diagnostics while settling a later valid model choice."""
+    if warnings is not None:
+        for index, warning in enumerate(warnings):
+            if warning.blocks_selection and warning.scope == "model" and warning.name == name:
+                warnings[index] = replace(warning, blocks_selection=False)
+
+
 def _parse_provider(
     provider_id: str,
     data: Any,
@@ -289,12 +317,8 @@ def _parse_provider(
     api = data.get("api")
     if api is not None:
         api = str(api)  # None (absent) = override-only entry; registry inherits
-    base_url = resolve_str(data.get("baseUrl"), env=env)
-    api_key = resolve_str(data.get("apiKey"), env=env)
-    headers_data = data.get("headers")
-    if headers_data is not None and not isinstance(headers_data, dict):
-        raise ModelsFileError(f"provider {provider_id!r} headers must be an object")
     compat_data = data.get("compat")
+    _validate_context_choices(compat_data)
     models: dict[str, ModelSpec] = {}
     for entry in data.get("models") or []:
         try:
@@ -310,6 +334,7 @@ def _parse_provider(
             warnings.append(_make_warning(source, "model", name, exc))
             continue
         models[model_id] = spec
+        _resolve_context_warning(warnings, f"{provider_id}:{model_id}")
     overrides = data.get("modelOverrides") or {}
     if not isinstance(overrides, dict):
         raise ModelsFileError(f"provider {provider_id!r} modelOverrides must be an object")
@@ -317,10 +342,19 @@ def _parse_provider(
         try:
             existing = models.get(str(model_id)) or ModelSpec(id=str(model_id))
             models[str(model_id)] = _apply_model_override(existing, patch)
+            if "compat" in patch:
+                _resolve_context_warning(warnings, f"{provider_id}:{model_id}")
         except Exception as exc:  # noqa: BLE001 - strict mode re-raises below
             if warnings is None:
                 raise
             warnings.append(_make_warning(source, "model", f"{provider_id}:{model_id}", exc))
+    # Parse remaining provider fields after model choices: even if this provider
+    # is unavailable, already identified invalid model choices remain visible.
+    base_url = resolve_str(data.get("baseUrl"), env=env)
+    api_key = resolve_str(data.get("apiKey"), env=env)
+    headers_data = data.get("headers")
+    if headers_data is not None and not isinstance(headers_data, dict):
+        raise ModelsFileError(f"provider {provider_id!r} headers must be an object")
     return ProviderSpec(
         id=provider_id,
         api=api,

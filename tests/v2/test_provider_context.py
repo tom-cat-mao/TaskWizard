@@ -160,6 +160,24 @@ def test_forced_chat_rejects_responses_only_options():
         )
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"previous_response_id": "resp_synthetic"},
+        {"text": {"format": {"type": "text"}}},
+    ],
+)
+@pytest.mark.parametrize("in_extra_body", [False, True])
+def test_forced_chat_rejects_all_responses_only_entrypoints(options, in_extra_body):
+    with pytest.raises(ValueError, match="Responses-only"):
+        build(
+            compat=ProviderCompat(
+                request_api="chat", extra_body=options if in_extra_body else None
+            ),
+            sampling=None if in_extra_body else options,
+        )
+
+
 @pytest.mark.parametrize("api", ["anthropic-messages", "google-generative-ai"])
 def test_openai_selection_is_not_silently_ignored_by_other_builtins(api):
     with pytest.raises(ValueError, match="OpenAI-family"):
@@ -219,6 +237,75 @@ def test_higher_priority_corrected_protocol_unblocks_selection(tmp_path, monkeyp
     assert registry.resolve("example-model").provider.compat.request_api == "chat"
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {
+            "models": [
+                {
+                    "id": "example-model",
+                    "contextWindow": "invalid",
+                    "compat": {"requestApi": "typo"},
+                }
+            ]
+        },
+        {"headers": [], "compat": {"requestApi": "typo"}},
+        {"compat": {"extraBody": [], "requestApi": "typo"}},
+        {
+            "headers": [],
+            "models": [{"id": "example-model", "compat": {"cachePolicy": "typo"}}],
+        },
+    ],
+)
+def test_other_parse_errors_cannot_mask_explicit_typed_invalid(
+    tmp_path, monkeypatch, entry
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".taskwizard.models.json").write_text(
+        json.dumps({"providers": {"gateway": entry}})
+    )
+    registry = build_provider_registry(config())
+    with pytest.raises(ProviderRegistryError, match="invalid explicit context"):
+        registry.resolve("example-model")
+    assert any(warning.blocks_selection for warning in registry.declaration_warnings)
+
+
+@pytest.mark.parametrize("correction", ["override", "later_model"])
+def test_same_file_effective_correction_keeps_warning_but_unblocks_model(
+    tmp_path, monkeypatch, correction
+):
+    monkeypatch.chdir(tmp_path)
+    entry = {"models": [{"id": "example-model", "compat": {"requestApi": "typo"}}]}
+    if correction == "override":
+        entry["modelOverrides"] = {"example-model": {"compat": {"requestApi": "chat"}}}
+    else:
+        entry["models"].append(
+            {"id": "example-model", "compat": {"requestApi": "chat"}}
+        )
+    (tmp_path / ".taskwizard.models.json").write_text(
+        json.dumps({"providers": {"gateway": entry}})
+    )
+    registry = build_provider_registry(config())
+    assert registry.resolve("example-model").model.compat.request_api == "chat"
+    assert registry.declaration_warnings and not any(
+        w.blocks_selection for w in registry.declaration_warnings
+    )
+
+
+def test_unrelated_model_override_does_not_repair_invalid_choice(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    entry = {
+        "models": [{"id": "example-model", "compat": {"requestApi": "typo"}}],
+        "modelOverrides": {"example-model": {"maxTokens": 200}},
+    }
+    (tmp_path / ".taskwizard.models.json").write_text(
+        json.dumps({"providers": {"gateway": entry}})
+    )
+    registry = build_provider_registry(config())
+    with pytest.raises(ProviderRegistryError):
+        registry.resolve("example-model")
+
+
 def test_support_is_private_and_survives_copy_and_tool_binding():
     model = build()
     support = get_context_support(model)
@@ -254,6 +341,176 @@ def test_profile_observes_bound_protocol_features_and_output_cap():
     assert (
         model_context_profile(model.bind(max_completion_tokens=None)).max_output_tokens
         is None
+    )
+
+
+@pytest.mark.parametrize(
+    "protocol,settings",
+    [
+        ("responses", {"max_output_tokens": 123}),
+        ("responses", {"max_output_tokens": None}),
+        ("responses", {"max_tokens": 123}),
+        ("responses", {"max_tokens": None}),
+        ("responses", {"max_completion_tokens": 123}),
+        ("responses", {"max_completion_tokens": None}),
+        ("responses", {"max_output_tokens": 123, "max_completion_tokens": 456}),
+        ("responses", {"extra_body": {"max_output_tokens": 321}}),
+        ("responses", {"extra_body": {"max_output_tokens": None}}),
+        ("chat", {"max_tokens": 123}),
+        ("chat", {"max_tokens": None}),
+        ("chat", {"max_completion_tokens": 123}),
+        ("chat", {"max_completion_tokens": None}),
+        ("chat", {"max_tokens": 123, "max_completion_tokens": 456}),
+        ("chat", {"extra_body": {"max_completion_tokens": 321}}),
+    ],
+)
+def test_openai_profile_cap_matches_final_mock_http_body(protocol, settings):
+    import httpx
+    from openai import OpenAI
+
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        if protocol == "responses":
+            body = {
+                "id": "resp_synthetic",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "example-model",
+                "error": None,
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_synthetic",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {"type": "output_text", "text": "done", "annotations": []}
+                        ],
+                    }
+                ],
+            }
+        else:
+            body = {
+                "id": "chatcmpl_synthetic",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "example-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "done"},
+                    }
+                ],
+            }
+        return httpx.Response(200, json=body)
+
+    model = build(compat=ProviderCompat(request_api=protocol))
+    with OpenAI(
+        api_key="synthetic",
+        base_url="https://example.invalid/v1",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    ) as sdk:
+        model.root_client = sdk
+        model.client = sdk.chat.completions
+        bound = model.bind(**settings)
+        profile = model_context_profile(bound)
+        bound.invoke([HumanMessage(content="synthetic")])
+    key = "max_output_tokens" if protocol == "responses" else "max_completion_tokens"
+    assert len(bodies) == 1
+    assert profile.max_output_tokens == bodies[0].get(key)
+
+
+@pytest.mark.parametrize(
+    "settings", [{"max_tokens": 123}, {"extra_body": {"max_tokens": 321}}]
+)
+def test_anthropic_profile_cap_matches_final_mock_http_body(settings):
+    import anthropic
+    import httpx
+
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_synthetic",
+                "type": "message",
+                "role": "assistant",
+                "model": "example-model",
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 1},
+            },
+        )
+
+    model = build(api="anthropic-messages")
+    with anthropic.Anthropic(
+        api_key="synthetic",
+        base_url="https://example.invalid",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    ) as sdk:
+        model._client = sdk
+        bound = model.bind(**settings)
+        profile = model_context_profile(bound)
+        bound.invoke([HumanMessage(content="synthetic")])
+    assert profile.max_output_tokens == bodies[0]["max_tokens"]
+    assert model_context_profile(model.bind(max_tokens=None)).max_output_tokens is None
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"max_output_tokens": 123},
+        {"max_output_tokens": None},
+        {"generation_config": {"max_output_tokens": 234}},
+        {
+            "http_options": {
+                "extra_body": {"generationConfig": {"maxOutputTokens": 321}}
+            }
+        },
+    ],
+)
+def test_google_profile_cap_matches_final_mock_http_body(settings):
+    from google import genai
+    import httpx
+
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": "done"}]},
+                        "finishReason": "STOP",
+                    }
+                ]
+            },
+        )
+
+    model = build(api="google-generative-ai", model_id="gemini-2.5-flash")
+    with genai.Client(
+        api_key="synthetic",
+        vertexai=False,
+        http_options=genai.types.HttpOptions(
+            base_url="https://example.invalid",
+            httpx_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        ),
+    ) as sdk:
+        model.client = sdk
+        bound = model.bind(**settings)
+        profile = model_context_profile(bound)
+        bound.invoke([HumanMessage(content="synthetic")])
+    assert len(bodies) == 1
+    assert profile.max_output_tokens == bodies[0].get("generationConfig", {}).get(
+        "maxOutputTokens"
     )
 
 
@@ -340,6 +597,32 @@ def test_plugin_without_support_keeps_generic_fallback():
     assert normalize_model_usage(model, None) is None
 
 
+@pytest.mark.parametrize(
+    "support",
+    [None, SimpleNamespace(estimate=lambda *args, **kwargs: ModelInputEstimate(1))],
+)
+def test_plugin_without_cache_preparer_retains_original_cache_metadata(support):
+    model = SimpleNamespace()
+    if support is not None:
+        bind_context_support(model, support)
+    canonical = [
+        HumanMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": "legacy policy",
+                    "cache_control": {"type": "ephemeral"},
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                }
+            ]
+        )
+    ]
+    prepared = prepare_model_messages(model, canonical)
+    assert prepared.messages == canonical
+    assert prepared.messages[0] is not canonical[0]
+    assert prepared.model_kwargs == {}
+
+
 @pytest.mark.parametrize("mutation", ["delete", "text", "status", "raise"])
 def test_bad_optional_preparation_cannot_change_semantics(mutation):
     class BadSupport:
@@ -365,7 +648,13 @@ def test_bad_optional_preparation_cannot_change_semantics(mutation):
 
 @pytest.mark.parametrize(
     "settings",
-    [{"model": "different-model", "input": []}, {"extra_body": {"input": []}}],
+    [
+        {"model": "different-model", "input": []},
+        {"extra_body": {"input": []}},
+        {"extra_body": {"truncation": "auto"}},
+        {"max_tokens": 1},
+        {"extra_body": {"response_format": {"type": "json_object"}}},
+    ],
 )
 def test_cache_preparation_cannot_override_model_or_canonical_input_via_kwargs(
     settings,
@@ -378,6 +667,27 @@ def test_cache_preparation_cannot_override_model_or_canonical_input_via_kwargs(
         bind_context_support(build(), BadSupport()), [HumanMessage(content="task")]
     )
     assert prepared.model_kwargs == {} and prepared.messages[0].content == "task"
+
+
+def test_custom_cache_parameter_requires_declaration_and_cannot_relabel_semantics():
+    class Support:
+        cache_parameter_names = ("vendor_cache", "truncation", "maxTokens")
+
+        def prepare(self, model, messages, tools=()):
+            return PreparedModelMessages(messages, self.settings)
+
+    support = Support()
+    model = bind_context_support(build(), support)
+    support.settings = {"extra_body": {"vendor_cache": "stable"}}
+    assert prepare_model_messages(model, []).model_kwargs == support.settings
+    support.settings = {"extra_body": {"truncation": "auto"}}
+    assert prepare_model_messages(model, []).model_kwargs == {}
+    support.settings = {"undeclared_cache": "stable"}
+    assert prepare_model_messages(model, []).model_kwargs == {}
+    support.settings = {"maxTokens": 1}
+    assert prepare_model_messages(model, []).model_kwargs == {}
+    support.settings = {"extra_body": {"vendor_cache": {"history": []}}}
+    assert prepare_model_messages(model, []).model_kwargs == {}
 
 
 def test_estimator_receives_private_messages():
@@ -558,3 +868,38 @@ def test_unknown_native_blocks_protect_their_message_identity():
         content=[{"type": "reasoning", "encrypted_content": "synthetic"}], id="opaque"
     )
     assert model_protected_message_ids(build(), [message]) == {"opaque"}
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"extras": {"signature": "synthetic"}},
+        {"extras": {"nested": [{"thought_signature": "synthetic"}]}},
+        {"encryptedContent": "synthetic"},
+    ],
+)
+def test_standard_blocks_with_native_metadata_are_protected(metadata):
+    message = AIMessage(
+        content=[{"type": "text", "text": "signed content", **metadata}], id="signed"
+    )
+    assert model_protected_message_ids(build(), [message]) == {"signed"}
+
+
+def test_bookkeeping_and_empty_signatures_do_not_pin_ordinary_groups():
+    message = AIMessage(
+        content=[{"type": "text", "text": "ordinary", "extras": {"signature": ""}}],
+        id="ordinary",
+        additional_kwargs={"__openai_function_call_ids__": {"call": "fc_synthetic"}},
+    )
+    assert model_protected_message_ids(build(), [message]) == set()
+
+
+def test_cache_boundary_stops_before_signed_standard_text():
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": "stable"},
+            {"type": "text", "text": "signed", "extras": {"signature": "synthetic"}},
+        ]
+    )
+    prepared = prepare_model_messages(cache_model(), [message])
+    assert marked_texts(prepared.messages, "prompt_cache_breakpoint") == ["stable"]

@@ -104,9 +104,16 @@ class ContextSupport:
 是否完整、来源；插件计数方法必须是纯本地操作，不能偷偷下载图片或调用计数 API。
 
 可选 `prepare(model, messages, tools=())` 返回 `PreparedModelMessages(messages, model_kwargs)`；输入已复制。
-`prepare_model_messages` 会去掉前一协议缓存标记再调用它，并检查去掉缓存元数据后的消息语义与基线一致；
+没有提供此方法的旧模型/仅计数插件保持原消息与既有缓存字段等价，仅作深复制。有明确 prepare 方法时，
+`prepare_model_messages` 才去掉前一协议缓存标记再调用它，并检查去掉缓存元数据后的消息语义与基线一致；
 删除历史、修改工具参数/状态、抛异常等会退回合法基线。仅支持缓存元数据装饰，不允许在这个接缝里做语义
 compact。最终原生参数仍由自定义模型 serializer 负责，公共层不按 provider 名拼报文。
+
+准备阶段的调用参数默认只接受 `prompt_cache_options`、`prompt_cache_key`、`prompt_cache_retention`、
+`cache_control` 和 `cached_content`，也可放在 `extra_body` 中。插件可用
+`cache_parameter_names = ("vendor_cache",)` 声明自己的缓存参数名；未声明参数会拒绝。
+声明不能把 `truncation`、历史/模型/工具字段、输出上限、采样或输出格式等语义参数重新归类为缓存，
+包括嵌套 `extra_body` 和常见 camelCase 形式；违规准备退回基线，不能借缓存提示让服务器偷偷截历史。
 
 可选 `protected_message_ids(model, messages)` 返回不可拆原生块所属消息 id；可选 `normalize_usage(message)`
 返回 `input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens` 四个非负整数或 `None`。
@@ -117,6 +124,10 @@ compact。最终原生参数仍由自定义模型 serializer 负责，公共层�
 `ctx.on_dispose` 清理，避免按名字卸载时覆盖别的注册者。本文新增的私有模型绑定不改变旧注册 API 的签名、
 override/unregister 语义或静态装配规则。原生 continuation/compact、服务端缓存资源、价格和金额预算没有
 在这一接口中实现。
+
+标准 text/image 块也可能在 `extras.signature` 等嵌套字段携带原生重放状态。公共
+`phone_agent.v2.native_content` 的检测与 token 估计共用；签名/加密状态所属消息保持不可拆，
+`__openai_function_call_ids__` 等已知 SDK bookkeeping 不会把普通工具组永久钉住。
 
 ## 打包分发
 

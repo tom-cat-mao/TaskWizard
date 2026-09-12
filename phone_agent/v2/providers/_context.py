@@ -17,6 +17,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+from phone_agent.v2.native_content import has_native_metadata
 from phone_agent.v2.pins import TASKDOC_ID_PREFIX
 from phone_agent.v2.providers.context import (
     ModelContextProfile,
@@ -24,7 +25,12 @@ from phone_agent.v2.providers.context import (
     PreparedModelMessages,
     unwrap_model,
 )
-from phone_agent.v2.providers.types import API_ANTHROPIC, API_OPENAI, ModelSpec
+from phone_agent.v2.providers.types import (
+    API_ANTHROPIC,
+    API_GOOGLE,
+    API_OPENAI,
+    ModelSpec,
+)
 
 _TEXT_TYPES = frozenset({"text", "input_text", "output_text"})
 _KNOWN_BLOCKS = _TEXT_TYPES | {"image", "image_url", "tool_use", "tool_result"}
@@ -57,6 +63,52 @@ def _bound_settings(model: Any, tools: Any) -> tuple[Any, dict[str, Any]]:
         _, tool_settings = unwrap_model(base.bind_tools(list(tools)))
         settings = {**tool_settings, **settings}
     return base, settings
+
+
+def _request_protocol_and_cap(
+    base: Any, api: str, settings: dict[str, Any]
+) -> tuple[str, int | None]:
+    """Use the SDK's own local alias/merge rules, then its HTTP extra-body cap.
+
+    Only a synthetic text message is serialized: no request is sent, no user
+    content is inspected, and no token-count endpoint is called. Guessing the
+    first apparent token key is unsafe because SDK aliases can overwrite it.
+    """
+    sample = [HumanMessage(content="context-profile")]
+    if api == API_GOOGLE:
+        request = base._prepare_request(sample, **settings)
+        config = request["config"]
+        cap = _positive_int(config.max_output_tokens)
+        extra = getattr(getattr(config, "http_options", None), "extra_body", None)
+        if isinstance(extra, dict) and "generationConfig" in extra:
+            generation = extra["generationConfig"]
+            if not isinstance(generation, dict):
+                cap = None
+            elif "maxOutputTokens" in generation:
+                cap = _positive_int(generation["maxOutputTokens"])
+        return api, cap
+
+    payload = base._get_request_payload(sample, **settings)
+    request_api = api
+    if api == API_OPENAI:
+        request_api = "responses" if "input" in payload else "chat/completions"
+    extra = payload.get("extra_body")
+    if isinstance(extra, dict):
+        payload = {**payload, **extra}
+    key = (
+        "max_output_tokens"
+        if request_api == "responses"
+        else "max_completion_tokens"
+        if request_api == "chat/completions"
+        else "max_tokens"
+    )
+    if request_api == "chat/completions" and "max_tokens" in payload:
+        # An HTTP extra_body can reintroduce the deprecated Chat cap alongside
+        # its replacement. Server precedence is not a client-side guarantee.
+        if "max_completion_tokens" in payload:
+            return request_api, None
+        key = "max_tokens"
+    return request_api, _positive_int(payload.get(key))
 
 
 def _text_blocks(message: Any) -> list[Any]:
@@ -102,6 +154,8 @@ def _stable_candidates(
             break
         if index >= first_non_system and isinstance(message, SystemMessage):
             break
+        if has_native_metadata(getattr(message, "additional_kwargs", None)):
+            break
         hasher.update(
             _json(
                 {
@@ -113,7 +167,11 @@ def _stable_candidates(
             ).encode()
         )
         for block_index, block in enumerate(_text_blocks(message)):
-            if not isinstance(block, dict) or block.get("type") not in _TEXT_TYPES:
+            if (
+                not isinstance(block, dict)
+                or block.get("type") not in _TEXT_TYPES
+                or has_native_metadata(block)
+            ):
                 return candidates
             text = block.get("text")
             if not isinstance(text, str) or "\nmarks (" in text:
@@ -141,38 +199,12 @@ class BuiltinContextSupport:
 
     def profile(self, model: Any, tools: Any = ()) -> ModelContextProfile:
         base, settings = _bound_settings(model, tools)
-        request_api = self.api
-        if self.api == API_OPENAI:
-            params = {**base._default_params, **settings}
-            request_api = (
-                "responses" if base._use_responses_api(params) else "chat/completions"
-            )
-        cap_keys = ("max_output_tokens", "max_completion_tokens", "max_tokens")
-        extra = {
-            **(getattr(base, "extra_body", None) or {}),
-            **(settings.get("extra_body") or {}),
-        }
-        cap_settings = {**settings, **extra}
-        explicit_cap = next((key for key in cap_keys if key in cap_settings), None)
-        cap = _positive_int(cap_settings[explicit_cap]) if explicit_cap else None
-        if explicit_cap is None:
-            cap = next(
-                (
-                    value
-                    for key in (
-                        "max_output_tokens",
-                        "max_tokens",
-                        "max_completion_tokens",
-                    )
-                    if (value := _positive_int(getattr(base, key, None))) is not None
-                ),
-                self.spec.max_tokens,
-            )
+        request_api, cap = _request_protocol_and_cap(base, self.api, settings)
         return ModelContextProfile(
             context_window=self.spec.context_window,
             max_output_tokens=cap,
             request_api=request_api,
-            source="model_declaration+sdk",
+            source="model_declaration+sdk_payload",
             cache_mode=self.cache_policy,
         )
 
@@ -248,8 +280,15 @@ class BuiltinContextSupport:
             str(message.id)
             for message in messages
             if getattr(message, "id", None)
-            and any(
-                isinstance(block, dict) and block.get("type") not in _KNOWN_BLOCKS
-                for block in _text_blocks(message)
+            and (
+                has_native_metadata(getattr(message, "additional_kwargs", None))
+                or any(
+                    isinstance(block, dict)
+                    and (
+                        block.get("type") not in _KNOWN_BLOCKS
+                        or has_native_metadata(block)
+                    )
+                    for block in _text_blocks(message)
+                )
             )
         )

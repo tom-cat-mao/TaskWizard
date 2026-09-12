@@ -566,10 +566,14 @@ def _build_openai(
         if selected is not None:
             request_api_kwargs["use_responses_api"] = selected
     selected_flag = request_api_kwargs.get("use_responses_api", sampling.get("use_responses_api"))
+    response_options = {**sampling, **(compat.extra_body or {})}
     if selected_flag is False and (
-        any(sampling.get(key) is not None for key in ("context_management", "include", "reasoning", "truncation"))
-        or sampling.get("use_previous_response_id")
-        or sampling.get("output_version") == "responses/v1"
+        any(key in response_options for key in (
+            "context_management", "include", "reasoning", "truncation",
+            "previous_response_id", "text",
+        ))
+        or response_options.get("use_previous_response_id")
+        or response_options.get("output_version") == "responses/v1"
     ):
         raise ValueError("explicit Chat protocol conflicts with Responses-only settings")
     if compat.cache_policy == "stable-prefix" and selected_flag is not True:
