@@ -118,7 +118,8 @@ def estimate_message_tokens(message: Any) -> int:
     """Estimate tokens for one message (text + images + ``tool_calls`` args).
 
     Accepts either a message object (``.content``) or a raw content value
-    (``str`` | ``list[dict]``). Non-text, non-image blocks contribute nothing;
+    (``str`` | ``list[dict]``). Unknown/native blocks use a nonzero serialized
+    text estimate; that is a fallback, never an exact encrypted-token count.
     every ``tool_calls`` entry adds :func:`estimate_text_tokens` over its
     json-serialized name+args.
     """
@@ -135,10 +136,28 @@ def estimate_message_tokens(message: Any) -> int:
                         total += estimate_text_tokens(str(block.get("text", "")))
                     elif _is_image_block(block):
                         total += IMAGE_TOKEN_COST
+                    else:
+                        # Native reasoning/signature blocks must not disappear
+                        # from the gauge merely because this generic estimator
+                        # cannot interpret them. Adapters can supply real counts.
+                        payload = json.dumps(
+                            block, ensure_ascii=False, sort_keys=True, default=str
+                        )
+                        total += max(1, estimate_text_tokens(payload))
                 elif isinstance(block, str):
                     total += estimate_text_tokens(block)
     for call in _tool_calls_of(message):
         total += estimate_text_tokens(_tool_call_payload(call))
+    extras = getattr(message, "additional_kwargs", None)
+    if isinstance(extras, dict):
+        native = {
+            key: value for key, value in extras.items()
+            if key not in {"tool_calls", "function_call"} and value
+        }
+        if native:
+            total += max(1, estimate_text_tokens(json.dumps(
+                native, ensure_ascii=False, sort_keys=True, default=str
+            )))
     return total
 
 

@@ -101,7 +101,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 | 截图 + marks | 每步 | 当前世界状态；历史图片滚动剪除 |
 | 窗口结构 | 每步 | marks 按窗口分组 + 可操作性标注（windowed dump 支持时） |
 
-成本由两道闸控制：token 预算（硬上限）与两级 auto-compact（0.75 提醒收敛、0.92 折叠历史）。两者均可配置，见[配置参考](configuration.md)。
+上下文管理分开处理物理窗口、完整输入工作目标与 run token 预算。默认工作目标为 32k，压缩后目标为其 70%；窗口仍保留 0.75 提醒、0.92 触发的保护线。每轮图像/marks 清理是确定性 micro，语义摘要按完整 AI/所有 sibling 工具回执组归并，保护最新观测与当前 TaskDoc；摘要前后检查容量和净缩减，失败保留已做 micro 的基线。缓存命中不减少逻辑窗口占用，也不改变信息保留策略。详见[配置参考](configuration.md)。
 
 ## 记忆
 

@@ -97,12 +97,21 @@ provider、无法构建的显式引用不会静默改用其它 gateway；唯显�
 | `PHONE_AGENT_COMPACT` | bool | `true` | auto-compact 总开关 |
 | `PHONE_AGENT_COMPACT_WARN_RATIO` | float | `0.75` | 上下文占窗口比例达到此值时提醒模型收敛 |
 | `PHONE_AGENT_COMPACT_TRIGGER_RATIO` | float | `0.92` | 达到此值时生成 handoff 摘要并折叠历史 |
+| `PHONE_AGENT_CONTEXT_WORK_TARGET` | int | `32000` | 完整模型输入的软工作目标，含工具、任务板、历史与图片；`0` 只关闭该目标，物理窗口与 T1/T2 仍有效 |
+| `PHONE_AGENT_COMPACT_TARGET_RATIO` | float | `0.7` | 压缩后的工作目标比例，必须大于 0、小于 1；保护内容无法容纳时可见跳过，不强行删除 |
+| `PHONE_AGENT_COMPACT_SUMMARY_TOKENS` | int | `2000` | 摘要表达及接受上限；超长摘要不提交，不是价格预算 |
+| `PHONE_AGENT_COMPACT_MIN_REDUCTION_TOKENS` | int | `1000` | 摘要至少释放的输入 tokens，与相对门槛同时满足 |
+| `PHONE_AGENT_COMPACT_MIN_REDUCTION_RATIO` | float | `0.1` | 摘要至少释放原输入的比例；不得大于等于 1 |
 | `PHONE_AGENT_COMPACT_SCHEMA_RESERVE` | int | `3000` | T1/T2 比较时为随每轮请求发送的序列化工具 schema 预留的 token 数（估算不可见部分） |
 | `PHONE_AGENT_COMPACT_OUTPUT_RESERVE` | int | `2000` | T1/T2 比较时为下一轮回复预留的 token 数 |
 | `PHONE_AGENT_CONTEXT_WINDOW` | int | 按实际构建的 actor 推断，兜底 `256000` | 手动覆盖上下文窗口大小；显式值优先，未设置时按**实际构建**的 actor 模型（含构建降级后的备用目标）窗口推断 |
 | `PHONE_AGENT_MEMORY_MODEL` | str | 主模型 | compact 摘要使用的模型 |
 | `PHONE_AGENT_IMAGE_KEEP` | int | `2` | 历史中保留的含图消息数 |
 | `PHONE_AGENT_OBS_MARKS_KEEP` | int | `2` | 历史中保留完整 marks 摘要的观测数 |
+
+工作目标不改变 `contextWindow`。每轮先清理旧图/marks，再按实际模型的可选 context support 估算；provider 已计入工具定义时不重复加 schema reserve。未知/native 内容使用明确的启发式估算，不视为零成本；这不等同于真实 provider tokenizer。
+
+语义压缩只归并完整的已闭合 AI/工具组，保留原始任务、当前 TaskDoc、最新完整组、活跃图/marks 和 opaque 依赖；不截 HTML 调用参数。摘要模型输入过长时按完整组分段后合并，单组装不下则跳过。单次压缩最多 8 次逻辑摘要调用（含本层重试/合并，不包含 SDK 内部 HTTP 重试）；每次调用前检查已有 run token 预算，耗尽后不再付摘要调用。失败、超长或净缩减不足时保留已经完成必要图像清理的基线，不提交部分摘要。最终发送前还需对实际模型、最新 pins 与工具定义做容量准入，不能在 fallback 内单独截断一份临时历史。
 
 ## 界面落地（Grounding）
 
