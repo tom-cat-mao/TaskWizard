@@ -239,7 +239,12 @@ def verify_finish(session: Any, config: Any, *, model: Any | None = None) -> Ver
 
     try:
         chat = model if model is not None else _build_verifier_model(config)
-        resp = chat.invoke(messages)
+        from phone_agent.v2.middleware.context_request import invoke_with_context
+
+        resp = invoke_with_context(
+            chat, messages, role="verifier",
+            trace_recorder=getattr(session, "resolution_trace_recorder", None),
+        )
     except Exception as exc:  # noqa: BLE001 - call failure -> fail-open
         logger.warning("finish verifier call failed, fail-open: %s", exc)
         return Verdict(

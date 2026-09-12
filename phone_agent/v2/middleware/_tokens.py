@@ -24,9 +24,24 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from phone_agent.v2.native_content import (
+    CONTEXT_BOOKKEEPING_KEYS,
+    has_native_metadata,
+    native_metadata,
+)
+
+# Only these extra fields duplicate already represented calls or known SDK
+# bookkeeping. Unknown provider payloads remain counted and protected.
+CONTEXT_DUPLICATE_EXTRA_KEYS = frozenset({"tool_calls", "function_call"}) | CONTEXT_BOOKKEEPING_KEYS
+
 # Flat per-image token cost. A phone screenshot at gateway tiling lands in the
 # ~1-2k token range; 1500 is a middle estimate (design: "len//4 + 图1500").
 IMAGE_TOKEN_COST = 1500
+
+def _serialized_tokens(value: Any) -> int:
+    return max(1, estimate_text_tokens(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, default=str
+    )))
 
 # CJK codepoint ranges counted at ~1 token per character (sorted ascending).
 # Covers CJK Unified Ideographs + Extension A, CJK punctuation (，「」…), and
@@ -118,7 +133,8 @@ def estimate_message_tokens(message: Any) -> int:
     """Estimate tokens for one message (text + images + ``tool_calls`` args).
 
     Accepts either a message object (``.content``) or a raw content value
-    (``str`` | ``list[dict]``). Non-text, non-image blocks contribute nothing;
+    (``str`` | ``list[dict]``). Unknown/native blocks use a nonzero serialized
+    text estimate; that is a fallback, never an exact encrypted-token count.
     every ``tool_calls`` entry adds :func:`estimate_text_tokens` over its
     json-serialized name+args.
     """
@@ -133,12 +149,43 @@ def estimate_message_tokens(message: Any) -> int:
                 if isinstance(block, dict):
                     if block.get("type") == "text":
                         total += estimate_text_tokens(str(block.get("text", "")))
+                        metadata = native_metadata(block)
+                        if metadata:
+                            total += _serialized_tokens(metadata)
                     elif _is_image_block(block):
                         total += IMAGE_TOKEN_COST
+                        metadata = native_metadata(block)
+                        if metadata:
+                            total += _serialized_tokens(metadata)
+                    else:
+                        # Native reasoning/signature blocks must not disappear
+                        # from the gauge merely because this generic estimator
+                        # cannot interpret them. Adapters can supply real counts.
+                        payload = json.dumps(
+                            block, ensure_ascii=False, sort_keys=True, default=str
+                        )
+                        total += max(1, estimate_text_tokens(payload))
                 elif isinstance(block, str):
                     total += estimate_text_tokens(block)
     for call in _tool_calls_of(message):
         total += estimate_text_tokens(_tool_call_payload(call))
+    extras = getattr(message, "additional_kwargs", None)
+    if isinstance(extras, dict):
+        # Raw call bodies are normally already represented by tool_calls, but
+        # native metadata on those envelopes is not part of name/args above.
+        metadata = native_metadata({
+            key: extras[key] for key in ("tool_calls", "function_call") if key in extras
+        })
+        if metadata:
+            total += _serialized_tokens(metadata)
+        native = {
+            key: value for key, value in extras.items()
+            if key not in CONTEXT_DUPLICATE_EXTRA_KEYS and value
+        }
+        if native:
+            total += max(1, estimate_text_tokens(json.dumps(
+                native, ensure_ascii=False, sort_keys=True, default=str
+            )))
     return total
 
 
@@ -171,8 +218,11 @@ def usage_tokens(message: Any) -> int | None:
 
 __all__ = [
     "IMAGE_TOKEN_COST",
+    "CONTEXT_DUPLICATE_EXTRA_KEYS",
     "estimate_text_tokens",
     "estimate_message_tokens",
     "estimate_context_tokens",
+    "has_native_metadata",
+    "native_metadata",
     "usage_tokens",
 ]

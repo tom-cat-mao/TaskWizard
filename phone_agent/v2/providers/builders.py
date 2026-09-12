@@ -236,6 +236,12 @@ def effective_compat(provider: ProviderSpec, model: ModelSpec) -> ResolvedCompat
             extra_body=(
                 override.extra_body if override.extra_body is not None else base.extra_body
             ),
+            request_api=(
+                override.request_api if override.request_api is not None else base.request_api
+            ),
+            cache_policy=(
+                override.cache_policy if override.cache_policy is not None else base.cache_policy
+            ),
         )
     return base.resolved()
 
@@ -489,7 +495,12 @@ def build_model_from_resolved(
         compat=compat,
         **({STREAMING_KWARG: streaming} if builder_accepts_streaming(builder) else {}),
     )
-    return built
+    # Declaration metadata is available even when an old custom builder omits
+    # all optional context support. Preserve that known limit for final primary
+    # and fallback admission without guessing an unknown serializer's output cap.
+    from phone_agent.v2.providers.context import bind_context_declaration
+
+    return bind_context_declaration(built, model.context_window)
 
 
 def _transport_kwargs(config: "V2Config") -> dict[str, Any]:
@@ -547,6 +558,42 @@ def _build_openai(
     streaming: bool = False,
 ) -> "BaseChatModel":
     from langchain_openai import ChatOpenAI
+    from phone_agent.v2.providers._context import BuiltinContextSupport
+    from phone_agent.v2.providers.context import bind_context_support
+
+    sampling = dict(sampling)
+    request_api_kwargs: dict[str, Any] = {}
+    if compat.request_api_declared is not None:
+        selected = {"auto": None, "chat": False, "responses": True}[compat.request_api]
+        if "use_responses_api" in sampling and sampling["use_responses_api"] is not selected:
+            raise ValueError("compat.requestApi conflicts with samplingParams.use_responses_api")
+        sampling.pop("use_responses_api", None)
+        if selected is not None:
+            request_api_kwargs["use_responses_api"] = selected
+    selected_flag = request_api_kwargs.get("use_responses_api", sampling.get("use_responses_api"))
+    response_options = {**sampling, **(compat.extra_body or {})}
+    if selected_flag is False and (
+        any(key in response_options for key in (
+            "context_management", "include", "reasoning", "truncation",
+            "previous_response_id", "text",
+        ))
+        or response_options.get("use_previous_response_id")
+        or response_options.get("output_version") == "responses/v1"
+    ):
+        raise ValueError("explicit Chat protocol conflicts with Responses-only settings")
+    if compat.cache_policy == "stable-prefix" and selected_flag is not True:
+        raise ValueError("OpenAI stable-prefix caching requires explicit requestApi=responses")
+    if compat.cache_policy == "stable-prefix" and any(
+        key in sampling or key in (compat.extra_body or {})
+        for key in ("prompt_cache_options", "cache_control")
+    ):
+        raise ValueError("cachePolicy conflicts with explicit native cache options")
+    if compat.cache_policy == "stable-prefix" and (
+        sampling.get("use_previous_response_id")
+        or "previous_response_id" in sampling
+        or "previous_response_id" in (compat.extra_body or {})
+    ):
+        raise ValueError("stable-prefix cache preparation requires full client-owned history")
 
     thinking_kwargs, thinking_extra_body = translate_thinking(level, model, compat)
     extra_body = {**(compat.extra_body or {}), **thinking_extra_body}
@@ -556,6 +603,7 @@ def _build_openai(
         "model": model.id,
         **_transport_kwargs(config),
         **_streaming_kwargs(streaming),
+        **request_api_kwargs,
     }
     if compat.usage_in_streaming_declared is not None:
         kwargs["stream_usage"] = bool(compat.usage_in_streaming_declared)
@@ -586,7 +634,9 @@ def _build_openai(
     if model_kwargs:
         kwargs["model_kwargs"] = model_kwargs
     kwargs.update(thinking_kwargs)
-    return ChatOpenAI(**kwargs)
+    return bind_context_support(
+        ChatOpenAI(**kwargs), BuiltinContextSupport(API_OPENAI, model, compat.cache_policy)
+    )
 
 
 @_builtin_api(API_ANTHROPIC)
@@ -601,6 +651,15 @@ def _build_anthropic(
     compat: ResolvedCompat,
     streaming: bool = False,
 ) -> "BaseChatModel":
+    from phone_agent.v2.providers._context import BuiltinContextSupport
+    from phone_agent.v2.providers.context import bind_context_support
+
+    if compat.request_api_declared is not None:
+        raise ValueError("compat.requestApi is only supported by the OpenAI-family builder")
+    if compat.cache_policy == "stable-prefix" and (
+        "cache_control" in sampling or "cache_control" in (compat.extra_body or {})
+    ):
+        raise ValueError("cachePolicy conflicts with explicit native cache options")
     thinking_kwargs, _ = translate_thinking(level, model, compat)
     thinking_enabled = bool(thinking_kwargs.get("thinking"))
 
@@ -633,7 +692,9 @@ def _build_anthropic(
     if model_kwargs:
         kwargs["model_kwargs"] = model_kwargs
     kwargs.update(thinking_kwargs)
-    return _anthropic_client_type()(**kwargs)
+    return bind_context_support(
+        _anthropic_client_type()(**kwargs), BuiltinContextSupport(API_ANTHROPIC, model, compat.cache_policy)
+    )
 
 
 @_builtin_api(API_GOOGLE)
@@ -649,6 +710,13 @@ def _build_google(
     streaming: bool = False,
 ) -> "BaseChatModel":
     from langchain_google_genai import ChatGoogleGenerativeAI
+    from phone_agent.v2.providers._context import BuiltinContextSupport
+    from phone_agent.v2.providers.context import bind_context_support
+
+    if compat.request_api_declared is not None:
+        raise ValueError("compat.requestApi is only supported by the OpenAI-family builder")
+    if compat.cache_policy != "off":
+        raise ValueError("Google stable-prefix cache resources are not implemented")
 
     thinking_kwargs, _ = translate_thinking(level, model, compat)
     effort = thinking_kwargs.get("reasoning_effort")
@@ -680,7 +748,9 @@ def _build_google(
     if model_kwargs:
         kwargs["model_kwargs"] = model_kwargs
     kwargs.update(thinking_kwargs)
-    return ChatGoogleGenerativeAI(**kwargs)
+    return bind_context_support(
+        ChatGoogleGenerativeAI(**kwargs), BuiltinContextSupport(API_GOOGLE, model)
+    )
 
 
 # Import-time registration of the three built-in transports as registry

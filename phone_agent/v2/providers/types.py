@@ -40,6 +40,8 @@ THINKING_LEVELS = ("off", "minimal", "low", "medium", "high")
 
 # Legal streaming modes (global env, model entry, role entry).
 STREAMING_MODES = ("off", "on")
+REQUEST_APIS = ("auto", "chat", "responses")
+CACHE_POLICIES = ("off", "stable-prefix")
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,18 @@ class ProviderCompat:
     supports_parallel_tool_calls: bool | None = None
     # Verbatim extra-body escape hatch merged into the request (openai path).
     extra_body: dict | None = None
+    # OpenAI-family request selection. None inherits; explicit auto resets a
+    # provider-level choice to the historical SDK selection behavior.
+    request_api: str | None = None
+    # Explicit opt-in AND declaration that the gateway supports native markers.
+    # No gateway is assumed to support active caching when this is absent.
+    cache_policy: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.request_api is not None and self.request_api not in REQUEST_APIS:
+            raise ValueError("compat.requestApi must be auto, chat, or responses")
+        if self.cache_policy is not None and self.cache_policy not in CACHE_POLICIES:
+            raise ValueError("compat.cachePolicy must be off or stable-prefix")
 
     def resolved(self) -> "ResolvedCompat":
         """Fill in the built-in defaults for every ``None`` field."""
@@ -83,6 +97,9 @@ class ProviderCompat:
                 else self.supports_parallel_tool_calls
             ),
             extra_body=dict(self.extra_body or {}),
+            request_api=self.request_api or "auto",
+            request_api_declared=self.request_api,
+            cache_policy=self.cache_policy or "off",
         )
 
 
@@ -96,6 +113,9 @@ class ResolvedCompat:
     supports_parallel_tool_calls: bool
     extra_body: dict
     usage_in_streaming_declared: bool | None = None
+    request_api: str = "auto"
+    request_api_declared: str | None = None
+    cache_policy: str = "off"
 
 
 @dataclass(frozen=True)

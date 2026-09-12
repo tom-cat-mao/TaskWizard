@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from phone_agent.grounding.provider import MarkProvider
     from phone_agent.v2.config import V2Config
     from phone_agent.v2.appkb import AppKnowledge, AppKnowledgeStore
+    from phone_agent.v2.review import FinishReviewTicket
     from phone_agent.v2.taskdoc import TaskDoc
     from phone_agent.v2.usage import UsageLedger
 
@@ -329,6 +330,7 @@ class PhoneSession:
         self.last_tool_ok: bool | None = None
         self.finish_reviewed: bool = False
         self.finish_review_seq: int = -1
+        self.finish_review_ticket: FinishReviewTicket | None = None
         self.finish_dispute_count: int = 0
         # Hard-contradiction labels captured by the most recent review packet
         # (review.py). The finish verifier trigger (S2 §4.1.2) reads this to
@@ -837,6 +839,9 @@ class PhoneSession:
         (``secure_screenshot_blocked``) retains no frame.
         """
 
+        # Even a failed observation supersedes the evidence underlying a
+        # token-boundary finish continuation; failure keeps screen_seq frozen.
+        self.finish_review_ticket = None
         if settle_ms is None:
             effective_settle_ms = int(
                 getattr(self.config, "observe_settle_ms", 300) or 0

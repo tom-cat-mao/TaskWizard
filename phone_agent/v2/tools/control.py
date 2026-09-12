@@ -155,6 +155,9 @@ def build_control_tools(session, config) -> list[StructuredTool]:
         # pre-two-step single-call landing (no review packet, no seq guard).
         mode = getattr(config, "finish_verify", "auto") or "auto"
         if mode == "off":
+            from phone_agent.v2.review import store_finish_review_ticket
+
+            store_finish_review_ticket(session, None)
             session.finished = True
             session.finish_summary = summary
             return "已记录完成声明"
@@ -180,6 +183,9 @@ def build_control_tools(session, config) -> list[StructuredTool]:
             session.finished = True
             session.finish_summary = summary
             session.finish_reviewed = False
+            from phone_agent.v2.review import store_finish_review_ticket
+
+            store_finish_review_ticket(session, None)
             return "已确认完成"
 
         # First stage (or a stale confirm): build + return the review packet and

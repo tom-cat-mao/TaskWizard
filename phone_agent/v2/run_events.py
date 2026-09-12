@@ -25,6 +25,7 @@ from phone_agent.v2.middleware.streaming import (
     model_with_stream_observer,
 )
 from phone_agent.v2.middleware.trace import redact_args
+from phone_agent.v2.usage import usage_details
 
 OBS_RE = re.compile(r"\[OBS\]\s+app=(?P<app>.*?)\s+screen#(?P<seq>\d+)")
 _SAFETY_MARKERS = ("⚠️ 已拦截（未执行）", "confirm_irreversible=true")
@@ -284,6 +285,7 @@ class WebEventMiddleware(AgentMiddleware):
             "tokens": turn_tokens,
             "tokens_total": self._tokens,
             "error": redact_text(error) if error else None,
+            **usage_details(message),
         }
         # Observe-only model-identity fields (safe labels, never credentials).
         # ``requested_model`` is the bound model reference; ``actual_model`` is

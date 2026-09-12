@@ -117,6 +117,14 @@ class ProviderRegistry:
                 raise UnknownProviderError(
                     f"default provider {provider_id!r} is not registered"
                 )
+        # Ordinary invalid declarations remain skippable. An explicitly invalid
+        # new protocol/cache choice may not become an automatic gateway call.
+        errors = getattr(self, "context_selection_errors", {})
+        if errors.get((provider_id, model_id)) or errors.get((provider_id, None)):
+            raise ProviderRegistryError(
+                f"invalid explicit context configuration for {provider_id}:{model_id}; "
+                "see declaration_warnings"
+            )
         model = provider.get_model(model_id)
         if model is not None:
             return ResolvedModel(provider=provider, model=model, ref=clean)

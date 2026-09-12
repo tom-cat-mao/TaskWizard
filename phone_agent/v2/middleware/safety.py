@@ -475,7 +475,12 @@ def build_safety_reviewer(
             content=f"工具：{tool_name}\n目标文本：{summary}\n该动作是否不可逆？"
         )
         messages = [system, human]
-        resp = model.invoke(messages)
+        from phone_agent.v2.middleware.context_request import invoke_with_context
+
+        resp = invoke_with_context(
+            model, messages, role="reviewer",
+            trace_recorder=getattr(session, "resolution_trace_recorder", None),
+        )
         ledger = getattr(session, "usage_ledger", None)
         if ledger is not None:
             try:

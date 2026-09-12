@@ -2104,7 +2104,9 @@ def _apply_self_grading(
         return _grading_records(candidates, fact_sheets, grades)
     started = time.monotonic()
     try:
-        response = model.invoke(messages)
+        from phone_agent.v2.middleware.context_request import invoke_with_context
+
+        response = invoke_with_context(model, messages, role="distill")
     except Exception as exc:  # noqa: BLE001 - grading is advisory, never fatal
         ledger.record("distill", estimate_tokens=request_estimate)
         _record_grading_failure(
@@ -2342,7 +2344,9 @@ def _distill_batch(
 
     started = time.monotonic()
     try:
-        response = model.invoke(messages)
+        from phone_agent.v2.middleware.context_request import invoke_with_context
+
+        response = invoke_with_context(model, messages, role="distill")
     except Exception as exc:  # noqa: BLE001 - transient failure: retry later
         ledger.record("distill", estimate_tokens=request_estimate)
         return (

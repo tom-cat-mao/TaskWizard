@@ -12,6 +12,7 @@ JSONL trace and asserts that:
 from __future__ import annotations
 
 import json
+import importlib
 import sys
 import types
 from dataclasses import dataclass, field
@@ -105,6 +106,10 @@ def _build_fake_tools(session: _FakeSession) -> list:
 def warned_agent(tmp_path, monkeypatch):
     """Assemble a headless agent whose first tool call is blocked by safety."""
 
+    # The real observation formatter is used by the harness even with fake
+    # tools. Load it before replacing its parent package, independent of test
+    # collection order (the full suite otherwise happened to import it first).
+    importlib.import_module("phone_agent.v2.tools._obs")
     session = _FakeSession()
 
     responses = [

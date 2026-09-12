@@ -260,6 +260,8 @@ class TraceWriter:
     def on_model_request(self, request, next):  # noqa: ANN001
         """Wrap the real model call: step, latency, error, model_call event."""
 
+        from phone_agent.v2.usage import usage_details
+
         self._step += 1
         step = self._step
         started = time.perf_counter()
@@ -283,6 +285,7 @@ class TraceWriter:
                 "step": step,
                 "latency_ms": int((time.perf_counter() - started) * 1000),
                 "error": None,
+                **usage_details(response),
             }
         )
         return response

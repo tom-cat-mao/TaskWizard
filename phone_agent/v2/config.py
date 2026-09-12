@@ -292,6 +292,13 @@ class V2Config:
     compact_warn_ratio: float = 0.75
     compact_trigger_ratio: float = 0.92
     context_window: int | None = None
+    # Full-input soft work target; independent of physical model capacity.
+    # Zero disables only this target, preserving T1/T2 capacity compaction.
+    context_work_target: int = 32_000
+    compact_target_ratio: float = 0.7
+    compact_summary_tokens: int = 2000
+    compact_min_reduction_tokens: int = 1000
+    compact_min_reduction_ratio: float = 0.1
     # Request-overhead reserves (S1 context hardening): the transcript estimate
     # sees message contents only — the serialized tool schemas sent with every
     # request and the tokens the next model reply needs are invisible to it.
@@ -576,6 +583,15 @@ class V2Config:
             context_window=(
                 _env_int("PHONE_AGENT_CONTEXT_WINDOW", 0) or None
             ),
+            context_work_target=_env_int("PHONE_AGENT_CONTEXT_WORK_TARGET", 32_000),
+            compact_target_ratio=_env_float("PHONE_AGENT_COMPACT_TARGET_RATIO", 0.7),
+            compact_summary_tokens=_env_int("PHONE_AGENT_COMPACT_SUMMARY_TOKENS", 2000),
+            compact_min_reduction_tokens=_env_int(
+                "PHONE_AGENT_COMPACT_MIN_REDUCTION_TOKENS", 1000
+            ),
+            compact_min_reduction_ratio=_env_float(
+                "PHONE_AGENT_COMPACT_MIN_REDUCTION_RATIO", 0.1
+            ),
             compact_schema_reserve=_env_int(
                 "PHONE_AGENT_COMPACT_SCHEMA_RESERVE", 3000
             ),
@@ -743,4 +759,14 @@ class V2Config:
         if not config.alias_overwrite_notes:
             raise ValueError("PHONE_AGENT_ALIAS_OVERWRITE_NOTES must not be empty")
 
+        if config.context_work_target < 0:
+            raise ValueError("PHONE_AGENT_CONTEXT_WORK_TARGET must be non-negative")
+        if not 0.0 < config.compact_target_ratio < 1.0:
+            raise ValueError("PHONE_AGENT_COMPACT_TARGET_RATIO must be between 0 and 1 (exclusive)")
+        if config.compact_summary_tokens <= 0:
+            raise ValueError("PHONE_AGENT_COMPACT_SUMMARY_TOKENS must be positive")
+        if config.compact_min_reduction_tokens < 0:
+            raise ValueError("PHONE_AGENT_COMPACT_MIN_REDUCTION_TOKENS must be non-negative")
+        if not 0.0 <= config.compact_min_reduction_ratio < 1.0:
+            raise ValueError("PHONE_AGENT_COMPACT_MIN_REDUCTION_RATIO must be between 0 (inclusive) and 1 (exclusive)")
         return config
