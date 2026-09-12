@@ -135,3 +135,57 @@ def test_undeclared_legacy_capacity_remains_unknown(factory):
     assert model_context_profile(model).context_window is None
     observer = ContextRequestObserver(settings())
     observer.prepare(ModelRequest(model=model, messages=[HumanMessage(content="字" * 2500)]))
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_real_thin_agent_retains_legacy_window_at_final_admission(tmp_path, monkeypatch, compact):
+    """Exercise bootstrap, real capabilities and final dispatch, not just helpers."""
+    from phone_agent.v2.agent import ThinPhoneAgent
+    from phone_agent.v2.capabilities import CapabilitySpec
+    from phone_agent.v2.config import V2Config
+    from phone_agent.v2.providers import register_provider
+    from phone_agent.v2.session import Observation, PhoneSession
+    from tests.v2._doubles import FakeDeviceFactory
+
+    device = FakeDeviceFactory()
+    monkeypatch.setattr("phone_agent.v2.session.get_device_factory", lambda: device)
+
+    def observe(session, **kwargs):
+        session.screen_seq += 1
+        session.epoch += 1
+        return Observation(
+            "U1lOVEhFVElD", 800, 1200, "com.synthetic.app", [],
+            session.screen_seq, epoch=session.epoch,
+        )
+
+    monkeypatch.setattr(PhoneSession, "observe", observe)
+    model = LegacyModel()
+
+    def builder(provider, spec, config, *, sampling, headers, level, compat):
+        return model
+
+    def apply(ctx):
+        register_api_builder(API, builder)
+        ctx.on_dispose(lambda: unregister_api_builder(API))
+        register_provider(ctx, ProviderSpec(
+            id="legacy", api=API, models={"actor": ModelSpec(id="actor", context_window=1000)},
+        ))
+
+    declaration = tmp_path / "models.json"
+    declaration.write_text('{"providers": {}}')
+    config = V2Config(
+        base_url="https://synthetic.invalid/v1", model_name="legacy:actor", models_file=str(declaration),
+        memory_dir=str(tmp_path / "memory"), trace_dir=str(tmp_path / "trace"),
+        experience_enabled=False, memory_rag="off", app_kb_enabled=False,
+        resolver_embed=False, deliverable_enabled=False, compact_enabled=compact,
+        context_window=None, safety_mode="off", observe_settle_ms=0,
+    )
+    try:
+        agent = ThinPhoneAgent(config, extra_capabilities=[CapabilitySpec(
+            "legacy_provider", "Synthetic legacy provider", "on", deps=("providers",), apply=apply,
+        )])
+        with pytest.raises(ContextCapacityError, match="capacity=1000"):
+            agent.run("Read the synthetic result")
+        assert model.calls == 0
+    finally:
+        unregister_api_builder(API)
