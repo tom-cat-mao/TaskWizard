@@ -145,6 +145,17 @@ def _grading_payload(model: _ScriptedModel) -> dict:
     return json.loads(str(model.calls[1][-1].content).split("\n", 1)[1])
 
 
+def _lesson_events(lessons_dir: Path) -> list[dict]:
+    path = lessons_dir / "events.jsonl"
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def _batch_with_errors() -> list[dict]:
     """Every run succeeds, yet every run carries error receipts."""
 
@@ -367,6 +378,52 @@ def test_rule_grading_call_failure_is_fail_open(tmp_path):
     assert result.groups_rejected == 0
     events = LessonStore(tmp_path / "lessons").events_path.read_text(encoding="utf-8")
     assert '"grade": "needs_review"' in events
+    # The swallowed call-2 failure now carries a fingerprint audit event; the
+    # fail-open verdict itself is unchanged.
+    failed = [
+        item
+        for item in _lesson_events(tmp_path / "lessons")
+        if item["type"] == "distill_grading_failed"
+    ]
+    assert len(failed) == 1
+    assert failed[0]["schema_v"] == 1
+    assert failed[0]["reason"] == "transport"
+    assert failed[0]["run_ids"] == ["run-0", "run-1"]
+    assert failed[0]["batch_size"] == 2
+    assert failed[0]["last_error"] == "RuntimeError"
+    assert failed[0]["last_error_class"] == "builtins.RuntimeError"
+    assert failed[0]["last_error_detail"] == "grading transport down"
+    assert failed[0]["last_error_status"] is None
+    assert failed[0]["last_error_cause"] is None
+    assert failed[0]["last_error_phase"] == "grade"
+    assert isinstance(failed[0]["last_error_elapsed_ms"], int)
+
+
+def test_rule_grading_parse_failure_is_recorded_and_fail_open(tmp_path):
+    events_path = tmp_path / "experience/events.jsonl"
+    _write_events(events_path, _batch_with_errors())
+    model = _ScriptedModel(
+        json.dumps(
+            {"rules": [_slim_rule(["run-0", "run-1"], ["search_flight", "search_hotel"])]},
+            ensure_ascii=False,
+        ),
+        "not json at all",
+    )
+
+    result = distill_lessons(events_path, tmp_path / "lessons", model=model)
+
+    assert [item.status for item in result.proposed] == ["needs_review"]
+    failed = [
+        item
+        for item in _lesson_events(tmp_path / "lessons")
+        if item["type"] == "distill_grading_failed"
+    ]
+    assert len(failed) == 1
+    assert failed[0]["reason"] == "parse"
+    assert failed[0]["last_error"] == "JSONDecodeError"
+    assert failed[0]["last_error_class"] == "json.decoder.JSONDecodeError"
+    assert failed[0]["last_error_phase"] == "grade"
+    assert "Expecting value" in failed[0]["last_error_detail"]
 
 
 def test_runtime_fact_sheet_carries_every_unified_field(tmp_path):

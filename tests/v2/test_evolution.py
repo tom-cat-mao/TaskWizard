@@ -901,11 +901,17 @@ def test_distill_transient_failure_is_retried_not_skipped(tmp_path):
     # The cursor did not move; the failed batch is recorded for the retry.
     assert state["last_ts_end"] == 0.0
     assert state["last_run_id"] == ""
-    assert state["failed_batch"] == {
-        "run_ids": ["run-0", "run-1"],
-        "attempts": 1,
-        "last_error": "RuntimeError",
-    }
+    failed = state["failed_batch"]
+    assert failed["run_ids"] == ["run-0", "run-1"]
+    assert failed["attempts"] == 1
+    # The legacy class-name field is kept; the fingerprint extends it.
+    assert failed["last_error"] == "RuntimeError"
+    assert failed["last_error_class"] == "builtins.RuntimeError"
+    assert failed["last_error_detail"] == "transport down"
+    assert failed["last_error_status"] is None
+    assert failed["last_error_cause"] is None
+    assert failed["last_error_phase"] == "extract"
+    assert isinstance(failed["last_error_elapsed_ms"], int)
     assert not [
         item for item in _events(lessons_dir) if "distill_batch" in item["type"]
     ]
@@ -923,6 +929,127 @@ def test_distill_transient_failure_is_retried_not_skipped(tmp_path):
     assert "run-1" in str(good.calls[0])
     state = json.loads((lessons_dir / "distill_state.json").read_text())
     assert state == {"last_ts_end": 2.0, "last_run_id": "run-1"}
+
+
+class _GatewayError(RuntimeError):
+    """Transport error shaped like an SDK exception: status + response."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status_code = status
+        self.response = SimpleNamespace(status_code=status)
+
+
+class _RaisingModel:
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+        self.calls: list = []
+
+    def invoke(self, messages):  # noqa: ANN001
+        self.calls.append(messages)
+        raise self.exc
+
+
+def test_distill_failure_fingerprint_is_redacted_and_bounded(tmp_path):
+    events_path = tmp_path / "experience/events.jsonl"
+    lessons_dir = tmp_path / "lessons"
+    _write_episodes(
+        events_path,
+        [_episode("run-0", success=True, goal="查询机票", reason="finished", ts=1)],
+    )
+    try:
+        try:
+            raise TimeoutError("connect timeout after 30s")
+        except TimeoutError as inner:
+            raise _GatewayError(
+                "gateway 502\nauthorization: Bearer sk-live-abcdef123456 "
+                + "upstream exploded " * 25,
+                502,
+            ) from inner
+    except _GatewayError as exc:
+        raised = exc
+
+    result = distill_lessons(events_path, lessons_dir, model=_RaisingModel(raised))
+
+    assert result.retried is True
+    failed = json.loads((lessons_dir / "distill_state.json").read_text())[
+        "failed_batch"
+    ]
+    assert failed["last_error"] == "_GatewayError"
+    assert failed["last_error_class"].endswith("._GatewayError")
+    assert failed["last_error_status"] == 502
+    assert failed["last_error_cause"] == "TimeoutError"
+    assert failed["last_error_phase"] == "extract"
+    assert isinstance(failed["last_error_elapsed_ms"], int)
+    detail = failed["last_error_detail"]
+    # One line, bounded, and the credential never lands on disk (P0 #6).
+    assert "\n" not in detail
+    assert len(detail) <= 200
+    assert "sk-live-abcdef123456" not in detail
+    assert "<redacted>" in detail
+
+
+def test_distill_extract_parse_failure_names_the_call_and_error(tmp_path):
+    events_path = tmp_path / "experience/events.jsonl"
+    lessons_dir = tmp_path / "lessons"
+    _write_episodes(
+        events_path,
+        [_episode("run-0", success=True, goal="查询机票", reason="finished", ts=1)],
+    )
+
+    result = distill_lessons(
+        events_path, lessons_dir, model=_FakeModel("not json at all")
+    )
+
+    assert result.retried is True
+    failed = json.loads((lessons_dir / "distill_state.json").read_text())[
+        "failed_batch"
+    ]
+    assert failed["last_error"] == "JSONDecodeError"
+    assert failed["last_error_class"] == "json.decoder.JSONDecodeError"
+    assert failed["last_error_phase"] == "extract"
+    assert "Expecting value" in failed["last_error_detail"]
+
+
+def test_distill_legacy_failed_batch_record_is_upgraded_on_retry(tmp_path):
+    events_path = tmp_path / "experience/events.jsonl"
+    lessons_dir = tmp_path / "lessons"
+    lessons_dir.mkdir(parents=True)
+    (lessons_dir / "distill_state.json").write_text(
+        json.dumps(
+            {
+                "last_ts_end": 0.0,
+                "last_run_id": "",
+                "failed_batch": {
+                    "run_ids": ["run-0", "run-1"],
+                    "attempts": 1,
+                    "last_error": "RuntimeError",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_episodes(
+        events_path,
+        [
+            _episode("run-0", success=False, goal="打开 A", reason="failed", ts=1),
+            _episode("run-1", success=True, goal="查询机票", reason="finished", ts=2),
+        ],
+    )
+
+    result = distill_lessons(events_path, lessons_dir, model=_ExplodingModel())
+
+    # An old-format record keeps counting attempts and gains the fingerprint.
+    assert result.retried is True
+    failed = json.loads((lessons_dir / "distill_state.json").read_text())[
+        "failed_batch"
+    ]
+    assert failed["run_ids"] == ["run-0", "run-1"]
+    assert failed["attempts"] == 2
+    assert failed["last_error"] == "RuntimeError"
+    assert failed["last_error_class"] == "builtins.RuntimeError"
+    assert failed["last_error_detail"] == "transport down"
+    assert failed["last_error_phase"] == "extract"
 
 
 def test_distill_three_strikes_abandons_batch_with_explicit_event(tmp_path):
@@ -955,6 +1082,9 @@ def test_distill_three_strikes_abandons_batch_with_explicit_event(tmp_path):
     assert abandoned[0]["run_ids"] == ["run-0", "run-1"]
     assert abandoned[0]["attempts"] == 3
     assert abandoned[0]["last_error"] == "RuntimeError"
+    assert abandoned[0]["last_error_class"] == "builtins.RuntimeError"
+    assert abandoned[0]["last_error_detail"] == "transport down"
+    assert abandoned[0]["last_error_phase"] == "extract"
     assert abandoned[0]["reason"] == "repeated_model_failure"
     state = json.loads((lessons_dir / "distill_state.json").read_text())
     assert state == {"last_ts_end": 2.0, "last_run_id": "run-1"}
