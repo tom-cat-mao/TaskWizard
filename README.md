@@ -72,6 +72,23 @@ cp .env.example .env
 
 旧自定义 Provider 无需实现新 context 接口；已有模型窗口声明仍用于每次主/备用请求准入，未声明的能力保持未知。
 
+## 开发诊断（Coding Agent）
+
+[真机诊断 Skill](.agents/skills/phone-agent-live-diagnosis/SKILL.md) 供 Pi、Codex、CodeBuddy 等编程 Agent
+组织 Case、启动正式 runner、监控与转交人工交互，并生成离线 HTML 回放。报告区分运行终局、Case 检查点
+与诊断推断；缺少证据不会自动判通过。`.agents/skills` 是权威源，`.claude/skills`、`.codebuddy/skills`
+保留相对符号链接兼容入口。
+
+```bash
+S=.agents/skills/phone-agent-live-diagnosis/scripts/run_diagnosis.py
+.venv/bin/python "$S" dry-run
+.venv/bin/python "$S" start path/to/case.json
+.venv/bin/python "$S" monitor <run_dir>
+.venv/bin/python "$S" analyze <run_dir>
+```
+
+合成检查不代表真机或网关验收；报告和截图仅留本地，不能将完整运行目录当作脱敏分享包。
+
 ## 文档
 
 - **完整文档站：<https://tom-cat-mao.github.io/TaskWizard/>**（源文件在 [`pages/`](pages/)）

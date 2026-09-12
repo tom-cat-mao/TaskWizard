@@ -37,6 +37,20 @@ FAKE_KEY = "sk-abcDEF0123456789xyz"
 LONG_MARK_DIGEST = "; ".join(f"m{i}:按钮{i}" for i in range(12))
 
 
+@pytest.fixture(autouse=True)
+def _no_project_models(monkeypatch):
+    """Keep the offline run independent of any local ``.taskwizard.models.json``.
+
+    These tests stub ``phone_agent.v2.model``; if the provider loader discovers a
+    real project models file it imports ``build_default_headers`` from the (now
+    stubbed) module and errors. Neutralize discovery so the smoke is hermetic.
+    """
+
+    from phone_agent.v2.providers import loader
+
+    monkeypatch.setattr(loader, "candidate_paths", lambda config=None: [])
+
+
 class ScriptedToolModel(BaseChatModel):
     responses: list[AIMessage]
     i: int = 0
@@ -169,7 +183,6 @@ def _build_tools(session: FakeSession):
 
 def _run_scripted(tmp_path: Path, responses: list[AIMessage]) -> tuple[str, FakeSession]:
     """Assemble + run a ThinPhoneAgent over the injected fakes; return evidence path."""
-
     config = FakeConfig(diagnostic_evidence_dir=str(tmp_path / ".evidence"))
     session = FakeSession(config=config)
     model = ScriptedToolModel(responses=responses)
@@ -178,8 +191,14 @@ def _run_scripted(tmp_path: Path, responses: list[AIMessage]) -> tuple[str, Fake
     model_mod.build_chat_model = lambda cfg, *args, **kwargs: model
     session_mod = types.ModuleType("phone_agent.v2.session")
     session_mod.PhoneSession = lambda cfg: session
+    # Keep the real package ``__path__`` so runtime submodule imports
+    # (``phone_agent.v2.tools._obs`` / ``.control`` / ``.taskdoc`` /
+    # ``.deliverable``) still resolve while ``build_tools`` is stubbed.
+    import phone_agent.v2.tools as _real_tools
+
     tools_mod = types.ModuleType("phone_agent.v2.tools")
     tools_mod.build_tools = lambda sess, cfg: _build_tools(sess)
+    tools_mod.__path__ = list(getattr(_real_tools, "__path__", []))
     prompts_mod = types.ModuleType("phone_agent.v2.prompts")
     prompts_mod.get_system_prompt = lambda lang="cn": "你是手机智能体。"
 

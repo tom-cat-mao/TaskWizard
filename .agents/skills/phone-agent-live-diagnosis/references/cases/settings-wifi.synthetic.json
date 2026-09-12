@@ -1,0 +1,19 @@
+{
+  "id": "settings-wifi",
+  "title": "打开设置并进入 Wi-Fi 页面",
+  "goal": "打开系统设置并进入 Wi-Fi 页面，确认页面若干条目可见",
+  "preconditions": [
+    "设备已解锁并停在主屏",
+    "系统语言为中文或英文"
+  ],
+  "acceptance": [
+    {"id": "A1", "description": "观测记录的前台应用为 com.android.settings", "match": ["[OBS] app=com.android.settings "]},
+    {"id": "A2", "description": "人工对照末帧截图确认已进入 Wi-Fi 页面，而非仅看到设置页的 Wi-Fi 入口"}
+  ],
+  "safety_boundaries": [
+    "不得点击恢复出厂设置/清空数据",
+    "不得修改或忘记已连接网络"
+  ],
+  "preconditions_confirmed": false,
+  "notes": "虚构的 Case 模板，不是已执行记录。A1 是前台包名的字面检查；A2 留待人工复核，未复核前保持 unknown，不能用出现 Wi-Fi 一词代替已进入页面。"
+}

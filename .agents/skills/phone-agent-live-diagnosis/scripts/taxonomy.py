@@ -23,6 +23,8 @@ SRC_OBS = "phone_agent/v2/tools/_obs.py"
 SRC_CONTROL = "phone_agent/v2/tools/control.py"
 SRC_TASKDOC = "phone_agent/v2/tools/taskdoc.py"
 SRC_DELIVERABLE = "phone_agent/v2/tools/deliverable.py"
+SRC_SAFETY = "phone_agent/v2/middleware/safety.py"
+SRC_REVIEW = "phone_agent/v2/review.py"
 
 
 @dataclass(frozen=True)
@@ -144,7 +146,7 @@ RESULT_CLASSES: tuple[ResultClass, ...] = (
     ResultClass("未写入（输入无效）：", "taskdoc_input_invalid", "taskdoc", SRC_TASKDOC),
     ResultClass("未写入（校验失败）：", "taskdoc_validation_failed", "taskdoc", SRC_TASKDOC),
     ResultClass("已更新任务板。", "taskdoc_ok", "taskdoc", SRC_TASKDOC),
-    # --- finish gate -----------------------------------------------------
+    # --- finish gate (two-step review + independent verifier, S2 §1/§4) ----
     ResultClass(
         "error: finish requires non-empty evidence",
         "finish_no_evidence",
@@ -157,7 +159,18 @@ RESULT_CLASSES: tuple[ResultClass, ...] = (
         "finish_gate",
         SRC_CONTROL,
     ),
+    ResultClass("[FINISH 复核包]", "finish_review_packet", "finish_gate", SRC_REVIEW),
+    ResultClass("已确认完成", "finish_confirmed", "finish_gate", SRC_CONTROL),
     ResultClass("已记录完成声明", "finish_ok", "finish_gate", SRC_CONTROL),
+    ResultClass("验收未通过：", "verifier_reject", "finish_verifier", SRC_CONTROL),
+    ResultClass(
+        "验收器再次驳回（第 ",
+        "verifier_dispute_takeover",
+        "finish_verifier",
+        SRC_CONTROL,
+    ),
+    # --- safety warning flow (wary default; S2 §3 / U2) --------------------
+    ResultClass("⚠️ 已拦截（未执行）", "safety_warning", "safety", SRC_SAFETY),
     # --- hitl ------------------------------------------------------------
     ResultClass("[ASK_USER] ", "ask_user", "hitl", SRC_CONTROL),
     ResultClass("已请求人工接管:", "takeover_requested", "hitl", SRC_CONTROL),
