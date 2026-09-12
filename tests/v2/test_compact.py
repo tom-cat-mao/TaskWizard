@@ -70,10 +70,12 @@ class ScriptModel:
         self.fail_times = fail_times
         self.calls = 0
         self.last_messages: list[Any] | None = None
+        self.requests: list[list[Any]] = []
 
     def invoke(self, messages):  # noqa: ANN001
         self.calls += 1
         self.last_messages = messages
+        self.requests.append(messages)
         if self.calls <= self.fail_times:
             raise RuntimeError("input too long")
         return AIMessage(content=self.text)
@@ -176,7 +178,9 @@ def test_t2_fold_rebuilds_with_summary_and_pinned():
     )
     # pinned TaskDoc preserved (kept verbatim, at the tail).
     assert taskdoc is rebuilt[-1]
-    assert model.calls == 1
+    # The source also has to fit this 20k summary model: two complete-group
+    # chunks and one merge, without deleting the oldest source group.
+    assert model.calls == 3
 
 
 def test_t2_appends_memory_capability_state_without_sending_it_to_llm():
@@ -343,8 +347,8 @@ def test_t2_iterative_does_not_feed_deterministic_memory_section_to_llm():
     assert "old-candidate" not in prompt
 
 
-def test_t2_ptl_retry_then_success():
-    # First summariser call fails (too long); the retry (older group dropped) wins.
+def test_t2_retry_preserves_source_then_success():
+    # A retry keeps exactly the same source, including the oldest group.
     session = FakeSession(task_doc=FakeTaskDoc())
     config = FakeConfig(context_window=20_000)
     model = ScriptModel(text="ok summary", fail_times=1)
@@ -354,7 +358,8 @@ def test_t2_ptl_retry_then_success():
 
     result = mw.before_model({"messages": msgs}, runtime=None)
     assert result is not None
-    assert model.calls == 2  # one failure + one success
+    assert model.calls == 4  # two chunks, one merge, and one identical retry
+    assert model.requests[0] == model.requests[1]
     summaries = [
         m for m in result["messages"] if isinstance(m, SystemMessage) and m.content.startswith("[COMPACT_SUMMARY]")
     ]

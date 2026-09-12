@@ -343,12 +343,46 @@ class _WrapModelBridgeMiddleware(AgentMiddleware):
         config: Any | None = None,
         fallback_provider: Callable[[], Any] | None = None,
         primary_ref: str = "",
+        trace_recorder: Callable[..., Any] | None = None,
     ) -> None:
         super().__init__()
         self._event_bus = event_bus
         self._config = config
         self._fallback_provider = fallback_provider
         self._primary_ref = str(primary_ref or "")
+        self._context_observer = None
+        if config is not None:
+            from phone_agent.v2.middleware.context_request import ContextRequestObserver
+
+            self._context_observer = ContextRequestObserver(config, trace_recorder)
+
+    def reset(self) -> None:
+        if self._context_observer is not None:
+            self._context_observer.reset()
+
+    def _invoke_attempt(self, request, handler):  # noqa: ANN001
+        if self._context_observer is None:
+            return handler(request)
+        prepared, attempt = self._context_observer.prepare(request)
+        try:
+            response = handler(prepared)
+        except Exception as exc:
+            self._context_observer.record_result(prepared, attempt, None, exc)
+            raise
+        self._context_observer.record_result(prepared, attempt, response, None)
+        return response
+
+    async def _ainvoke_attempt(self, request, handler):  # noqa: ANN001
+        if self._context_observer is None:
+            return await handler(request)
+        prepared, attempt = self._context_observer.prepare(request)
+        try:
+            response = await handler(prepared)
+        except Exception as exc:
+            self._context_observer.record_result(prepared, attempt, None, exc)
+            raise
+        self._context_observer.record_result(prepared, attempt, response, None)
+        return response
 
     def _requested_ref(self) -> str:
         if self._primary_ref:
@@ -375,7 +409,7 @@ class _WrapModelBridgeMiddleware(AgentMiddleware):
 
     def _invoke_with_fallback(self, request, handler):  # noqa: ANN001
         try:
-            return handler(request)
+            return self._invoke_attempt(request, handler)
         except Exception as primary_exc:
             fallback = self._fallback()
             if fallback is None:
@@ -383,7 +417,7 @@ class _WrapModelBridgeMiddleware(AgentMiddleware):
             model, ref = fallback
             requested = self._requested_ref()
             try:
-                response = handler(request.override(model=model))
+                response = self._invoke_attempt(request.override(model=model), handler)
             except Exception as fallback_exc:
                 self._record(
                     requested=requested,
@@ -402,7 +436,7 @@ class _WrapModelBridgeMiddleware(AgentMiddleware):
 
     async def _ainvoke_with_fallback(self, request, handler):  # noqa: ANN001
         try:
-            return await handler(request)
+            return await self._ainvoke_attempt(request, handler)
         except Exception as primary_exc:
             fallback = self._fallback()
             if fallback is None:
@@ -410,7 +444,7 @@ class _WrapModelBridgeMiddleware(AgentMiddleware):
             model, ref = fallback
             requested = self._requested_ref()
             try:
-                response = await handler(request.override(model=model))
+                response = await self._ainvoke_attempt(request.override(model=model), handler)
             except Exception as fallback_exc:
                 self._record(
                     requested=requested,
@@ -830,6 +864,8 @@ class ThinPhoneAgent:
                 model=self.model,
                 memory_state_provider=self._compact_memory_state,
                 pruner=pruner,
+                tools_provider=lambda: list(getattr(self, "tools", None) or []),
+                trace_recorder=getattr(self._trace, "record_event", None),
             )
 
         def budget_middleware_factory():
@@ -839,6 +875,7 @@ class ThinPhoneAgent:
                 lang=getattr(config, "lang", "cn"),
                 ledger=self.usage_ledger,
                 trace_recorder=getattr(self._trace, "record_event", None),
+                session=self.session,
             )
 
         def taskdoc_tool_factory():
@@ -961,13 +998,15 @@ class ThinPhoneAgent:
             ),
             order=45,
         )
+        self._model_request_bridge = _WrapModelBridgeMiddleware(
+            self.event_bus,
+            config=config,
+            fallback_provider=lambda: self._actor_fallback,
+            primary_ref=self._actor_actual_ref,
+            trace_recorder=getattr(self._trace, "record_event", None),
+        )
         self._capability_ctx.register_core_middleware(
-            _WrapModelBridgeMiddleware(
-                self.event_bus,
-                config=config,
-                fallback_provider=lambda: self._actor_fallback,
-                primary_ref=self._actor_actual_ref,
-            ),
+            self._model_request_bridge,
             order=46,
         )
         self._capability_ctx.register_core_middleware(
@@ -1913,6 +1952,8 @@ class ThinPhoneAgent:
             usage_ledger.reset()
         if getattr(self, "_budget", None) is not None:
             self._budget.reset()
+        if getattr(self, "_model_request_bridge", None) is not None:
+            self._model_request_bridge.reset()
         if getattr(self, "_compact", None) is not None:
             try:
                 self._compact.reset()

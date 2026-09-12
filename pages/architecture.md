@@ -101,7 +101,25 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 | 截图 + marks | 每步 | 当前世界状态；历史图片滚动剪除 |
 | 窗口结构 | 每步 | marks 按窗口分组 + 可操作性标注（windowed dump 支持时） |
 
-成本由两道闸控制：token 预算（硬上限）与两级 auto-compact（0.75 提醒收敛、0.92 折叠历史）。两者均可配置，见[配置参考](configuration.md)。
+上下文管理分开处理物理窗口、完整输入工作目标与 run token 预算。默认工作目标为 32k，压缩后目标为其 70%；窗口仍保留 0.75 提醒、0.92 触发的保护线。每轮图像/marks 清理是确定性 micro，语义摘要按完整 AI/所有 sibling 工具回执组归并，保护最新观测与当前 TaskDoc；摘要前后检查容量和净缩减，失败保留已做 micro 的基线。缓存命中不减少逻辑窗口占用，也不改变信息保留策略。详见[配置参考](configuration.md)。
+
+工作目标是软限制。保护内容超过软低水位时，物理容量修复仍可进行并标注 `soft_target_unattainable`；不能为凑目标删除完整工具组。原生签名/加密元数据在标准块的嵌套 `extras` 中也受到保护。若必须 micro 的旧观测含无法合法保留的签名，先全量预检再明确失败，不静默丢签名、挪签名或放宽 K。
+
+### 上下文请求与缓存观测
+
+主模型与已配置的备用模型每次尝试各自进行 Provider 上下文准备和容量检查。缓存标记只添加到请求副本，
+不写回任务历史；备用模型不会继承首选的缓存标记，也不会为了适应较小窗口在请求里偷偷删历史。
+摘要、验收器、安全复核和离线蒸馏同样使用模型自己的准备能力；验收器仍只读取独立的目标与证据上下文。
+
+生产 trace 的 `context_request` 给出实际客户端协议、估算来源/覆盖范围、容量判断及有序消息差异。
+`fingerprint_basis=ordered_client_messages` 只表示 SDK 调用前的消息顺序；Provider 仍可能提升 system 或合并块，
+不能拿它当服务端精确 token 前缀。`model_attempt_usage` 的 `attempt_scope=handler_invoke` 区分显式备用尝试，
+不声称已观察 SDK/网关内部每次 HTTP 重试。
+
+`model_call` / 模型事件新增可空 `input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`。
+缺失和明确 0 分开；兼容普通、priority、flex 的缓存明细。只输出数字，不输出 prompt、HTML、认证信息或截图。
+有完整数据时，输入加权命中率为 `Σcache_read_tokens / Σinput_tokens`；缓存输入仍计入上下文与原 token 预算。
+这些字段用于定位缓存行为，不引入金额预算或价格换算。
 
 ## 记忆
 
