@@ -41,6 +41,7 @@ import threading
 import time
 from typing import Any
 
+from phone_agent.config.redact import redact_context_text
 from phone_agent.v2.middleware._tokens import (
     estimate_context_tokens,
     estimate_message_tokens,
@@ -2069,7 +2070,9 @@ def _apply_self_grading(
     harness only supplies facts, the model owns the verdict.  Both calls are
     charged to the ``distill`` ledger role.  Any failure (budget, transport,
     malformed grades) is fail-open: every candidate stays at ``needs_review``
-    rather than being dropped.
+    rather than being dropped.  A transport or parse failure is additionally
+    written to the lesson events as a ``distill_grading_failed`` audit record
+    (redacted fingerprint only) — the verdict semantics never change.
     """
 
     if not candidates:
@@ -2099,10 +2102,18 @@ def _apply_self_grading(
     if token_budget is not None and ledger.total + request_estimate > token_budget:
         # Out of budget: keep every candidate at needs_review, drop nothing.
         return _grading_records(candidates, fact_sheets, grades)
+    started = time.monotonic()
     try:
         response = model.invoke(messages)
-    except Exception:  # noqa: BLE001 - grading is advisory, never fatal
+    except Exception as exc:  # noqa: BLE001 - grading is advisory, never fatal
         ledger.record("distill", estimate_tokens=request_estimate)
+        _record_grading_failure(
+            store,
+            group,
+            reason="transport",
+            exc=exc,
+            elapsed_ms=_elapsed_ms(started),
+        )
     else:
         ledger.record(
             "distill",
@@ -2111,8 +2122,15 @@ def _apply_self_grading(
         )
         try:
             grades = _parse_grades(response)
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
             grades = {}
+            _record_grading_failure(
+                store,
+                group,
+                reason="parse",
+                exc=exc,
+                elapsed_ms=_elapsed_ms(started),
+            )
     return _grading_records(candidates, fact_sheets, grades)
 
 
@@ -2149,6 +2167,112 @@ _DISTILL_STATE_FILE = "distill_state.json"
 # advanced past it and the data loss is made explicit and audible
 # (``distill_batch_abandoned`` event) — fail-open, but never silent.
 _DISTILL_MAX_ATTEMPTS = 3
+# Failure fingerprints are diagnostics, not payloads: text is single-lined,
+# regex-redacted (P0 #6 — no api keys/auth headers/response bodies), capped
+# at 200 chars, and the cause chain is bounded and cycle-safe.
+_DISTILL_ERROR_DETAIL_CHARS = 200
+_DISTILL_ERROR_CAUSE_DEPTH = 3
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.monotonic() - started) * 1000))
+
+
+def _error_text(value: Any) -> str | None:
+    """Single-line, redacted, length-bounded diagnostic text; never raises."""
+
+    try:
+        text = _single_line(value)
+    except Exception:  # noqa: BLE001 - a diagnosis must never break the caller
+        return None
+    if not text:
+        return None
+    return redact_context_text(text)[:_DISTILL_ERROR_DETAIL_CHARS] or None
+
+
+def _exception_status_code(exc: BaseException) -> int | None:
+    """Best-effort HTTP status from ``exc.status_code`` / ``exc.response.status_code``."""
+
+    owners = [exc]
+    try:
+        owners.append(getattr(exc, "response", None))
+    except Exception:  # noqa: BLE001 - a diagnosis must never break the caller
+        pass
+    for owner in owners:
+        try:
+            status = getattr(owner, "status_code", None)
+        except Exception:  # noqa: BLE001 - a diagnosis must never break the caller
+            continue
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    return None
+
+
+def _exception_cause_chain(exc: BaseException) -> str | None:
+    """Bounded, cycle-safe ``__cause__`` chain of bare exception class names."""
+
+    names: list[str] = []
+    seen = {id(exc)}
+    cause = exc.__cause__
+    while (
+        cause is not None
+        and id(cause) not in seen
+        and len(names) < _DISTILL_ERROR_CAUSE_DEPTH
+    ):
+        seen.add(id(cause))
+        names.append(type(cause).__name__)
+        cause = cause.__cause__
+    return " <- ".join(names) or None
+
+
+def _error_fingerprint(
+    exc: BaseException, *, phase: str, elapsed_ms: int | None = None
+) -> dict[str, Any]:
+    """Return the redacted fingerprint of one failed distill model call.
+
+    ``phase`` names the failing call: ``"extract"`` (call-1 candidate
+    extraction), ``"grade"`` (call-2 self-grading), or ``"batch"`` (the
+    pipeline around them).  ``last_error`` keeps the legacy bare class name;
+    the ``last_error_*`` keys extend it without breaking old readers.
+    """
+
+    cls = type(exc)
+    return {
+        "last_error": cls.__name__,
+        "last_error_class": f"{cls.__module__}.{cls.__qualname__}",
+        "last_error_detail": _error_text(exc),
+        "last_error_status": _exception_status_code(exc),
+        "last_error_cause": _exception_cause_chain(exc),
+        "last_error_phase": phase,
+        "last_error_elapsed_ms": elapsed_ms,
+    }
+
+
+def _error_record_fields(info: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize an error fingerprint to the fixed ``failed_batch`` schema.
+
+    Tolerates partial legacy input (for example a bare ``{"last_error": ...}``)
+    and re-applies the text hygiene, so every reader sees the same keys.
+    """
+
+    last_error = _error_text(info.get("last_error")) or "UnexpectedError"
+    status = info.get("last_error_status")
+    elapsed = info.get("last_error_elapsed_ms")
+    return {
+        "last_error": last_error,
+        "last_error_class": _error_text(info.get("last_error_class")) or last_error,
+        "last_error_detail": _error_text(info.get("last_error_detail")),
+        "last_error_status": (
+            status if isinstance(status, int) and not isinstance(status, bool) else None
+        ),
+        "last_error_cause": _error_text(info.get("last_error_cause")),
+        "last_error_phase": _error_text(info.get("last_error_phase")),
+        "last_error_elapsed_ms": (
+            elapsed
+            if isinstance(elapsed, int) and not isinstance(elapsed, bool)
+            else None
+        ),
+    }
 
 
 def _distill_state_path(lessons_dir: str | os.PathLike[str]) -> Path:
@@ -2204,22 +2328,30 @@ def _distill_batch(
     token_budget: int | None,
     ledgers: Mapping[str, Sequence[Mapping[str, Any]]],
     appkb_dir: str | os.PathLike[str] | None,
-) -> tuple[str, str | None, int, list[LessonCandidate]]:
+) -> tuple[str, dict[str, Any] | None, int, list[LessonCandidate]]:
     """Run one batch through the model and persist whatever it supports.
 
-    Returns ``(outcome, error_type, rejected, proposed)``.  ``outcome`` is
+    Returns ``(outcome, error_info, rejected, proposed)``.  ``outcome`` is
     ``"processed"`` (the model call completed, with or without candidates),
     ``"skipped"`` (consumed but rejected by a deterministic budget rule), or
     ``"failed"`` (transport or parse failure — the batch stays pending and is
-    retried by the next distill run).  ``error_type`` is the exception class
-    name of a failure, else ``None``.
+    retried by the next distill run).  ``error_info`` is the redacted
+    fingerprint of the failure (:func:`_error_fingerprint`) with phase
+    ``"extract"`` for call-1, else ``None``.
     """
 
+    started = time.monotonic()
     try:
         response = model.invoke(messages)
     except Exception as exc:  # noqa: BLE001 - transient failure: retry later
         ledger.record("distill", estimate_tokens=request_estimate)
-        return "failed", type(exc).__name__, 1, []
+        return (
+            "failed",
+            _error_fingerprint(exc, phase="extract", elapsed_ms=_elapsed_ms(started)),
+            1,
+            [],
+        )
+    invoke_ms = _elapsed_ms(started)
     ledger.record(
         "distill",
         response,
@@ -2230,7 +2362,12 @@ def _distill_batch(
     try:
         candidates = _validate_model_candidates(response, batch)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        return "failed", type(exc).__name__, 1, []
+        return (
+            "failed",
+            _error_fingerprint(exc, phase="extract", elapsed_ms=invoke_ms),
+            1,
+            [],
+        )
     if not candidates:
         return "processed", None, 0, []
     # Second call: the harness supplies per-card facts, the model self-grades
@@ -2286,6 +2423,39 @@ def _append_distill_event(store: LessonStore, event: Mapping[str, Any]) -> None:
         pass
 
 
+def _record_grading_failure(
+    store: LessonStore,
+    group: Sequence[Mapping[str, Any]],
+    *,
+    reason: str,
+    exc: BaseException,
+    elapsed_ms: int,
+) -> None:
+    """Audit one swallowed call-2 grading failure (``transport``/``parse``).
+
+    Grading stays fail-open: this only appends a diagnostic event carrying the
+    redacted fingerprint, and any recording failure is itself swallowed.
+    """
+
+    try:
+        _append_distill_event(
+            store,
+            {
+                "type": "distill_grading_failed",
+                "schema_v": 1,
+                "ts": time.time(),
+                "reason": reason,
+                "run_ids": _batch_signature(group),
+                "batch_size": len(group),
+                **_error_record_fields(
+                    _error_fingerprint(exc, phase="grade", elapsed_ms=elapsed_ms)
+                ),
+            },
+        )
+    except Exception:  # noqa: BLE001 - recording must never break fail-open grading
+        pass
+
+
 def _register_batch_failure(
     store: LessonStore,
     lessons_dir: str | os.PathLike[str],
@@ -2293,16 +2463,21 @@ def _register_batch_failure(
     *,
     signature: Sequence[str],
     batch_key: tuple[float, str],
-    error_type: str,
+    error_info: Mapping[str, Any],
 ) -> bool:
     """Record one failed batch attempt in the distill state; abandon on the third.
 
     The cursor never moves on a failure, so the next distill run reselects the
     same batch (fail-open: a transient model outage must never become a
-    permanent skip).  After ``_DISTILL_MAX_ATTEMPTS`` consecutive failures of
-    the same batch signature the cursor is advanced past the batch and the loss
-    is made explicit with a ``distill_batch_abandoned`` event.  Returns
-    ``True`` when the batch was abandoned.
+    permanent skip).  The ``failed_batch`` record keeps the legacy ``last_error``
+    class-name string and extends it with the redacted fingerprint fields
+    (``last_error_class`` / ``last_error_detail`` / ``last_error_status`` /
+    ``last_error_cause`` / ``last_error_phase`` / ``last_error_elapsed_ms``),
+    so old readers that only know ``last_error`` keep working.  After
+    ``_DISTILL_MAX_ATTEMPTS`` consecutive failures of the same batch signature
+    the cursor is advanced past the batch and the loss is made explicit with a
+    ``distill_batch_abandoned`` event.  Returns ``True`` when the batch was
+    abandoned.
     """
 
     cursor_ts, cursor_run = _distill_cursor(state)
@@ -2314,6 +2489,7 @@ def _register_batch_failure(
         except (TypeError, ValueError):
             attempts = 0
     attempts += 1
+    failure_fields = _error_record_fields(error_info)
     if attempts < _DISTILL_MAX_ATTEMPTS:
         _write_distill_state(
             lessons_dir,
@@ -2323,7 +2499,7 @@ def _register_batch_failure(
                 "failed_batch": {
                     "run_ids": list(signature),
                     "attempts": attempts,
-                    "last_error": error_type,
+                    **failure_fields,
                 },
             },
         )
@@ -2343,7 +2519,7 @@ def _register_batch_failure(
             "run_ids": list(signature),
             "batch_size": len(signature),
             "attempts": attempts,
-            "last_error": error_type,
+            **failure_fields,
         },
     )
     return True
@@ -2370,11 +2546,13 @@ def distill_lessons(
     call completed (with or without candidates), or the batch was
     consumed-but-rejected by a deterministic budget rule (a
     ``distill_batch_skipped`` event records the reason).  A transport or parse
-    failure leaves the cursor in place and records the failed batch (run ids +
-    attempt count) in the state file, so the next distill run retries it; after
-    three failed attempts on the same batch signature the cursor is advanced
-    past the batch and a ``distill_batch_abandoned`` event makes the data loss
-    explicit (see :func:`_register_batch_failure`).
+    failure leaves the cursor in place and records the failed batch (run ids,
+    attempt count, and the redacted error fingerprint — class, bounded message,
+    HTTP status, cause chain, failing call, elapsed ms) in the state file, so
+    the next distill run retries it; after three failed attempts on the same
+    batch signature the cursor is advanced past the batch and a
+    ``distill_batch_abandoned`` event makes the data loss explicit (see
+    :func:`_register_batch_failure`).
 
     A second model call self-grades every surviving candidate: the harness
     supplies a fact sheet, the model answers ``auto_approved`` or
@@ -2406,7 +2584,7 @@ def distill_lessons(
     rejected = 0
     proposed: list[LessonCandidate] = []
     outcome = "failed"
-    error_type = "UnexpectedError"
+    error_info: Mapping[str, Any] | None = None
     skip_reason = ""
     try:
         if token_budget is not None and active_ledger.total >= token_budget:
@@ -2420,7 +2598,7 @@ def distill_lessons(
             ):
                 rejected, outcome, skip_reason = 1, "skipped", "token_budget"
             else:
-                outcome, error_type, rejected, proposed = _distill_batch(
+                outcome, error_info, rejected, proposed = _distill_batch(
                     batch,
                     messages=messages,
                     request_estimate=request_estimate,
@@ -2438,7 +2616,7 @@ def distill_lessons(
             state,
             signature=signature,
             batch_key=batch_key,
-            error_type=type(exc).__name__,
+            error_info=_error_fingerprint(exc, phase="batch"),
         )
         raise
 
@@ -2467,7 +2645,8 @@ def distill_lessons(
             state,
             signature=signature,
             batch_key=batch_key,
-            error_type=error_type,
+            error_info=error_info
+            or {"last_error": "UnexpectedError", "last_error_phase": "batch"},
         ):
             abandoned = 1
         else:
