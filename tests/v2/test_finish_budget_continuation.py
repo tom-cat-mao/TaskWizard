@@ -152,7 +152,14 @@ def _review(session, *, mode="always"):
 
 
 def _harness(
-    monkeypatch, responses, *, session=None, verifier=None, mode="always", limit=100
+    monkeypatch,
+    responses,
+    *,
+    session=None,
+    verifier=None,
+    mode="always",
+    limit=100,
+    extra_tools=(),
 ):
     from phone_agent.v2 import verify
 
@@ -195,6 +202,7 @@ def _harness(
             *build_control_tools(session, config),
             make_update_task_doc_tool(session, "cn"),
             synthetic_device_action,
+            *extra_tools,
         ],
         middleware=[
             _ModelPreRequestBridgeMiddleware(bus, admission.is_terminal),
@@ -660,3 +668,189 @@ def test_real_session_failed_observation_invalidates_ticket(monkeypatch):
         session.observe()
     assert session.finish_review_ticket is None
     assert session.screen_seq == 0
+
+
+def _uncertain_back_session():
+    """Real session/back tool with a fake command that changes world then fails."""
+
+    from phone_agent.v2.tools.actuation import build_actuation_tools
+    from tests.v2.test_observation_lifecycle import _session
+
+    session = _session()
+    session.config.observe_settle_ms = 0
+    session.config.finish_verify = "auto"
+    session.task_doc = _closed_board()
+    session.run_goal = session.task_doc.goal_base
+    session.last_tool_ok = True
+    session.usage_ledger = UsageLedger()
+    world = {"screen": "result", "dispatches": 0}
+
+    def uncertain_back(*, device_id=None):
+        world["screen"] = "previous screen"
+        world["dispatches"] += 1
+        raise RuntimeError("synthetic transport failed after dispatch")
+
+    session.device_factory.back = uncertain_back
+    back = next(
+        action
+        for action in build_actuation_tools(session, session.config)
+        if action.name == "back"
+    )
+    return session, back, world
+
+
+@pytest.mark.parametrize("review_before_dispatch", [True, False])
+def test_unknown_real_back_dispatch_requires_a_subsequent_review(
+    monkeypatch, review_before_dispatch
+):
+    session, back, world = _uncertain_back_session()
+    calls = [_finish("review"), _call("back", "back", intent="Go back")]
+    if not review_before_dispatch:
+        calls.reverse()
+    harness = _harness(
+        monkeypatch,
+        [_response(*calls, tokens=1100), _response(_finish("confirm", confirm=True))],
+        session=session,
+        mode="auto",
+        extra_tools=[back],
+    )
+    result = _invoke(harness)
+    receipt = next(
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage) and message.tool_call_id == "back"
+    )
+    assert "设备结果无法确认" in receipt.content
+    assert world == {"screen": "previous screen", "dispatches": 1}
+    assert session.last_tool_ok is False
+    if review_before_dispatch:
+        # No observation followed the uncertain command, so seq alone is not
+        # proof that the world underlying the earlier review still exists.
+        assert session.screen_seq == 1
+        assert session.finish_reviewed is True
+        assert pending_finish_review(session) is None
+        assert harness.model.calls == 1
+        assert session.finished is False
+        assert harness.verifier.requests == []
+        assert "granted" not in _stages(harness)
+    else:
+        # A genuine new review after a failed action can still be confirmed.
+        # Do not replace review provenance with a last_tool_ok=False shortcut.
+        assert session.finished is True
+        assert harness.model.calls == 2
+        assert len(harness.verifier.requests) == 1
+        assert session.finish_verifier == "pass"
+
+
+@pytest.mark.parametrize(
+    "name", ["back", "tap", "type_text", "write_document", "unknown_plugin_tool"]
+)
+@pytest.mark.parametrize("raises", [False, True])
+def test_ordinary_delegation_supersedes_review_before_any_unknown_result(name, raises):
+    session = _Session(task_doc=_closed_board())
+    _review(session)
+    seq = session.screen_seq
+    ledger = session.usage_ledger
+    budget = BudgetMiddleware(token_budget=1000, ledger=ledger, session=session)
+    dispatched = []
+
+    def dispatch(request):
+        assert session.finish_review_ticket is None
+        dispatched.append(name)
+        if raises:
+            raise RuntimeError("synthetic failure after dispatch")
+        return "error: dispatched, outcome unknown"
+
+    request = SimpleNamespace(tool_call=_call(name, "ordinary"))
+    if raises:
+        with pytest.raises(RuntimeError, match="after dispatch"):
+            budget.on_tool_execute(request, dispatch)
+    else:
+        assert "outcome unknown" in budget.on_tool_execute(request, dispatch)
+    assert dispatched == [name]
+    assert session.screen_seq == seq
+    ledger.record("actor", estimate_tokens=1000)
+    assert budget.before_model({"messages": []}, None)["jump_to"] == "end"
+
+
+@pytest.mark.parametrize(
+    "name,decision,args",
+    [
+        (
+            "ask_user",
+            {"type": "respond", "message": "Continue"},
+            {"question": "Continue?"},
+        ),
+        ("take_over", {"type": "reject"}, {"reason": "Human review"}),
+    ],
+)
+def test_post_hitl_ordinary_dispatch_cannot_reuse_pre_interrupt_review(
+    monkeypatch, name, decision, args
+):
+    session, back, world = _uncertain_back_session()
+    harness = _harness(
+        monkeypatch,
+        [
+            _response(
+                _finish("review"),
+                _call(name, "hitl", **args),
+                _call("back", "back", intent="Go back"),
+                tokens=1100,
+            ),
+            _response(_finish("confirm", confirm=True)),
+        ],
+        session=session,
+        mode="auto",
+        extra_tools=[back],
+    )
+    interrupted = _invoke(harness)
+    assert interrupted["__interrupt__"]
+    assert world["dispatches"] == 0
+    assert pending_finish_review(session) is not None
+    harness.graph.invoke(Command(resume={"decisions": [decision]}), harness.config)
+    assert world["dispatches"] == 1
+    assert pending_finish_review(session) is None
+    assert session.finished is False
+    assert harness.model.calls == 1
+    assert "granted" not in _stages(harness)
+
+
+def test_unexecuted_human_question_does_not_invalidate_review(monkeypatch):
+    harness = _harness(
+        monkeypatch,
+        [
+            _response(
+                _finish("review"),
+                _call("ask_user", "ask", question="Is the result ready?"),
+                tokens=1100,
+            ),
+            _response(_finish("confirm", confirm=True)),
+        ],
+    )
+    interrupted = _invoke(harness)
+    assert interrupted["__interrupt__"]
+    ticket = pending_finish_review(harness.session)
+    assert ticket is not None
+    harness.graph.invoke(
+        Command(resume={"decisions": [{"type": "respond", "message": "Yes"}]}),
+        harness.config,
+    )
+    assert harness.session.finished is True
+    assert harness.model.calls == 2
+    assert _stages(harness).count("granted") == 1
+
+
+def test_normal_attribute_style_tool_request_keeps_delegation_compatible():
+    session = _Session(task_doc=_closed_board())
+    _review(session)
+    budget = BudgetMiddleware(session=session)
+    request = SimpleNamespace(
+        tool_call=SimpleNamespace(name="unknown_plugin_tool", id="plugin", args={})
+    )
+    delegated = []
+    result = budget.on_tool_execute(
+        request, lambda call: delegated.append(call) or "plugin result"
+    )
+    assert result == "plugin result"
+    assert delegated == [request]
+    assert pending_finish_review(session) is None

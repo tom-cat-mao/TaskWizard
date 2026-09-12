@@ -293,11 +293,21 @@ class BudgetMiddleware(AgentMiddleware):
         this fence activates only when the extra actor request actually runs.
         """
 
-        if not self._finish_continuation_active:
-            return next(request)
         call = getattr(request, "tool_call", None) or {}
+        if not isinstance(call, dict):
+            call = {key: getattr(call, key, None) for key in ("name", "id", "args")}
         name = str(call.get("name") or "")
         call_id = str(call.get("id") or "")
+        if not self._finish_continuation_active:
+            if name != "finish" and self._session is not None:
+                from phone_agent.v2.review import store_finish_review_ticket
+
+                # Dispatch can change the world even when the tool later fails
+                # before observe() (screen_seq then stays frozen). A delegated
+                # ordinary/plugin tool supersedes the old review regardless of
+                # its result; only a subsequent successful review can replace it.
+                store_finish_review_ticket(self._session, None)
+            return next(request)
         if name in {"ask_user", "take_over"}:
             return next(request)
 
