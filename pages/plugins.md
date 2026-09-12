@@ -75,6 +75,60 @@ model/request:      trace → diagnostic
 
 除监听器外，`apply(ctx)` 里还可以挂：工具（模型可见）、提示块（system 前缀/后缀/消息）、run hooks（开始/结束）、CLI 子命令。完整 API 见 `phone_agent/v2/capabilities.py::CapabilityAssemblyContext`。
 
+## 可选模型上下文支持
+
+自定义 API builder 仍返回 LangChain `BaseChatModel`；不要求实现另一套 wire IR。可用
+`phone_agent.v2.providers.bind_context_support(model, support)` 将支持对象私有地绑定到模型：
+
+```python
+from phone_agent.v2.providers import (
+    ModelContextProfile, ModelInputEstimate, bind_context_support,
+)
+
+class ContextSupport:
+    def profile(self, model, tools=()):
+        return ModelContextProfile(context_window=48000, request_api="my-api", source="plugin")
+
+    def estimate(self, model, messages, tools=()):
+        # Replace with your local counter; explicitly state coverage and precision.
+        count = local_estimate(messages, tools)
+        return ModelInputEstimate(count, includes_tools=True, complete=False, source="plugin-local")
+
+# In your existing builder, after constructing the BaseChatModel:
+# return bind_context_support(model, ContextSupport())
+```
+
+上述方法是可选的。无支持对象的旧模型继续走原调用与通用估算；普通 `model_copy()` / `bind_tools()` 后，
+公共 helpers 仍能找到模型的支持对象。不要把支持对象放进发给 SDK/浏览器的 `metadata` 或 `model_kwargs`。
+`model_context_profile`、`estimate_model_input` 报告实际模型容量/输出 cap，以及计数是否覆盖 tools/images、
+是否完整、来源；插件计数方法必须是纯本地操作，不能偷偷下载图片或调用计数 API。
+
+可选 `prepare(model, messages, tools=())` 返回 `PreparedModelMessages(messages, model_kwargs)`；输入已复制。
+没有提供此方法的旧模型/仅计数插件保持原消息与既有缓存字段等价，仅作深复制。有明确 prepare 方法时，
+`prepare_model_messages` 才去掉前一协议缓存标记再调用它，并检查去掉缓存元数据后的消息语义与基线一致；
+删除历史、修改工具参数/状态、抛异常等会退回合法基线。仅支持缓存元数据装饰，不允许在这个接缝里做语义
+compact。最终原生参数仍由自定义模型 serializer 负责，公共层不按 provider 名拼报文。
+
+准备阶段的调用参数默认只接受 `prompt_cache_options`、`prompt_cache_key`、`prompt_cache_retention`、
+`cache_control` 和 `cached_content`，也可放在 `extra_body` 中。插件可用
+`cache_parameter_names = ("vendor_cache",)` 声明自己的缓存参数名；未声明参数会拒绝。
+声明不能把 `truncation`、历史/模型/工具字段、输出上限、采样或输出格式等语义参数重新归类为缓存，
+包括嵌套 `extra_body` 和常见 camelCase 形式；违规准备退回基线，不能借缓存提示让服务器偷偷截历史。
+
+可选 `protected_message_ids(model, messages)` 返回不可拆原生块所属消息 id；可选 `normalize_usage(message)`
+返回 `input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens` 四个非负整数或 `None`。
+解释不了的字段保留 `None`，不制造零；不返回其他 raw 字段。原 `AIMessage.usage_metadata` 仍是预算的基础协议。
+
+支持对象由模型持有，没有新增进程全局注册表。现有 `register_api_builder` 是旧的进程级接口，
+`register_provider` 对已有 registry 的内部修改也不会自动成为 owner 挂载；插件仍须为这类资源安排
+`ctx.on_dispose` 清理，避免按名字卸载时覆盖别的注册者。本文新增的私有模型绑定不改变旧注册 API 的签名、
+override/unregister 语义或静态装配规则。原生 continuation/compact、服务端缓存资源、价格和金额预算没有
+在这一接口中实现。
+
+标准 text/image 块也可能在 `extras.signature` 等嵌套字段携带原生重放状态。公共
+`phone_agent.v2.native_content` 的检测与 token 估计共用；签名/加密状态所属消息保持不可拆，
+`__openai_function_call_ids__` 等已知 SDK bookkeeping 不会把普通工具组永久钉住。
+
 ## 打包分发
 
 插件以 pip 包或本地目录分发；`plugin add` 只做 pip 安装或在 manifest 里登记本地路径（`cmd_add` 不见其他资源注入逻辑，

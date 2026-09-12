@@ -30,6 +30,18 @@ from phone_agent.v2.providers.builders import (
     translate_thinking,
     unregister_api_builder,
 )
+from phone_agent.v2.providers.context import (
+    ModelContextProfile,
+    ModelInputEstimate,
+    PreparedModelMessages,
+    bind_context_support,
+    estimate_model_input,
+    get_context_support,
+    model_context_profile,
+    model_protected_message_ids,
+    normalize_model_usage,
+    prepare_model_messages,
+)
 from phone_agent.v2.providers.loader import (
     DeclarationWarning,
     ModelsFileError,
@@ -152,4 +164,14 @@ __all__ = [
     "THINKING_LEVELS",
     "translate_thinking",
     "unregister_api_builder",
+    "ModelContextProfile",
+    "ModelInputEstimate",
+    "PreparedModelMessages",
+    "bind_context_support",
+    "estimate_model_input",
+    "get_context_support",
+    "model_context_profile",
+    "model_protected_message_ids",
+    "normalize_model_usage",
+    "prepare_model_messages",
 ]
