@@ -436,8 +436,17 @@ def build_safety_reviewer(
     cheap), never the full transcript. Any construction error yields ``None``.
     """
 
-    model_name = getattr(config, "safety_reviewer_model", None) or getattr(
-        config, "verifier_model", None
+    registry = getattr(config, "_provider_registry", None)
+    role_model = None
+    if registry is not None:
+        from phone_agent.v2.providers.roles import get_role_specs
+
+        spec = get_role_specs(registry).get("safety_reviewer")
+        role_model = getattr(spec, "model", None)
+    model_name = (
+        getattr(config, "safety_reviewer_model", None)
+        or role_model
+        or getattr(config, "verifier_model", None)
     )
     if not model_name:
         return None
@@ -445,7 +454,9 @@ def build_safety_reviewer(
     try:
         from phone_agent.v2.model import build_role_model
 
-        model = build_role_model(config, role="safety_reviewer")
+        model = build_role_model(
+            config, role="safety_reviewer", registry=registry
+        )
     except Exception:  # noqa: BLE001 - unbuildable reviewer -> fail-closed (None)
         return None
 

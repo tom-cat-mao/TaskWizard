@@ -432,6 +432,89 @@ def test_entrance_delivery_merges_card_and_app_rules(tmp_path):
     assert injector.injected_rule_ids == ["les_00000000000a", "les_00000000000b"]
 
 
+def test_pending_card_and_rule_revoked_after_selection_are_not_emitted(tmp_path):
+    rule_id = "les_00000000000a"
+    injector, trace = _injector(
+        tmp_path, selector=_card_selector(), rules=[_rule(rule_id, "待撤销规则")]
+    )
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": APP, "device_id": "serial-1"})
+
+    view = Path(injector.config.lessons_dir) / "lessons.json"
+    payload = json.loads(view.read_text(encoding="utf-8"))
+    for lesson in payload:
+        if lesson["lesson_id"] in {CARD_ID, rule_id}:
+            lesson["status"] = "revoked"
+    view.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    messages = injector.on_pre_request(
+        [SystemMessage(content="SYSTEM")], next=lambda value: value
+    )
+    rendered = "\n".join(str(message.content) for message in messages)
+    assert PROCEDURE_CARD_PREFIX not in rendered
+    assert APP_RULES_PREFIX not in rendered
+    assert CARD_ID not in injector.injected_ids
+    assert rule_id not in injector.injected_rule_ids
+    assert not any(event == "procedure_injection" for event, _ in trace)
+
+
+def test_pending_rule_version_drift_is_not_emitted(tmp_path):
+    rule_id = "les_00000000000a"
+    injector, _trace = _injector(
+        tmp_path, selector=_card_selector(), rules=[_rule(rule_id, "旧版规则")]
+    )
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": APP, "device_id": "serial-1"})
+
+    view = Path(injector.config.lessons_dir) / "lessons.json"
+    payload = json.loads(view.read_text(encoding="utf-8"))
+    for lesson in payload:
+        if lesson["lesson_id"] == rule_id:
+            lesson["version"] = 2
+            lesson["text"] = "新版规则"
+    view.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    messages = injector.on_pre_request(
+        [SystemMessage(content="SYSTEM")], next=lambda value: value
+    )
+    rendered = "\n".join(str(message.content) for message in messages)
+    assert PROCEDURE_CARD_PREFIX in rendered
+    assert APP_RULES_PREFIX not in rendered
+    assert rule_id not in injector.injected_rule_ids
+
+
+def test_pending_rule_revoked_through_agent_control_is_not_emitted(tmp_path):
+    rule_id = "les_00000000000a"
+    lessons_dir = tmp_path / "lessons"
+    store = LessonStore(lessons_dir)
+    rule = store.propose(LessonCandidate.from_dict(_rule(rule_id, "控制通道规则", status="proposed")))
+    store.approve(rule.lesson_id)
+    store.propose(LessonCandidate.from_dict(_card_payload()))
+    injector, trace = _injector(
+        tmp_path, selector=_card_selector(), rules=[_rule(rule_id, "控制通道规则")]
+    )
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": APP, "device_id": "serial-1"})
+    agent = ThinPhoneAgent.__new__(ThinPhoneAgent)
+    agent.config = injector.config
+    agent._trace = injector.trace
+    agent._procedure_injector = injector
+    agent._revoked_lesson_ids = set()
+
+    assert agent.revoke_lesson(rule_id) is True
+    messages = injector.on_pre_request(
+        [SystemMessage(content="SYSTEM")], next=lambda value: value
+    )
+    rendered = "\n".join(str(message.content) for message in messages)
+
+    assert APP_RULES_PREFIX not in rendered
+    assert rule_id not in injector.injected_rule_ids
+    assert any(
+        event == "lesson_revoked" and payload["lesson_id"] == rule_id
+        for event, payload in trace
+    )
+
+
 def test_entrance_rule_budget_truncates_to_two_items(tmp_path):
     rules = [
         _rule("les_00000000000a", "规则甲"),
@@ -815,5 +898,134 @@ def test_run_delivers_prefetch_then_dedups_entrance(tmp_path, monkeypatch):
     ]
     outcomes = [event for event in outcomes if event["type"] == "episode_outcome"]
     assert outcomes[0]["injected_procedures"] == [card_id]
-    # C3: the delivered app rule is booked under injected_lessons.
     assert outcomes[0]["injected_lessons"] == ["les_00000000000a"]
+
+
+def test_rule_only_bad_snapshot_records_suppression(tmp_path):
+    """A rule-only delivery with a corrupt view emits a suppression audit."""
+
+    injector, trace = _injector(
+        tmp_path,
+        selector=lambda _goal, **_kwargs: ProcedureSelection(
+            candidates=1, filtered=0, reason="app_scope_mismatch"
+        ),
+        rules=[_rule("les_00000000000a", "规则甲")],
+        with_index=False,
+    )
+    lessons_dir = Path(injector.config.lessons_dir)
+    (lessons_dir / "lessons.json").write_text("{broken", encoding="utf-8")
+
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": APP})
+    messages = injector.on_pre_request(
+        [SystemMessage(content="SYSTEM")], next=lambda payload: payload
+    )
+
+    assert messages == [SystemMessage(content="SYSTEM")]
+    assert injector.injected_rule_ids == []
+    suppressed = [
+        payload for event, payload in trace if event == "procedure_delivery_suppressed"
+    ]
+    assert len(suppressed) == 1
+    assert suppressed[0]["reason"] == "snapshot_corrupt"
+    assert suppressed[0]["kind"] == "rule"
+    assert suppressed[0]["app_package"] == APP
+    assert "lesson_id" in suppressed[0]
+    stats = _stats(tmp_path)
+    assert stats["rule_suppressed"] == 1
+    assert stats["latest_rule_suppressed"]["reason"] == "snapshot_corrupt"
+
+
+def test_missing_view_for_rules_records_snapshot_missing(tmp_path):
+    """A missing lesson view is reported separately from a corrupt one."""
+
+    injector, trace = _injector(
+        tmp_path,
+        selector=lambda _goal, **_kwargs: ProcedureSelection(
+            candidates=1, filtered=0, reason="app_scope_mismatch"
+        ),
+        rules=[_rule("les_00000000000a", "规则甲")],
+        with_index=False,
+    )
+    injector.config.lessons_dir = str(tmp_path / "no-such-lessons")
+
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": APP})
+    messages = injector.on_pre_request(
+        [SystemMessage(content="SYSTEM")], next=lambda payload: payload
+    )
+
+    assert messages == [SystemMessage(content="SYSTEM")]
+    suppressed = [
+        payload for event, payload in trace if event == "procedure_delivery_suppressed"
+    ]
+    assert any(payload["reason"] == "snapshot_missing" for payload in suppressed)
+    assert all(payload["kind"] == "rule" for payload in suppressed)
+
+
+def test_rule_revoked_in_view_is_suppressed_with_audit(tmp_path):
+    """A rule selected at build time but revoked before delivery is logged."""
+
+    rule_id = "les_00000000000a"
+    injector, trace = _injector(
+        tmp_path,
+        selector=lambda _goal, **_kwargs: ProcedureSelection(
+            candidates=1, filtered=0, reason="app_scope_mismatch"
+        ),
+        rules=[_rule(rule_id, "进场规则")],
+        with_index=False,
+    )
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": APP})
+
+    view = Path(injector.config.lessons_dir) / "lessons.json"
+    payload = json.loads(view.read_text(encoding="utf-8"))
+    for lesson in payload:
+        if lesson["lesson_id"] == rule_id:
+            lesson["status"] = "revoked"
+    view.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    messages = injector.on_pre_request(
+        [SystemMessage(content="SYSTEM")], next=lambda payload: payload
+    )
+
+    assert messages == [SystemMessage(content="SYSTEM")]
+    assert injector.injected_rule_ids == []
+    suppressed = [
+        payload for event, payload in trace if event == "procedure_delivery_suppressed"
+    ]
+    assert any(
+        payload["lesson_id"] == rule_id and payload["reason"] == "not_injectable"
+        for payload in suppressed
+    )
+    assert all(payload["kind"] == "rule" for payload in suppressed)
+
+
+def test_rule_audit_write_failure_is_fail_open(tmp_path):
+    """A broken stats path must not block the run or model call."""
+
+    injector, trace = _injector(
+        tmp_path,
+        selector=lambda _goal, **_kwargs: ProcedureSelection(
+            candidates=1, filtered=0, reason="app_scope_mismatch"
+        ),
+        rules=[_rule("les_00000000000a", "规则甲")],
+        with_index=False,
+    )
+    # Make the stats directory a file so the atomic write fails.
+    stats_file = tmp_path / "memory" / "experience"
+    stats_file.parent.mkdir(parents=True, exist_ok=True)
+    stats_file.unlink(missing_ok=True)
+    stats_file.write_text("not a directory", encoding="utf-8")
+
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": APP})
+    messages = injector.on_pre_request(
+        [SystemMessage(content="SYSTEM")], next=lambda payload: payload
+    )
+
+    # The rule is delivered normally; the failed audit write is silent.
+    assert len(messages) == 2
+    assert APP_RULES_PREFIX in messages[-1].content
+    assert injector.injected_rule_ids == ["les_00000000000a"]
+    # No crash, no exception raised: the run continues.

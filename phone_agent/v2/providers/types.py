@@ -38,6 +38,9 @@ THINKING_MAP_UNSET = object()
 # config env var there is no empty-string level here.
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high")
 
+# Legal streaming modes (global env, model entry, role entry).
+STREAMING_MODES = ("off", "on")
+
 
 @dataclass(frozen=True)
 class ProviderCompat:
@@ -48,7 +51,7 @@ class ProviderCompat:
     sets (see :func:`providers.builders.effective_compat`).
     """
 
-    # Streaming usage blocks supported (reserved; observability planes read it).
+    # Usage-in-streaming declaration; see builders.effective usage mapping.
     supports_usage_in_streaming: bool | None = None
     # Which request field carries the token cap ("max_tokens" default).
     max_tokens_field: str | None = None
@@ -71,6 +74,7 @@ class ProviderCompat:
                 if self.supports_usage_in_streaming is None
                 else self.supports_usage_in_streaming
             ),
+            usage_in_streaming_declared=self.supports_usage_in_streaming,
             max_tokens_field=self.max_tokens_field or "max_tokens",
             thinking_format=self.thinking_format,
             supports_parallel_tool_calls=(
@@ -91,6 +95,7 @@ class ResolvedCompat:
     thinking_format: str | None
     supports_parallel_tool_calls: bool
     extra_body: dict
+    usage_in_streaming_declared: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +107,11 @@ class ModelSpec:
     built-in budget table), a ``str`` = send that value verbatim, ``None``
     (explicit null in JSON) = thinking unsupported (omit silently), a ``dict``
     = per-level mapping whose missing levels fall back to the default.
+
+    ``streaming`` is an optional ``off``/``on`` endpoint declaration (absent =
+    not written).  It outranks the global ``PHONE_AGENT_STREAMING`` so a model
+    whose endpoint cannot stream can stay ``off`` even when the deployment
+    enables streaming globally; ``roles.<role>.streaming`` outranks it.
     """
 
     id: str
@@ -114,6 +124,7 @@ class ModelSpec:
     sampling_params: dict = field(default_factory=dict)
     # Three-state thinking map (see class docstring).
     thinking_level_map: object = THINKING_MAP_UNSET
+    streaming: str | None = None
     # Per-model header additions merged over the provider's headers.
     headers: dict = field(default_factory=dict)
     # Model-level compat overrides; only fields explicitly set replace the
@@ -161,13 +172,16 @@ class RoleSpec:
     only when the role's own env var is unset (same specificity -> env wins);
     ``sampling_params`` is the highest-precedence sampling tier
     (model entry < config env < roles); ``thinking`` overrides the global
-    thinking level for this role only.  ``None``/empty fields mean "not
-    written" — the legacy chain/config behavior passes through untouched.
+    thinking level for this role only; ``streaming`` (``off``/``on``) is the
+    most specific streaming decision, outranking both the model entry and the
+    global ``PHONE_AGENT_STREAMING``.  ``None``/empty fields mean "not written"
+    — the legacy chain/config behavior passes through untouched.
     """
 
     model: str | None = None
     sampling_params: dict = field(default_factory=dict)
     thinking: str | None = None
+    streaming: str | None = None
 
 
 @dataclass(frozen=True)

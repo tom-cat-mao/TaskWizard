@@ -31,12 +31,16 @@ from phone_agent.v2.providers.builders import (
     unregister_api_builder,
 )
 from phone_agent.v2.providers.loader import (
+    DeclarationWarning,
     ModelsFileError,
+    apply_provider_declarations,
     build_provider_registry,
     candidate_paths,
     load_raw_document,
+    load_raw_document_lenient,
     load_raw_file,
     parse_models_document,
+    parse_models_document_lenient,
     parse_models_json,
 )
 from phone_agent.v2.providers.registry import (
@@ -45,8 +49,15 @@ from phone_agent.v2.providers.registry import (
     ProviderRegistryError,
     UnknownProviderError,
 )
-from phone_agent.v2.providers.roles import ROLES, get_role_specs, resolve_role_ref
+from phone_agent.v2.providers.roles import (
+    ROLES,
+    get_role_specs,
+    resolve_role_ref,
+    resolve_streaming_enabled,
+    resolve_streaming_mode,
+)
 from phone_agent.v2.providers.types import (
+    STREAMING_MODES,
     THINKING_LEVELS,
     ModelSpec,
     ProviderCompat,
@@ -79,10 +90,11 @@ def register_provider(ctx: Any, spec: ProviderSpec) -> None:
     service is built lazily from the ctx ``config`` and registered under the
     calling capability so release removes it.  Registration is an upsert:
     re-registering an existing provider id overrides its fields while keeping
-    the merged model catalog.  Models are resolved lazily at build time, but
-    note the actor model is constructed before plugins apply — route the
-    actor via models.json, plugin providers serve the auxiliary roles
-    (memory/verifier/safety_reviewer/distill) built after assembly.
+    the merged model catalog. Models are resolved at build time; a plugin can
+    contribute the actor provider as well as auxiliary-role providers when
+    its capability declares
+    ``deps=("providers",)``; the agent bootstraps those provider contributors
+    before constructing the actor.
     """
 
     registry = ctx.service("provider_registry")
@@ -106,6 +118,7 @@ def register_provider(ctx: Any, spec: ProviderSpec) -> None:
 
 __all__ = [
     "DEFAULT_PROVIDER_ID",
+    "DeclarationWarning",
     "ModelsFileError",
     "ModelSpec",
     "ProviderCompat",
@@ -113,8 +126,10 @@ __all__ = [
     "ProviderRegistryError",
     "ProviderSpec",
     "ROLES",
+    "STREAMING_MODES",
     "ResolvedModel",
     "UnknownProviderError",
+    "apply_provider_declarations",
     "build_model_from_resolved",
     "build_provider_registry",
     "candidate_paths",
@@ -122,13 +137,17 @@ __all__ = [
     "get_api_builder",
     "get_role_specs",
     "load_raw_document",
+    "load_raw_document_lenient",
     "load_raw_file",
     "parse_models_document",
+    "parse_models_document_lenient",
     "parse_models_json",
     "register_api_builder",
     "register_provider",
     "registered_api_types",
     "resolve_role_ref",
+    "resolve_streaming_enabled",
+    "resolve_streaming_mode",
     "RoleSpec",
     "THINKING_LEVELS",
     "translate_thinking",

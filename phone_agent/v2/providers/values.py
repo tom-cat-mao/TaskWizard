@@ -5,8 +5,8 @@ interpolation.  ``!command`` execution is deliberately NOT implemented in this
 phase (documented non-goal; key material comes from the environment instead).
 
 Resolution is single-pass and non-recursive: an env value that itself contains
-``$`` is kept verbatim.  Missing env names raise :class:`ValueError` so callers
-(loader) fail open to the legacy single-gateway path.
+``$`` is kept verbatim. Missing env names raise :class:`ValueError`; the loader
+reports them as explicit models-file configuration errors.
 """
 
 from __future__ import annotations
@@ -22,8 +22,7 @@ def resolve_value(value: object, *, env: Mapping[str, str] | None = None) -> obj
     """Resolve ``$ENV`` / ``${ENV}`` references inside a string value.
 
     Non-string values pass through untouched.  A missing env variable raises
-    ``ValueError`` (fail-visible at parse time; the loader converts this into
-    its fail-open path).
+    ``ValueError`` (fail-visible at parse time).
     """
 
     if not isinstance(value, str) or "$" not in value:

@@ -16,23 +16,29 @@ wholesale per role name — the later file's entry for a role replaces the
 earlier one.  Values (apiKey, baseUrl, header values) support ``$ENV`` /
 ``${ENV}`` interpolation via :mod:`providers.values`.
 
-Role-section schema is fail-closed (:class:`ModelsFileError`): unknown role
-names and illegal thinking levels are rejected at parse time.  As with every
-parse error, :func:`build_provider_registry` converts the failure into
-``None`` (log + fall back to the legacy single-gateway behavior) — the
-provider layer never crashes a run.
+Strict parse functions (:func:`parse_models_document` /
+:func:`load_raw_document`) remain fail-closed (:class:`ModelsFileError`) for
+explicit validation.  The runtime assembly path
+(:func:`build_provider_registry` / :func:`apply_provider_declarations`) is
+availability-first: a missing, malformed, or partially broken declared file
+never disables the synthesized env gateway.  Bad parts are skipped
+individually and reported as :class:`DeclarationWarning` records (structured
+and redaction-safe) on ``registry.declaration_warnings`` plus a bounded
+``logging`` warning.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from phone_agent.v2.providers.roles import ROLES
 from phone_agent.v2.providers.types import (
     RoleSpec,
+    STREAMING_MODES,
     THINKING_LEVELS,
     ProviderCompat,
     ProviderSpec,
@@ -41,6 +47,46 @@ from phone_agent.v2.providers.types import (
 from phone_agent.v2.providers.values import resolve_headers, resolve_str
 
 logger = logging.getLogger(__name__)
+
+MAX_WARNING_CHARS = 300
+
+
+@dataclass(frozen=True)
+class DeclarationWarning:
+    """One skipped models.json part (file/provider/model/role level).
+
+    ``error`` is loader-owned text (paths, ids, env-var names, api names) and
+    is bounded; no resolved value or key material is ever included.
+    """
+
+    source: str
+    scope: str
+    name: str
+    error: str
+
+
+def _make_warning(source: Any, scope: str, name: Any, exc: BaseException) -> DeclarationWarning:
+    text = str(exc).strip() or type(exc).__name__
+    if len(text) > MAX_WARNING_CHARS:
+        text = text[:MAX_WARNING_CHARS] + "..."
+    return DeclarationWarning(
+        source=str(source),
+        scope=scope,
+        name=str(name),
+        error=f"{type(exc).__name__}: {text}",
+    )
+
+
+def _log_warnings(warnings: list[DeclarationWarning]) -> None:
+    for warning in warnings:
+        logger.warning(
+            "models declaration skipped: source=%s scope=%s name=%s error=%s",
+            warning.source,
+            warning.scope,
+            warning.name,
+            warning.error,
+        )
+
 
 PROJECT_MODELS_NAME = ".taskwizard.models.json"
 
@@ -117,6 +163,18 @@ def _parse_thinking_map(value: Any) -> Any:
     )
 
 
+def _parse_streaming(value: Any, *, scope: str) -> str | None:
+    """Validate an optional ``streaming`` declaration (``off``/``on``)."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or value.strip().lower() not in STREAMING_MODES:
+        raise ModelsFileError(
+            f"{scope}.streaming must be one of {STREAMING_MODES}, got {value!r}"
+        )
+    return value.strip().lower()
+
+
 def _parse_model(data: Any, *, env: dict[str, str]) -> tuple[str, ModelSpec]:
     if not isinstance(data, dict):
         raise ModelsFileError(f"model entry must be an object, got {type(data).__name__}")
@@ -147,6 +205,9 @@ def _parse_model(data: Any, *, env: dict[str, str]) -> tuple[str, ModelSpec]:
         kwargs["sampling_params"] = dict(sampling)
     if "thinkingLevelMap" in data:
         kwargs["thinking_level_map"] = _parse_thinking_map(data["thinkingLevelMap"])
+    streaming = _parse_streaming(data.get("streaming"), scope=f"model {model_id!r}")
+    if streaming is not None:
+        kwargs["streaming"] = streaming
     headers = data.get("headers")
     if headers is not None:
         if not isinstance(headers, dict):
@@ -171,6 +232,7 @@ def _apply_model_override(existing: ModelSpec, patch: Any) -> ModelSpec:
         "input_modalities": existing.input_modalities,
         "sampling_params": dict(existing.sampling_params),
         "thinking_level_map": existing.thinking_level_map,
+        "streaming": existing.streaming,
         "headers": dict(existing.headers),
         "compat": existing.compat,
     }
@@ -178,6 +240,10 @@ def _apply_model_override(existing: ModelSpec, patch: Any) -> ModelSpec:
         field = _snake(str(key))
         if field == "thinking_level_map":
             fields[field] = _parse_thinking_map(value)
+        elif field == "streaming":
+            fields[field] = _parse_streaming(
+                value, scope=f"modelOverrides.{existing.id!r}"
+            )
         elif field == "input_modalities":
             fields[field] = tuple(str(item) for item in value or ())
         elif field == "sampling_params":
@@ -191,7 +257,14 @@ def _apply_model_override(existing: ModelSpec, patch: Any) -> ModelSpec:
     return ModelSpec(id=existing.id, **fields)
 
 
-def _parse_provider(provider_id: str, data: Any, *, env: dict[str, str]) -> ProviderSpec:
+def _parse_provider(
+    provider_id: str,
+    data: Any,
+    *,
+    env: dict[str, str],
+    warnings: list[DeclarationWarning] | None = None,
+    source: Any = "",
+) -> ProviderSpec:
     if not isinstance(data, dict):
         raise ModelsFileError(
             f"provider {provider_id!r} must be an object, got {type(data).__name__}"
@@ -207,14 +280,25 @@ def _parse_provider(provider_id: str, data: Any, *, env: dict[str, str]) -> Prov
     compat_data = data.get("compat")
     models: dict[str, ModelSpec] = {}
     for entry in data.get("models") or []:
-        model_id, spec = _parse_model(entry, env=env)
+        try:
+            model_id, spec = _parse_model(entry, env=env)
+        except Exception as exc:  # noqa: BLE001 - strict mode re-raises below
+            if warnings is None:
+                raise
+            warnings.append(_make_warning(source, "model", provider_id, exc))
+            continue
         models[model_id] = spec
     overrides = data.get("modelOverrides") or {}
     if not isinstance(overrides, dict):
         raise ModelsFileError(f"provider {provider_id!r} modelOverrides must be an object")
     for model_id, patch in overrides.items():
-        existing = models.get(str(model_id)) or ModelSpec(id=str(model_id))
-        models[str(model_id)] = _apply_model_override(existing, patch)
+        try:
+            existing = models.get(str(model_id)) or ModelSpec(id=str(model_id))
+            models[str(model_id)] = _apply_model_override(existing, patch)
+        except Exception as exc:  # noqa: BLE001 - strict mode re-raises below
+            if warnings is None:
+                raise
+            warnings.append(_make_warning(source, "model", f"{provider_id}:{model_id}", exc))
     return ProviderSpec(
         id=provider_id,
         api=api,
@@ -250,25 +334,53 @@ def _parse_role_entry(role: str, data: Any) -> RoleSpec:
         raise ModelsFileError(
             f"roles.{role}.thinking must be one of {THINKING_LEVELS}, got {thinking!r}"
         )
-    return RoleSpec(model=model, sampling_params=dict(sampling), thinking=thinking)
+    streaming = _parse_streaming(data.get("streaming"), scope=f"roles.{role}")
+    return RoleSpec(
+        model=model,
+        sampling_params=dict(sampling),
+        thinking=thinking,
+        streaming=streaming,
+    )
 
 
-def _parse_roles(data: dict[str, Any]) -> dict[str, RoleSpec]:
-    """Parse the top-level ``roles`` section (empty dict when absent)."""
+def _parse_roles(
+    data: dict[str, Any],
+    *,
+    warnings: list[DeclarationWarning] | None = None,
+    source: Any = "",
+) -> dict[str, RoleSpec]:
+    """Parse the top-level ``roles`` section (empty dict when absent).
+
+    Strict by default; with ``warnings`` supplied, bad role entries are
+    skipped individually and recorded instead of aborting the whole file.
+    """
 
     roles_data = data.get("roles")
     if roles_data is None:
         return {}
     if not isinstance(roles_data, dict):
-        raise ModelsFileError("'roles' must be an object")
+        exc = ModelsFileError("'roles' must be an object")
+        if warnings is None:
+            raise exc
+        warnings.append(_make_warning(source, "role", "", exc))
+        return {}
     parsed: dict[str, RoleSpec] = {}
     for name, entry in roles_data.items():
         role = str(name)
         if role not in ROLES:
-            raise ModelsFileError(
+            exc = ModelsFileError(
                 f"unknown role {role!r} in 'roles' (expected one of {ROLES})"
             )
-        parsed[role] = _parse_role_entry(role, entry)
+            if warnings is None:
+                raise exc
+            warnings.append(_make_warning(source, "role", role, exc))
+            continue
+        try:
+            parsed[role] = _parse_role_entry(role, entry)
+        except Exception as exc:  # noqa: BLE001 - strict mode re-raises below
+            if warnings is None:
+                raise
+            warnings.append(_make_warning(source, "role", role, exc))
     return parsed
 
 
@@ -298,6 +410,44 @@ def parse_models_document(
             except Exception as exc:  # noqa: BLE001 - normalize to ModelsFileError
                 raise ModelsFileError(f"provider {provider_id!r}: {exc}") from exc
     return parsed, _parse_roles(data)
+
+
+def parse_models_document_lenient(
+    data: Any, *, env: dict[str, str] | None = None, source: Any = ""
+) -> tuple[dict[str, ProviderSpec], dict[str, RoleSpec], list[DeclarationWarning]]:
+    """Availability-first variant of :func:`parse_models_document`.
+
+    Valid providers/models/roles are kept; every bad part is skipped and
+    reported as a :class:`DeclarationWarning`.  Never raises for document
+    content (a non-object root yields no declarations plus one warning).
+    """
+
+    if not isinstance(data, dict):
+        exc = ModelsFileError("models.json root must be an object")
+        return {}, {}, [_make_warning(source, "file", source, exc)]
+    warnings: list[DeclarationWarning] = []
+    parsed: dict[str, ProviderSpec] = {}
+    providers_data = data.get("providers")
+    if providers_data is not None:
+        if not isinstance(providers_data, dict):
+            exc = ModelsFileError("'providers' must be an object")
+            warnings.append(_make_warning(source, "file", source, exc))
+        else:
+            for provider_id, entry in providers_data.items():
+                try:
+                    spec = _parse_provider(
+                        str(provider_id),
+                        entry,
+                        env=env,
+                        warnings=warnings,
+                        source=source,
+                    )
+                except Exception as exc:  # noqa: BLE001 - skip the bad provider
+                    warnings.append(_make_warning(source, "provider", provider_id, exc))
+                    continue
+                parsed[str(provider_id)] = spec
+    roles = _parse_roles(data, warnings=warnings, source=source)
+    return parsed, roles, warnings
 
 
 def parse_models_json(data: Any, *, env: dict[str, str] | None = None) -> dict[str, ProviderSpec]:
@@ -330,7 +480,7 @@ def load_raw_file(path: Path) -> dict[str, ProviderSpec]:
     return load_raw_document(path)[0]
 
 
-def build_provider_registry(config: Any = None) -> Any:
+def build_provider_registry(config: Any = None, *, load_declarations: bool = True) -> Any:
     """Assemble the ProviderRegistry: built-in gateway + models.json files.
 
     The gateway provider is synthesized from V2Config (id ``"gateway"``,
@@ -344,10 +494,11 @@ def build_provider_registry(config: Any = None) -> Any:
     :func:`phone_agent.v2.providers.roles.get_role_specs`, which tolerates
     registries built elsewhere (no attribute).
 
-    Fail-open contract: any error (missing env var, malformed JSON, unknown
-    role/thinking value, unsupported api, filesystem failure) logs a warning
-    and returns ``None`` so callers degrade to the legacy single-gateway
-    behavior instead of crashing a run.
+    With no declared file this returns the synthesized legacy gateway registry.
+    Missing, malformed, or partially broken declared files are skipped per
+    part and reported through ``registry.declaration_warnings`` (plus a
+    bounded log warning); the synthesized env gateway always stays usable.
+    Strict validation stays available via :func:`load_raw_document`.
     """
 
     from phone_agent.v2.providers.registry import (
@@ -356,32 +507,99 @@ def build_provider_registry(config: Any = None) -> Any:
     )
 
     try:
-        # Imported inside the try: the model module may be a partial fake in
-        # test/concurrent-worktree environments; any failure must land the
-        # fail-open return below.
         from phone_agent.v2.model import build_default_headers
+    except ImportError:
+        if not any(path.exists() for path in candidate_paths(config)):
+            return None
+        raise
 
-        model_name = str(getattr(config, "model_name", "") or "")
-        registry = ProviderRegistry(default_provider=DEFAULT_PROVIDER_ID)
-        gateway = ProviderSpec(
-            id=DEFAULT_PROVIDER_ID,
-            api="openai-completions",
-            base_url=getattr(config, "base_url", None),
-            api_key=getattr(config, "api_key", None),
-            headers=build_default_headers(config) if config is not None else {},
-            models={model_name: ModelSpec(id=model_name, name=model_name)} if model_name else {},
-        )
-        registry.register(gateway)
-        roles: dict[str, RoleSpec] = {}
-        for path in candidate_paths(config):
-            if not path.exists():
-                continue
-            providers, file_roles = load_raw_document(path)
-            for provider_id, spec in providers.items():
-                registry.override(spec)
-            roles.update(file_roles)
-        registry.roles = roles  # loader-side attach (see docstring)
+    model_name = str(getattr(config, "model_name", "") or "")
+    registry = ProviderRegistry(default_provider=DEFAULT_PROVIDER_ID)
+    gateway = ProviderSpec(
+        id=DEFAULT_PROVIDER_ID,
+        api="openai-completions",
+        base_url=getattr(config, "base_url", None),
+        api_key=getattr(config, "api_key", None),
+        headers=build_default_headers(config) if config is not None else {},
+        models={model_name: ModelSpec(id=model_name, name=model_name)} if model_name else {},
+    )
+    registry.register(gateway)
+    registry.roles = {}
+    registry.declaration_warnings = []
+    if not load_declarations:
         return registry
-    except Exception as exc:  # noqa: BLE001 - provider layer must never crash a run
-        logger.warning("provider registry unavailable, using legacy gateway path: %s", exc)
-        return None
+    apply_provider_declarations(registry, config)
+    return registry
+
+
+def load_raw_document_lenient(
+    path: Path,
+) -> tuple[dict[str, ProviderSpec], dict[str, RoleSpec], list[DeclarationWarning]]:
+    """Availability-first variant of :func:`load_raw_document`.
+
+    Read/parse failures yield no declarations plus one file-scope warning. A
+    corrupt file is treated as unavailable, never as content: an OSError
+    (missing/permission/stat) and a non-UTF-8 byte stream both degrade to the
+    env gateway. The warning names the path plus the error *type* only — the
+    undecodable bytes are never surfaced.
+    """
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        broken = ModelsFileError(f"cannot read {path}: {exc}")
+        return {}, {}, [_make_warning(path, "file", path, broken)]
+    except (UnicodeDecodeError, ValueError):
+        broken = ModelsFileError(f"cannot decode {path} as UTF-8")
+        return {}, {}, [_make_warning(path, "file", path, broken)]
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        broken = ModelsFileError(f"malformed JSON in {path}: {exc}")
+        return {}, {}, [_make_warning(path, "file", path, broken)]
+    return parse_models_document_lenient(data, source=path)
+
+
+def apply_provider_declarations(registry: Any, config: Any = None) -> None:
+    """Apply configured provider/role declarations to an existing registry.
+
+    Agent bootstrap uses this second phase after external provider capabilities
+    have registered custom transports. Ordinary callers use
+    :func:`build_provider_registry`, which performs both phases immediately.
+    Bad parts never abort assembly: each skipped declaration (parse failure or
+    a failed ``registry.override`` merge, e.g. a legal override-shaped entry
+    that turns out to declare a brand-new provider without an api) becomes a
+    ``registry.declaration_warnings`` entry and one bounded log warning.
+    ``registry.override`` raises before mutating, so a rejected merge leaves the
+    already-valid providers intact — no half-applied pollution.  A path whose
+    stat or read raises (permission denied, unreadable directory, ...) is
+    likewise warned and skipped instead of aborting the assembly.
+    """
+
+    explicit = getattr(config, "models_file", None)
+    declarations: list[DeclarationWarning] = []
+    roles: dict[str, RoleSpec] = {}
+    for path in candidate_paths(config):
+        try:
+            path.stat()
+        except FileNotFoundError:
+            if explicit and Path(explicit) == path:
+                missing = ModelsFileError(f"configured models file does not exist: {path}")
+                declarations.append(_make_warning(path, "file", path, missing))
+            continue
+        except OSError as exc:
+            broken = ModelsFileError(f"cannot stat {path}: {exc}")
+            declarations.append(_make_warning(path, "file", path, broken))
+            continue
+        providers, file_roles, warnings = load_raw_document_lenient(path)
+        declarations.extend(warnings)
+        for provider_id, spec in providers.items():
+            try:
+                registry.override(spec)
+            except Exception as exc:  # noqa: BLE001 - one bad merge never disables the rest
+                declarations.append(_make_warning(path, "provider", provider_id, exc))
+                continue
+        roles.update(file_roles)
+    registry.roles = roles  # loader-side attach (see docstring)
+    registry.declaration_warnings = declarations
+    _log_warnings(declarations)

@@ -25,6 +25,7 @@ from typing import Literal
 
 from langchain_core.tools import StructuredTool
 
+from phone_agent.adb.errors import KeyboardPreparationError
 from phone_agent.config.apps import DEFAULT_LAUNCH_TARGET_RESOLVER
 from phone_agent.config.redact import SENSITIVE_PATTERN
 from phone_agent.grounding.provider import MarkCandidate
@@ -32,12 +33,17 @@ from phone_agent.grounding.provider import MarkCandidate
 from phone_agent.v2.appkb import should_save
 from phone_agent.v2.names import ResolverSettings, decide_name
 from phone_agent.v2.resolver import (
-    LocateAmbiguousError,
     ResolveAmbiguousError,
     StaleMarkError,
     authorize_app_candidate,
     resolve_app_name,
     resolve_description,
+)
+from phone_agent.v2.session import (
+    LOCATE_PROVIDER_FAULT_STREAK_THRESHOLD,
+    LocateAmbiguousError,
+    classify_locate_failure,
+    normalize_locate_failure_code,
 )
 from phone_agent.v2.tools._obs import auto_observation, mark_tool_fail, mark_tool_ok
 
@@ -79,6 +85,18 @@ def _receipt_package_candidates(available: str) -> list[str]:
         seen.add(package)
         packages.append(package)
     return packages
+
+
+def _locate_fault_circuit_tripped(session) -> bool:
+    """Return whether this run has reached the locate-fault circuit threshold."""
+
+    getter = getattr(session, "locate_provider_fault_streak", None)
+    if not callable(getter):
+        return False
+    try:
+        return int(getter()) >= LOCATE_PROVIDER_FAULT_STREAK_THRESHOLD
+    except Exception:  # noqa: BLE001 - guidance must never break a receipt
+        return False
 
 
 def _remember_unknown_launch(session, config, app_name: str, available: str) -> None:
@@ -293,6 +311,15 @@ def _fail(session, message: str) -> str:
     return message
 
 
+def _device_failure(session, action: str) -> str:
+    """Return a redacted factual receipt for an uncertain device dispatch."""
+
+    return _fail(
+        session,
+        f"error: {action} 的设备命令失败；命令可能已发送，设备结果无法确认。",
+    )
+
+
 def _resolve_target(
     session,
     target_mark_id: str | None,
@@ -325,6 +352,24 @@ def _resolve_target(
                 + " — refine the description or use target_mark_id"
             )
         except LocateAmbiguousError as exc:
+            failure_code = normalize_locate_failure_code(
+                getattr(exc, "failure_code", None)
+            )
+            failure_class = classify_locate_failure(failure_code)
+            if failure_class == "service_fault":
+                message = (
+                    f"视觉定位服务故障（{failure_code}）：请改用 marks 块中的 "
+                    "target_mark_id，或 back/导航绕过。"
+                )
+                if _locate_fault_circuit_tripped(session):
+                    message += (
+                        "本轮定位服务持续故障：请停止使用 locate 与描述式 tap，改用 marks"
+                    )
+                return None, message
+            if failure_class == "transient":
+                return None, (
+                    f"定位暂时失败（{failure_code}）：可原样重试，勿修改目标描述"
+                )
             return None, (
                 f"ambiguous: {exc} — refine the description or use target_mark_id"
             )
@@ -364,12 +409,15 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
         if err is not None:
             return _fail(session, err)
         x, y = session.mark_center_abs(mark)
-        if action == "long_press":
-            device.long_press(x, y, device_id=device_id)
-            verb = "已长按"
-        else:
-            device.tap(x, y, device_id=device_id)
-            verb = "已点击"
+        try:
+            if action == "long_press":
+                device.long_press(x, y, device_id=device_id)
+                verb = "已长按"
+            else:
+                device.tap(x, y, device_id=device_id)
+                verb = "已点击"
+        except Exception:  # noqa: BLE001
+            return _device_failure(session, "点击" if action == "tap" else "长按")
         return _ok_with_obs(
             f"{verb}{_mark_label(mark)}", session, settle_ms=settle_ms
         )
@@ -452,22 +500,63 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
             if err is not None:
                 return _fail(session, err)
             fx, fy = session.mark_center_abs(mark)
-            device.tap(fx, fy, device_id=device_id)
+            try:
+                device.tap(fx, fy, device_id=device_id)
+            except Exception:  # noqa: BLE001
+                return _device_failure(session, "输入框聚焦点击")
 
         ime = None
         detect = getattr(device, "detect_and_set_adb_keyboard", None)
         restore = getattr(device, "restore_keyboard", None)
+        input_error = False
+        restore_error = False
         try:
             if callable(detect):
-                ime = detect(device_id=device_id)
-            device.type_text(text, device_id=device_id)
+                try:
+                    ime = detect(device_id=device_id)
+                except KeyboardPreparationError as exc:
+                    cleanup = {
+                        "restored": "原键盘已恢复",
+                        "failed": "键盘恢复命令失败，当前键盘状态未知",
+                        "not_needed": "未执行需要恢复的输入法切换",
+                    }.get(exc.keyboard_cleanup)
+                    if cleanup is None:
+                        cleanup = (
+                            "输入法切换结果无法确认，当前键盘状态未知"
+                            if exc.stage == "switch"
+                            else "键盘恢复结果无法确认，当前键盘状态未知"
+                        )
+                    return _fail(
+                        session,
+                        f"error: 输入法准备失败；待输入文本尚未发送；{cleanup}。",
+                    )
+                except Exception:  # noqa: BLE001
+                    return _fail(
+                        session,
+                        "error: 输入法准备失败；待输入文本尚未发送。",
+                    )
+            try:
+                device.type_text(text, device_id=device_id)
+            except Exception:  # noqa: BLE001
+                input_error = True
         finally:
             if ime and callable(restore):
-                restore(ime, device_id=device_id)
+                try:
+                    restore(ime, device_id=device_id)
+                except Exception:  # noqa: BLE001
+                    restore_error = True
+
+        if input_error:
+            suffix = "；且键盘恢复失败" if restore_error else ""
+            return _fail(
+                session,
+                "error: 文本输入命令可能已发送，输入结果无法确认" + suffix + "。",
+            )
 
         preview = text if len(text) <= 32 else text[:31] + "…"
+        cleanup = "；输入已发送；键盘恢复失败" if restore_error else ""
         return _ok_with_obs(
-            f"已输入 {preview!r}", session, settle_ms=settle_ms
+            f"已输入 {preview!r}{cleanup}", session, settle_ms=settle_ms
         )
 
     def scroll(
@@ -503,7 +592,10 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
         rsx, rsy, rex, rey = moves[direction]
         sx, sy = session.relative_to_abs(rsx, rsy)
         ex, ey = session.relative_to_abs(rex, rey)
-        device.swipe(sx, sy, ex, ey, device_id=device_id)
+        try:
+            device.swipe(sx, sy, ex, ey, device_id=device_id)
+        except Exception:  # noqa: BLE001
+            return _device_failure(session, f"scroll {direction}")
         return _ok_with_obs(f"scroll {direction}", session, settle_ms=settle_ms)
 
     def swipe(
@@ -530,7 +622,10 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
             return _fail(session, "error: end must be [x, y] in 0-1000 relative coords")
         sx, sy = session.relative_to_abs(int(start[0]), int(start[1]))
         ex, ey = session.relative_to_abs(int(end[0]), int(end[1]))
-        device.swipe(sx, sy, ex, ey, device_id=device_id)
+        try:
+            device.swipe(sx, sy, ex, ey, device_id=device_id)
+        except Exception:  # noqa: BLE001
+            return _device_failure(session, "swipe")
         return _ok_with_obs(
             f"swipe ({start[0]},{start[1]})->({end[0]},{end[1]})",
             session,
@@ -550,7 +645,10 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
         搜索/提交/打开页面后建议 1500-2500ms；普通点击留空。
         """
 
-        device.back(device_id=device_id)
+        try:
+            device.back(device_id=device_id)
+        except Exception:  # noqa: BLE001
+            return _device_failure(session, "back")
         return _ok_with_obs("back", session, settle_ms=settle_ms)
 
     def home(
@@ -566,7 +664,10 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
         搜索/提交/打开页面后建议 1500-2500ms；普通点击留空。
         """
 
-        device.home(device_id=device_id)
+        try:
+            device.home(device_id=device_id)
+        except Exception:  # noqa: BLE001
+            return _device_failure(session, "home")
         return _ok_with_obs("home", session, settle_ms=settle_ms)
 
     def wait(

@@ -1,22 +1,25 @@
-name: Deploy MkDocs site to GitHub Pages
+name: Build and deploy MkDocs site
 
 on:
   push:
     branches: [main]
     paths: [pages/**, mkdocs.yml, .github/workflows/pages.yml]
+  pull_request:
+    paths: [pages/**, mkdocs.yml, .github/workflows/pages.yml]
   workflow_dispatch:
 
 permissions:
-  pages: write
-  id-token: write
+  contents: read
 
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,13 +27,58 @@ jobs:
           python-version: "3.12"
       - run: pip install mkdocs-material
       - run: mkdocs build --strict
-      - uses: actions/upload-pages-artifact@v3
+      - name: Validate built site artifact
+        run: |
+          python - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path("site")
+          problems = []
+          if not (root / "index.html").is_file():
+              problems.append("site/index.html is missing")
+          for path in sorted(root.rglob("*")):
+              if not path.is_file():
+                  continue
+              if path.name == ".env" or path.suffix == ".env":
+                  problems.append(f"env file in artifact: {path}")
+                  continue
+              try:
+                  text = path.read_text(errors="ignore")
+              except OSError:
+                  continue
+              if "/Users/" in text:
+                  problems.append(f"local absolute path in {path}")
+              if "PRIVATE KEY-----" in text:
+                  problems.append(f"private key marker in {path}")
+              if re.search(r"PHONE_AGENT_API_KEY=\S{24,}", text):
+                  problems.append(f"secret-like api key value in {path}")
+          if problems:
+              print("\n".join(problems))
+              sys.exit(1)
+          print("artifact checks passed")
+          PY
+      - name: Upload validation artifact (non-main runs)
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mkdocs-site-preview
+          path: site
+          retention-days: 7
+      - name: Upload Pages artifact (main push only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

@@ -38,6 +38,18 @@ from phone_agent.v2.run_ipc import (
 )
 
 _ACTIVE_STATUSES = {"starting", "running", "waiting_hitl"}
+_STREAM_ATTEMPTS_KEEP = 6
+_STREAM_ATTEMPT_CHARS = 20000
+_ACTIVITY_STATES = {
+    "idle",
+    "starting",
+    "running",
+    "waiting_model",
+    "executing_tool",
+    "waiting_human",
+    "stopping",
+    "ended",
+}
 _POLL_SECONDS = 0.3
 
 
@@ -57,6 +69,25 @@ def _read_json_mtime(cache: dict[str, Any], key: str, path: Path) -> Any:
         return None
     cache[key] = (mtime, data)
     return data
+
+
+def _kb_display_row(entry: Any) -> dict[str, Any] | None:
+    """Validate one materialized App-KB row enough for a read-only table."""
+
+    if not isinstance(entry, dict):
+        return None
+    for key in ("label", "package", "kind"):
+        value = entry.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return None
+    success_count = entry.get("success_count", 0)
+    if not isinstance(success_count, int) or isinstance(success_count, bool):
+        success_count = 0
+    stale = entry.get("stale", False)
+    row = dict(entry)
+    row["success_count"] = max(0, success_count)
+    row["stale"] = stale if isinstance(stale, bool) else False
+    return row
 
 
 class WebRunBridge:
@@ -100,10 +131,23 @@ class WebRunBridge:
         self.error: str | None = None
         self.run_id: str | None = None
         self.task = ""
+        # Observe-only liveness/identity projection (console readability).
+        self.activity: str = "idle"
+        self.last_event_ts: float | None = None
+        self.started_at: float | None = None
+        self.stop_requested_flag: bool = False
+        self.requested_model: str | None = None
+        self.actual_model: str | None = None
+        self.stream_attempts: list[dict[str, Any]] = []
+        self._screen_ref_seen: set[str] = set()
 
     def _resolved_config(self, overrides: dict[str, Any] | None = None) -> Any:
         load_project_env()
         config = self._config_factory(overrides)
+        if overrides and "device_id" in overrides:
+            raw_device = overrides["device_id"]
+            if isinstance(raw_device, str) and not raw_device.strip():
+                config.device_id = None
         self._config = config
         return config
 
@@ -160,6 +204,8 @@ class WebRunBridge:
             self.run_id = run_id
             self.task = clean_task
             self.status = "starting"
+            self.activity = "starting"
+            self.started_at = time.time()
             self._paths = paths
             self._run_snapshot = snapshot
             self._event_reader = JsonlReader(paths.events)
@@ -223,13 +269,24 @@ class WebRunBridge:
             return None
 
     def kb_entries(self) -> list[dict[str, Any]]:
-        store = self._kb_store()
-        if store is None:
-            return []
+        """Return a read-only view of the materialized App-KB snapshot.
+
+        The console refreshes this table on a timer; reading it must never
+        construct a store, replay events, or rewrite ``kb.json``. A missing or
+        unreadable snapshot reads as an empty table.
+        """
+
         try:
-            return [dict(entry) for entry in store.entries(include_stale=True)]
-        except Exception:  # noqa: BLE001
+            config = self._config or self._resolved_config(dict(self.overrides))
+            path = Path(getattr(config, "memory_dir", "memory")) / "app_kb/kb.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - KB view is optional
             return []
+        if not isinstance(payload, list):
+            return []
+        return [
+            row for entry in payload if (row := _kb_display_row(entry)) is not None
+        ]
 
     def run_dream(self) -> dict[str, Any]:
         store = self._kb_store()
@@ -367,6 +424,13 @@ class WebRunBridge:
         )
         result = RunResult(False, "error: runner_died", steps, None)
         now = time.time()
+        snapshot = dict(spec.snapshot)
+        for event in events:
+            if event.get("event") != "capability_snapshot":
+                continue
+            capabilities = event.get("capabilities")
+            if isinstance(capabilities, dict):
+                snapshot["capabilities"] = dict(capabilities)
         with JsonlWriter(paths.events) as writer:
             writer.put(
                 {
@@ -385,7 +449,7 @@ class WebRunBridge:
                 "status": "error",
                 "result": asdict(result),
                 "usage": {},
-                "snapshot": spec.snapshot,
+                "snapshot": snapshot,
                 "finished_at": now,
             },
         )
@@ -434,23 +498,25 @@ class WebRunBridge:
                     repaired.append((started, paths, spec))
             if not candidates:
                 if repaired:
-                    _, paths, spec = max(repaired, key=lambda item: item[0])
+                    started, paths, spec = max(repaired, key=lambda item: item[0])
                     self._reset_state()
                     self._paths = paths
                     self.run_id = spec.run_id
                     self.task = spec.task
                     self._run_snapshot = spec.snapshot
                     self.status = "running"
+                    self.started_at = started or None
                     self._event_reader = JsonlReader(paths.events)
                     self._drain_events()
                 return
-            _, paths, spec = max(candidates, key=lambda item: item[0])
+            started, paths, spec = max(candidates, key=lambda item: item[0])
             self._reset_state()
             self._paths = paths
             self.run_id = spec.run_id
             self.task = spec.task
             self._run_snapshot = spec.snapshot
             self.status = "running"
+            self.started_at = started or None
             self._event_reader = JsonlReader(paths.events)
             self._drain_events()
             self._start_tail_thread()
@@ -493,8 +559,66 @@ class WebRunBridge:
             return str(args["text"])
         return ""
 
+    def _stream_attempt(self, number: Any, step: Any) -> dict[str, Any]:
+        """Find or create one incrementally streamed attempt record.
+
+        Identity is the runner-side ``attempt`` number: a primary call and a
+        later fallback call are two records, so a failed partial answer is
+        never concatenated with the answer that replaced it.
+        """
+
+        key = int(number) if isinstance(number, (int, float)) else 0
+        for record in self.stream_attempts:
+            if record["attempt"] == key:
+                return record
+        record = {
+            "attempt": key,
+            "step": int(step) if isinstance(step, (int, float)) else 0,
+            "text": "",
+            "reasoning": "",
+            "status": "streaming",
+            "error": None,
+            "revision": 0,
+            "chars_total": 0,
+            "reasoning_total": 0,
+            "text_truncated": False,
+            "reasoning_truncated": False,
+        }
+        self.stream_attempts.append(record)
+        if len(self.stream_attempts) > _STREAM_ATTEMPTS_KEEP:
+            del self.stream_attempts[: len(self.stream_attempts) - _STREAM_ATTEMPTS_KEEP]
+        return record
+
+    @staticmethod
+    def _append_stream_text(record: dict[str, Any], field: str, piece: Any) -> None:
+        """Append one delta, keeping a real bounded tail plus its totals."""
+
+        if not isinstance(piece, str) or not piece:
+            return
+        total_key = "chars_total" if field == "text" else "reasoning_total"
+        truncated_key = "text_truncated" if field == "text" else "reasoning_truncated"
+        record[total_key] = int(record.get(total_key, 0)) + len(piece)
+        record["revision"] = int(record.get("revision", 0)) + 1
+        text = record.get(field, "") + piece
+        if len(text) > _STREAM_ATTEMPT_CHARS:
+            text = text[-_STREAM_ATTEMPT_CHARS:]
+            record[truncated_key] = True
+        record[field] = text
+
     def _apply_event(self, event: dict[str, Any]) -> None:
         kind = event.get("event")
+        ts = event.get("ts")
+        if isinstance(ts, (int, float)):
+            self.last_event_ts = float(ts)
+        if kind == "model_request" and event.get("phase") == "start":
+            # The model call is in flight: the run is waiting on the gateway
+            # (network / queue / inference — indistinguishable without segment
+            # evidence, so the UI must not attribute it to inference alone).
+            self.activity = "waiting_model"
+            requested = event.get("requested_model")
+            if isinstance(requested, str) and requested.strip():
+                self.requested_model = requested.strip()
+            return
         if kind == "model_call":
             step = self._step(int(event.get("step", 0)))
             step["latency_ms"] = int(event.get("latency_ms", 0))
@@ -502,6 +626,16 @@ class WebRunBridge:
             if event.get("error"):
                 step.update(result=str(event["error"]), ok=False, status="error")
             self.tokens = int(event.get("tokens_total", self.tokens))
+            requested = event.get("requested_model")
+            if isinstance(requested, str) and requested.strip():
+                self.requested_model = requested.strip()
+            actual = event.get("actual_model")
+            if isinstance(actual, str) and actual.strip():
+                self.actual_model = actual.strip()
+            # The model returned; the run is now deciding/acting until the next
+            # tool call or terminal event advances the activity.
+            if self.status in _ACTIVE_STATUSES:
+                self.activity = "running"
         elif kind == "tool_call":
             step = self._step(int(event.get("step", 0)))
             args = event.get("args") if isinstance(event.get("args"), dict) else {}
@@ -512,6 +646,8 @@ class WebRunBridge:
                 status="running",
                 args=args,
             )
+            if self.status in _ACTIVE_STATUSES:
+                self.activity = "executing_tool"
         elif kind == "tool_result":
             step = self._step(int(event.get("step", 0)))
             ok = bool(event.get("ok"))
@@ -525,26 +661,77 @@ class WebRunBridge:
             match = OBS_RE.search(str(result_text))
             if match:
                 step["screen_seq"] = int(match.group("seq"))
+        elif kind == "model_stream_start":
+            self._stream_attempt(event.get("attempt"), event.get("step"))
+        elif kind == "model_stream_delta":
+            record = self._stream_attempt(event.get("attempt"), event.get("step"))
+            self._append_stream_text(record, "text", event.get("text"))
+            self._append_stream_text(record, "reasoning", event.get("reasoning"))
+        elif kind == "model_stream_end":
+            record = self._stream_attempt(event.get("attempt"), event.get("step"))
+            record["status"] = "done" if event.get("ok") else "failed"
+            error = event.get("error")
+            record["error"] = str(error) if error else None
         elif kind == "safety_warning":
             step = self._step(int(event.get("step", 0)))
             step.update(result=str(event.get("text", "")), ok=False, status="warning")
         elif kind == "screen":
             image = str(event.get("image", "")) or None
-            self.current_screen = image
-            self.current_app = event.get("current_app") or self.current_app
-            self.screen_seq = event.get("screen_seq")
-            if image:
+            is_reference = bool(event.get("reference"))
+            screen_ref = event.get("screen_ref")
+            if image and is_reference:
+                # An unverified reference frame: it carries no committed seq, so
+                # it keeps its own identity (``screen_ref``) and never overwrites
+                # the last verified observation. Dedupe by ref so repeated polls
+                # do not append duplicates.
+                ref_key = str(screen_ref) if screen_ref is not None else image
+                self.current_screen = image
+                if ref_key not in self._screen_ref_seen:
+                    self._screen_ref_seen.add(ref_key)
+                    self.screens.append(
+                        {
+                            "seq": None,
+                            "app": self.current_app,
+                            "image": image,
+                            "reference": True,
+                            "screen_ref": ref_key,
+                        }
+                    )
+                    if len(self.screens) > 30:
+                        del self.screens[: len(self.screens) - 30]
+            elif image:
+                self.current_screen = image
+                self.current_app = event.get("current_app") or self.current_app
+                self.screen_seq = event.get("screen_seq")
                 self.screens.append(
-                    {"seq": self.screen_seq, "app": self.current_app, "image": image}
+                    {
+                        "seq": self.screen_seq,
+                        "app": self.current_app,
+                        "image": image,
+                        "reference": False,
+                        "screen_ref": None,
+                    }
                 )
                 if len(self.screens) > 30:
                     del self.screens[: len(self.screens) - 30]
         elif kind == "taskdoc_snapshot":
             self.task_board = str(event.get("text", ""))
+        elif kind == "capability_snapshot":
+            capabilities = event.get("capabilities")
+            if isinstance(capabilities, dict):
+                self._run_snapshot["capabilities"] = dict(capabilities)
+        elif kind == "stopping":
+            # The soft-stop was acknowledged inside the run; the terminal
+            # run_end has not landed yet, so the run is NOT stopped — it is
+            # winding down the in-flight call/step.
+            self.stop_requested_flag = True
+            if self.status in _ACTIVE_STATUSES:
+                self.activity = "stopping"
         elif kind == "pending_hitl":
             prompt = event.get("prompt")
             self.pending_hitl_prompt = str(prompt) if prompt else None
             self.status = "waiting_hitl" if prompt else "running"
+            self.activity = "waiting_human" if prompt else "running"
         elif kind == "run_end":
             payload = event.get("result") or {}
             self.final_result = RunResult(**payload)
@@ -552,6 +739,7 @@ class WebRunBridge:
             self.tokens = int(event.get("tokens_total", self.tokens))
             self.error = self.final_result.reason if self.status == "error" else None
             self.pending_hitl_prompt = None
+            self.activity = "ended"
 
     def _drain_events(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -588,13 +776,8 @@ class WebRunBridge:
             elif isinstance(capabilities_raw, dict) and capabilities_raw:
                 capabilities = [dict(row) for row in capabilities_raw.values()]
             else:
-                # No run snapshot yet (pre-run / idle): the registry is a pure
-                # function of config + memory dir, so derive it directly — the
-                # console's capability chips work before the first run.
                 try:
-                    from phone_agent.v2.capabilities import (
-                        build_capability_registry,
-                    )
+                    from phone_agent.v2.capabilities import build_capability_registry
 
                     cfg = self._config or self._config_factory(self.overrides)
                     capabilities = [
@@ -618,7 +801,33 @@ class WebRunBridge:
                 "usage": dict(self.usage),
                 "capabilities": capabilities,
                 "error": self.error,
+                "activity": self._effective_activity(),
+                "last_event_ts": self.last_event_ts,
+                "started_at": self.started_at,
+                "stop_requested": self.stop_requested_flag,
+                "requested_model": self.requested_model,
+                "actual_model": self.actual_model,
+                "stream_attempts": [dict(record) for record in self.stream_attempts],
             }
+
+    def _effective_activity(self) -> str:
+        """Project a truthful activity label from status + last event.
+
+        Terminal statuses always read ``ended``; an idle bridge reads ``idle``.
+        While active, the activity mirrors the last observed lifecycle event
+        (waiting_model / executing_tool / waiting_human / stopping / running).
+        This never claims work the events did not report.
+        """
+
+        if self.status == "idle":
+            return "idle"
+        if self.status not in _ACTIVE_STATUSES:
+            return "ended"
+        if self.status == "waiting_hitl":
+            return "waiting_human"
+        if self.stop_requested_flag:
+            return "stopping"
+        return self.activity if self.activity in _ACTIVITY_STATES else "running"
 
     def wait(self, timeout: float | None = None) -> bool:
         thread = self._thread

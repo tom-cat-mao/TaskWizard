@@ -102,8 +102,9 @@ class _Delivery:
     point: str
     package: str | None
     card_id: str | None = None
+    card_version: int | None = None
     card_block: str | None = None
-    rules: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    rules: tuple[tuple[str, int, str], ...] = field(default_factory=tuple)
 
 
 def _render_app_rules(rules: Sequence[tuple[str, str]]) -> str:
@@ -113,6 +114,24 @@ def _render_app_rules(rules: Sequence[tuple[str, str]]) -> str:
     for index, (_lesson_id, text) in enumerate(rules, start=1):
         lines.append(f"{index}. {text}")
     return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class _LessonRef:
+    """Minimal selected-id shape for suppression audit records."""
+
+    lesson_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    """Authoritative lesson-view snapshot with coarse read status."""
+
+    status: str
+    entries: dict[str, tuple[bool, int]]
+
+    def get(self, lesson_id: str) -> tuple[bool, int] | None:
+        return self.entries.get(lesson_id)
 
 
 class ProcedureCardInjector:
@@ -160,10 +179,10 @@ class ProcedureCardInjector:
         self._revoked: set[str] = set()
         # Authoritative lesson-view snapshot cache, keyed by the view file's
         # (mtime_ns, size) so one delivery point reads the file at most once.
-        # ``False`` marks a failed read: validation then fails closed until
-        # the file changes.
+        # ``None`` marks a failed read or missing view: validation then fails
+        # closed until the file changes.
         self._lessons_cache_key: tuple[int, int] | None = None
-        self._lessons_cache: dict[str, tuple[str, int]] | None | bool = False
+        self._lessons_cache: _Snapshot | None = None
 
     # -- run lifecycle ---------------------------------------------------
 
@@ -179,7 +198,7 @@ class ProcedureCardInjector:
         self._injected_rule_ids = []
         self._selected_packages = set()
         self._lessons_cache_key = None
-        self._lessons_cache = False
+        self._lessons_cache = None
 
     @property
     def injected_ids(self) -> list[str]:
@@ -238,19 +257,38 @@ class ProcedureCardInjector:
             return None
         if self.injects:
             selection = self._select(self.goal, app_package=None)
-            self.run_start_selection = selection
             if selection is not None and selection.selected:
                 block = self._card_block(selection, POINT_RUN_START)
                 if block:
+                    if selection.version is None:
+                        selection = self._with_authoritative_version(selection)
                     self.run_start_block = block
-                    self._injected_ids.append(str(selection.lesson_id))
-                    self._record_trace(
-                        POINT_RUN_START,
-                        [str(selection.lesson_id)],
-                        app_package=None,
-                    )
+            self.run_start_selection = selection
         self._prefetch_mentioned_apps()
         return self.run_start_selection
+
+    def take_run_start_block(self) -> str | None:
+        """Return the run-start card only after an emission-time re-check."""
+
+        block = self.run_start_block
+        selection = self.run_start_selection
+        if not block or selection is None:
+            return None
+        self.run_start_block = None
+        if self._revoked_selection(selection):
+            return None
+        self._lessons_cache_key = None
+        self._lessons_cache = None
+        reason = self._authoritative_check(selection)
+        if reason is not None:
+            self._record_suppressed(
+                POINT_RUN_START, selection, reason, kind="card", app_package=None
+            )
+            return None
+        lesson_id = str(selection.lesson_id)
+        self._injected_ids.append(lesson_id)
+        self._record_trace(POINT_RUN_START, [lesson_id], app_package=None)
+        return block
 
     # -- injection point two: after a confirmed launch -------------------
 
@@ -406,16 +444,19 @@ class ProcedureCardInjector:
         block = self._card_block(selection, point)
         if block:
             card_id = str(selection.lesson_id)
+            if selection.version is None:
+                selection = self._with_authoritative_version(selection)
             card_block = block
-        rules: tuple[tuple[str, str], ...] = ()
+        rules: tuple[tuple[str, int, str], ...] = ()
         if with_rules:
-            rules = tuple(self._select_app_rules(package, goal))
+            rules = tuple(self._select_app_rules(package, goal, point=point))
         if card_block is None and not rules:
             return None
         return _Delivery(
             point=point,
             package=package,
             card_id=card_id,
+            card_version=(selection.version if card_id else None),
             card_block=card_block,
             rules=rules,
         )
@@ -434,9 +475,34 @@ class ProcedureCardInjector:
             return None
         reason = self._authoritative_check(selection) if self.injects else None
         if reason is not None:
-            self._record_suppressed(point, selection, reason)
+            self._record_suppressed(
+                point, selection, reason, kind="card", app_package=None
+            )
             return None
         return format_procedure_block(selection)
+
+    def _with_authoritative_version(
+        self, selection: ProcedureSelection
+    ) -> ProcedureSelection:
+        """Capture the selected view version when custom selectors omit it."""
+
+        snapshot = self._lessons_status_snapshot()
+        entry = snapshot.get(str(selection.lesson_id or ""))
+        if entry is None:
+            return selection
+        return ProcedureSelection(
+            lesson_id=selection.lesson_id,
+            title=selection.title,
+            steps=selection.steps,
+            pitfalls=selection.pitfalls,
+            app_scope=selection.app_scope,
+            device_scope=selection.device_scope,
+            score=selection.score,
+            candidates=selection.candidates,
+            filtered=selection.filtered,
+            reason=selection.reason,
+            version=entry[1],
+        )
 
     # -- authoritative delivery gate (S3) ---------------------------------
 
@@ -447,16 +513,19 @@ class ProcedureCardInjector:
         only at run-end/dream, so the selected lesson id is re-checked against
         the current authoritative lesson view: the lesson must exist, be
         injectable, and — when the index metadata carries a version — carry
-        the same version.  Any mismatch (or an unreadable snapshot) suppresses
-        the delivery; the run itself is never affected.
+        the same version.  A missing or corrupt view is reported distinctly
+        from a lesson that is simply not in the view; the run itself is never
+        affected.
         """
 
         lesson_id = str(selection.lesson_id or "").strip()
         if not lesson_id:
             return "no_lesson_id"
         snapshot = self._lessons_status_snapshot()
-        if snapshot is None:
-            return "snapshot_unreadable"
+        if snapshot.status == "missing":
+            return "snapshot_missing"
+        if snapshot.status == "corrupt":
+            return "snapshot_corrupt"
         entry = snapshot.get(lesson_id)
         if entry is None:
             return "lesson_missing"
@@ -467,18 +536,20 @@ class ProcedureCardInjector:
             return "version_mismatch"
         return None
 
-    def _lessons_status_snapshot(self) -> dict[str, tuple[bool, int]] | None:
-        """``{lesson_id: (injectable, version)}`` from the lesson view.
+    def _lessons_status_snapshot(self) -> _Snapshot:
+        """Read-only authoritative view with coarse status.
 
-        Read at most once per file change (mtime-keyed cache) per delivery
-        point; ``None`` signals an unreadable snapshot (fail closed for the
-        injection, never for the run).  Strictly read-only.
+        Returns a :class:`_Snapshot` whose ``status`` is ``ok``, ``missing``,
+        or ``corrupt``.  The dictionary maps ``lesson_id`` to
+        ``(injectable, version)``.  Read at most once per file change
+        (mtime-keyed cache) per delivery point; any non-ok status fails closed
+        for injection, never for the run.
         """
 
         from phone_agent.v2.evolution import (
             lesson_injectable,
             lessons_view_path,
-            read_lessons_snapshot,
+            read_lessons_snapshot_status,
         )
 
         lessons_dir = str(
@@ -487,24 +558,39 @@ class ProcedureCardInjector:
         view_path = lessons_view_path(lessons_dir)
         try:
             stat = view_path.stat()
+        except FileNotFoundError:
+            return _Snapshot(status="missing", entries={})
         except OSError:
-            return None
+            return _Snapshot(status="corrupt", entries={})
         key = (stat.st_mtime_ns, stat.st_size)
-        if self._lessons_cache_key == key and isinstance(self._lessons_cache, dict):
+        if (
+            self._lessons_cache_key == key
+            and self._lessons_cache is not None
+        ):
             return self._lessons_cache
-        try:
-            snapshot = {
-                str(lesson.lesson_id): (lesson_injectable(lesson), int(lesson.version))
-                for lesson in read_lessons_snapshot(lessons_dir)
-            }
-        except Exception:  # noqa: BLE001 - the gate fails closed, not open
-            return None
+        status, lessons = read_lessons_snapshot_status(lessons_dir)
+        entries = {
+            str(lesson.lesson_id): (lesson_injectable(lesson), int(lesson.version))
+            for lesson in lessons
+        }
+        snapshot = _Snapshot(status=status, entries=entries)
         self._lessons_cache_key = key
         self._lessons_cache = snapshot
         return snapshot
 
-    def _record_suppressed(self, point: str, selection: Any, reason: str) -> None:
-        """Record one suppressed delivery in the shadow/stats path (fail-open)."""
+    def _record_suppressed(
+        self,
+        point: str,
+        selection: Any,
+        reason: str,
+        *,
+        kind: str = "card",
+        app_package: str | None = None,
+    ) -> None:
+        """Record one suppressed delivery in the shadow/stats path (fail-open).
+
+        Logs only the lesson id, reason, and kind; never the lesson body.
+        """
 
         lesson_id = str(getattr(selection, "lesson_id", "") or "") or None
         try:
@@ -513,7 +599,10 @@ class ProcedureCardInjector:
                 / "experience/recall_stats.json"
             )
             update_procedure_delivery_suppressed(
-                stats_path, reason=reason, lesson_id=lesson_id
+                stats_path,
+                reason=reason,
+                lesson_id=lesson_id,
+                kind=kind,
             )
         except Exception:  # noqa: BLE001 - shadow statistics are fail-open
             pass
@@ -526,13 +615,32 @@ class ProcedureCardInjector:
                 point=point,
                 lesson_id=lesson_id,
                 reason=str(reason),
+                kind=kind,
+                app_package=app_package,
             )
         except Exception:  # noqa: BLE001 - trace cannot change run semantics
             return
 
-    def _select_app_rules(self, package: str, goal: str) -> list[tuple[str, str]]:
-        """Read-only app-rule snapshot rendered as one-liners (fail-open)."""
+    def _select_app_rules(
+        self, package: str, goal: str, *, point: str
+    ) -> list[tuple[str, int, str]]:
+        """Read-only app-rule snapshot rendered as one-liners (fail-open).
 
+        If the authoritative snapshot is missing or corrupt, a suppression
+        audit record is emitted once per selection point so rule-only
+        failures are as visible as card failures.
+        """
+
+        snapshot = self._lessons_status_snapshot()
+        if snapshot.status != "ok":
+            self._record_suppressed(
+                point,
+                _LessonRef(None),
+                f"snapshot_{snapshot.status}",
+                kind="rule",
+                app_package=package,
+            )
+            return []
         try:
             from phone_agent.v2.evolution import select_app_rules_for_injection
 
@@ -544,7 +652,7 @@ class ProcedureCardInjector:
             )
         except Exception:  # noqa: BLE001 - app-rule delivery is fail-open
             return []
-        rules: list[tuple[str, str]] = []
+        rules: list[tuple[str, int, str]] = []
         for lesson in lessons:
             lesson_id = str(getattr(lesson, "lesson_id", "") or "")
             if not lesson_id or lesson_id in self._revoked:
@@ -552,23 +660,58 @@ class ProcedureCardInjector:
             device = (getattr(lesson, "scope", {}) or {}).get("device")
             scope_label = "全局 scope" if device is None else "设备 scope"
             rules.append(
-                (lesson_id, f"{lesson.text}（来源 {lesson_id} · {scope_label}）")
+                (
+                    lesson_id,
+                    int(lesson.version),
+                    f"{lesson.text}（来源 {lesson_id} · {scope_label}）",
+                )
             )
         return rules
 
     def _render_delivery(
         self, delivery: _Delivery
     ) -> tuple[str | None, str | None, list[tuple[str, str]]]:
-        """Render a delivery against current revocations (zero-residue drop)."""
+        """Render a delivery against current authoritative lesson state."""
 
+        self._lessons_cache_key = None
+        self._lessons_cache = None
         card_id = delivery.card_id
         if card_id and card_id in self._revoked:
+            self._record_suppressed(
+                delivery.point,
+                _LessonRef(card_id),
+                "runtime_revoked",
+                kind="card",
+                app_package=delivery.package,
+            )
             card_id = None
-        rules = [
-            (rule_id, text)
-            for rule_id, text in delivery.rules
-            if rule_id not in self._revoked
-        ]
+        if card_id:
+            reason = self._authoritative_check(
+                ProcedureSelection(lesson_id=card_id, version=delivery.card_version)
+            )
+            if reason is not None:
+                self._record_suppressed(
+                    delivery.point,
+                    _LessonRef(card_id),
+                    reason,
+                    kind="card",
+                    app_package=delivery.package,
+                )
+                card_id = None
+        snapshot = self._lessons_status_snapshot()
+        rules: list[tuple[str, str]] = []
+        for rule_id, version, text in delivery.rules:
+            rule_reason = self._rule_suppression_reason(rule_id, version, snapshot)
+            if rule_reason is None:
+                rules.append((rule_id, text))
+            else:
+                self._record_suppressed(
+                    delivery.point,
+                    _LessonRef(rule_id),
+                    rule_reason,
+                    kind="rule",
+                    app_package=delivery.package,
+                )
         parts: list[str] = []
         if card_id and delivery.card_block:
             parts.append(f"{PROCEDURE_CARD_PREFIX}\n{delivery.card_block}")
@@ -577,6 +720,30 @@ class ProcedureCardInjector:
         if not parts:
             return None, None, []
         return "\n".join(parts), card_id, rules
+
+    def _rule_suppression_reason(
+        self,
+        rule_id: str,
+        version: int,
+        snapshot: _Snapshot,
+    ) -> str | None:
+        """Return the reason a pending rule is not deliverable, or ``None``."""
+
+        if snapshot.status == "missing":
+            return "snapshot_missing"
+        if snapshot.status == "corrupt":
+            return "snapshot_corrupt"
+        if rule_id in self._revoked:
+            return "runtime_revoked"
+        entry = snapshot.get(rule_id)
+        if entry is None:
+            return "lesson_missing"
+        injectable, current_version = entry
+        if not injectable:
+            return "not_injectable"
+        if current_version != version:
+            return "version_mismatch"
+        return None
 
     def _goal_from_session(self) -> str:
         doc = getattr(self.session, "task_doc", None)
@@ -626,6 +793,11 @@ class ProcedureCardInjector:
             candidates=int(selection.get("candidates", 0)),
             filtered=int(selection.get("filtered", 0)),
             reason=str(selection.get("reason", "")),
+            version=(
+                int(selection["version"])
+                if selection.get("version") is not None
+                else None
+            ),
         )
 
     def _select_from_index(

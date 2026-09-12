@@ -86,6 +86,7 @@ _PACKAGE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*
 _CAPABILITY_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _CAPABILITY_STATES = frozenset({"active", "off", "shadow", "pending"})
 _LESSON_ID_PATTERN = re.compile(r"^les_[0-9a-f]{12,64}$")
+_TOOL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAX_EVENT_TEXT_CHARS = 200
 
 
@@ -240,7 +241,7 @@ def _classify_and_clean(record: Mapping[str, Any]) -> dict[str, Any]:
         if clean_package is not None and not _PACKAGE_PATTERN.fullmatch(clean_package):
             clean_package = None
         tool = _clean_text(record.get("tool"))
-        if tool not in _TOOLS:
+        if tool not in _TOOLS and not _TOOL_ID_PATTERN.fullmatch(tool):
             tool = "unknown"
 
         # Tool args/results are deliberately absent: only this fixed shape lands.
@@ -456,6 +457,7 @@ def classify_tool_result(result: Any, error: BaseException | None = None) -> str
         "未定位",
         "定位失败",
         "未写入",
+        "stale mark",
         "路线仍有未完成项",
         "验收未通过",
         "验收器再次驳回",

@@ -12,12 +12,17 @@ same-screen image dedup was removed (A4) because it never fired in practice —
 accessibility marks jitter across dumps, so the screenshot hash effectively
 changed every step, making the dedup branch dead code. Historical-image growth
 is bounded on the *history* side by ``middleware/images.py`` (keep newest N),
-not on the produce side. Re-observation failure degrades to a single text block
-(fail-closed: an actuation success is not lost just because a re-observe
-hiccuped, and no fake image is ever emitted).
+not on the produce side. Re-observation failure keeps the action fact and, when
+the failed observation retained a valid earlier frame, ships that frame as an
+explicitly earlier/unverified reference image (``reference``/``screen_ref``
+metadata, never a fresh batch); with no valid frame it degrades to a single
+text block. An actuation success is never lost to an observation hiccup and no
+fake image is ever emitted.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 from phone_agent.v2.session import ScreenshotError, clamp_action_settle_ms
 
@@ -46,15 +51,20 @@ def mark_tool_fail(session) -> None:
         pass
 
 
-def format_marks_digest_fallback(marks: dict, max_items: int = 40) -> str:
+def format_marks_digest_fallback(marks, max_items: int = 40) -> str:
     """Render ``mark_id | role | text(<=32) | center`` lines (§6 sketch).
 
     Used only when the session does not expose ``format_marks_digest``. Matches
     the doc's per-line contract so the model sees a stable marks summary.
     """
 
+    entries = (
+        list(marks.items())
+        if isinstance(marks, dict)
+        else [(getattr(mark, "mark_id", "?"), mark) for mark in list(marks or [])]
+    )
     lines: list[str] = []
-    for mark_id, mark in list(marks.items())[:max_items]:
+    for mark_id, mark in entries[:max_items]:
         role = getattr(mark, "role", None) or "?"
         text = (getattr(mark, "text_summary", None) or "").strip()
         if len(text) > 32:
@@ -67,18 +77,14 @@ def format_marks_digest_fallback(marks: dict, max_items: int = 40) -> str:
         lines.append(f"{mark_id}|{role}|{text}|({cx},{cy})")
     body = " · ".join(lines)
     extra = ""
-    if len(marks) > max_items:
-        extra = f" …(+{len(marks) - max_items} more)"
+    if len(entries) > max_items:
+        extra = f" …(+{len(entries) - max_items} more)"
     return body + extra
 
 
-def _obs_text(session, settle_ms: int | None = None) -> tuple[str, object]:
-    """Observe once and build the ``[OBS]`` text; return ``(text, observation)``."""
+def format_observation_text(session, obs) -> str:
+    """Build the canonical model-facing ``[OBS]`` text for one observation."""
 
-    if settle_ms is None:
-        obs = session.observe()
-    else:
-        obs = session.observe(settle_ms=settle_ms)
     current_app = getattr(obs, "current_app", None) or "?"
     seq = getattr(obs, "screen_seq", getattr(session, "screen_seq", 0))
     marks = getattr(obs, "marks", None)
@@ -98,28 +104,53 @@ def _obs_text(session, settle_ms: int | None = None) -> tuple[str, object]:
         if isinstance(raw_total, int):
             total_candidates = raw_total
 
+    items = list(marks.values()) if isinstance(marks, dict) else list(marks or [])
     digest_fn = getattr(session, "format_marks_digest", None)
     if callable(digest_fn):
         try:
             digest = digest_fn(
-                marks, window_source=window_source, windows=windows
+                items, window_source=window_source, windows=windows
             )
         except TypeError:
             # Older/duck-typed digest signature without the B3 kwargs.
-            digest = digest_fn(marks)
+            digest = digest_fn(items)
     else:
-        digest = format_marks_digest_fallback(marks)
+        digest = format_marks_digest_fallback(items)
 
-    count = len(marks) if hasattr(marks, "__len__") else 0
-    count_field = f"{count}"
-    if isinstance(total_candidates, int) and total_candidates > count:
-        count_field = f"{count}/{total_candidates}"
+    retained_count = len(items)
+    shown_count = min(retained_count, 40)
+    select_fn = getattr(session, "select_marks_for_digest", None)
+    if callable(select_fn):
+        try:
+            shown_count = len(select_fn(items, max_items=40))
+        except TypeError:
+            shown_count = len(select_fn(items))
+
+    reported_total = max(retained_count, total_candidates or 0)
+    count_field = f"{shown_count}"
+    if reported_total > shown_count:
+        count_field = f"{shown_count}/{reported_total}"
+    retained_note = ""
+    if shown_count < retained_count < reported_total:
+        retained_note = f" [retained:{retained_count}]"
     # B2: a valid frame whose marks *dump* failed is annotated so the model never
     # reads "no controls" when the dump timed out / errored. A genuinely empty
     # screen (dump_empty / no_interactive_marks) is not annotated as a failure.
     annotation = _marks_failure_annotation(obs)
-    header = f"[OBS] app={current_app} screen#{seq}\nmarks ({count_field}){annotation}: {digest}"
-    return header, obs
+    return (
+        f"[OBS] app={current_app} screen#{seq}\n"
+        f"marks ({count_field}){retained_note}{annotation}: {digest}"
+    )
+
+
+def _obs_text(session, settle_ms: int | None = None) -> tuple[str, object]:
+    """Observe once and build the ``[OBS]`` text; return ``(text, observation)``."""
+
+    if settle_ms is None:
+        obs = session.observe()
+    else:
+        obs = session.observe(settle_ms=settle_ms)
+    return format_observation_text(session, obs), obs
 
 
 _ANNOTATED_MARK_FAILURES = frozenset(
@@ -145,6 +176,65 @@ def _marks_failure_annotation(obs) -> str:
     return ""
 
 
+_REFERENCE_NOTE = (
+    "参考图：本次观测较早采样的一帧有效截图（screen_ref={ref}），"
+    "当前画面未验证，不是当前可操作的标记批次，不能据它使用 mark 或坐标。"
+)
+
+
+def _reference_frame(session) -> dict[str, Any] | None:
+    """Pull the session's unverified reference frame; missing accessor -> None."""
+
+    getter = getattr(session, "last_reference_frame", None)
+    if not callable(getter):
+        return None
+    try:
+        frame = getter()
+    except Exception:  # noqa: BLE001 - degrade to text-only, never crash
+        return None
+    if not isinstance(frame, dict):
+        return None
+    b64 = frame.get("b64")
+    if not b64:
+        return None
+    return {
+        "b64": b64,
+        "mime": frame.get("mime") or "image/png",
+        "ref": str(frame.get("ref") or "ref"),
+    }
+
+
+def observation_failure_blocks(
+    session, headline: str, *, failure_code: str | None = None
+) -> list[dict]:
+    """Failure-side observation blocks: factual text + optional reference image.
+
+    ``headline`` is the complete failure fact (e.g.
+    ``[OBS] (re-observation failed: ...)``). When the failed observation retained
+    a valid earlier-sampled frame, it is attached as an ordinary multimodal image
+    block carrying ``reference``/``screen_ref`` metadata, and the text says
+    explicitly that it is an earlier, unverified reference — never a fresh mark
+    batch. A protected-screen failure or the absence of a valid frame yields a
+    text-only result; no image is ever fabricated.
+    """
+
+    if failure_code == "secure_screenshot_blocked":
+        return [{"type": "text", "text": headline}]
+    frame = _reference_frame(session)
+    if frame is None:
+        return [{"type": "text", "text": headline}]
+    note = _REFERENCE_NOTE.format(ref=frame["ref"])
+    return [
+        {"type": "text", "text": f"{headline}\n{note}"},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:{frame['mime']};base64,{frame['b64']}"},
+            "reference": True,
+            "screen_ref": frame["ref"],
+        },
+    ]
+
+
 def auto_observation(session, settle_ms: int | None = None) -> list[dict]:
     """Return the §7.4 ``[OBS]`` block as a multimodal content list.
 
@@ -154,8 +244,10 @@ def auto_observation(session, settle_ms: int | None = None) -> list[dict]:
     screen hash almost every step; total image growth is bounded on the history
     side by ``middleware/images.py``.)
 
-    Failure (re-observation raised) degrades to a single text block, never a
-    fake image — fail-closed.
+    Failure (re-observation raised) keeps a text block and, when the failed
+    observation retained a valid earlier frame, adds it as an explicitly
+    earlier/unverified ``reference`` image. With no valid frame — or on a
+    protected screen — the result is text only; a fake image is never emitted.
     """
 
     effective_settle_ms = settle_ms
@@ -187,20 +279,16 @@ def auto_observation(session, settle_ms: int | None = None) -> list[dict]:
                 receipt += f" {clamp_note}"
             return [{"type": "text", "text": receipt}]
         suffix = f" {clamp_note}" if clamp_note else ""
-        return [
-            {
-                "type": "text",
-                "text": f"[OBS] (re-observation failed: {exc}){suffix}",
-            }
-        ]
+        return observation_failure_blocks(
+            session,
+            f"[OBS] (re-observation failed: {exc}){suffix}",
+            failure_code=getattr(exc, "failure_code", None),
+        )
     except Exception as exc:  # noqa: BLE001 - observation is best-effort here
         suffix = f" {clamp_note}" if clamp_note else ""
-        return [
-            {
-                "type": "text",
-                "text": f"[OBS] (re-observation failed: {exc}){suffix}",
-            }
-        ]
+        return observation_failure_blocks(
+            session, f"[OBS] (re-observation failed: {exc}){suffix}"
+        )
 
     if clamp_note:
         text += f"\n{clamp_note}"

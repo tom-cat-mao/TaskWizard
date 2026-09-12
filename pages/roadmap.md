@@ -1,44 +1,44 @@
 # 路线图
 
+本页只列**用户相关**的能力状态与限制；详细验收证据、批次授权与实施记录在仓库 `docs/execution/`，
+维护者视角的当前状态在 `docs/future-roadmap.md`。
+
 ## 已完成
 
 | 模块 | 内容 |
 |---|---|
-| thin-loop v2 | 工具环替代图编排；v1 LangGraph 架构已删除 |
-| 原子观测 | 单生产者 + epoch 批次徽章 + mark 新鲜度闸门；dump 失败触发重试并在观测文本标注 |
-| 安全 | 预警制（wary 默认）、finish 两段式、独立验收器 |
-| 成本 | token 预算上限、两级 auto-compact（摘要携带记忆/能力状态）、cached_tokens 与 first-diff 计量 |
-| App 名解析 | 四层解析（归一化→多路候选→先验排序→证据分型三态决策）；`exact_package_segment` 设备事实证据；拼音/嵌入/模糊永不单独自动执行；typed 默认 + legacy 可回退 |
-| App-KB | 设备事实 + learned 别名（验证启动写回 + 隐式纠正）+ dream 整理与错误别名覆盖（秒退+自述签名）+ 用户纠正入口（`--learn-alias`/`--forget-alias`，最高信任级） |
-| 窗口化 marks | `uiautomator dump --windows` 双模式采集（auto 回退）；窗口分组渲染 + 可操作性四档（confirmed/likely/blocked/unknown）；名额按窗口配额，顶层弹窗保底 |
-| locate | 原图输入、hint-first、可选 scope 区域裁剪；连击 id 不碰撞；命中开启新观测批次 |
-| 产出物 | `write_document`/`update_document` 产出单页 HTML（攻略/计划/报告）；路径由 run id 派生，控制台「产出」页预览/删除 |
-| 经验档案 | episode 记录（隐私白名单）+ UsageLedger 持久化 + dream 归档 |
-| 语义回想 | sqlite-vec + 本地 MLX 嵌入（全量精度）；run 结束自动增量索引；别名/档案分榜召回；Hit@1 等新口径统计 |
-| 经验提炼与晋升 | `--distill` 离线蒸馏（水位线批次、语义字段输出 + harness 客观校验与簿记、无失败锚定/复现硬门槛）、两类候选统一自判分级（auto_approved / needs_review）、人工 CLI 纠正通道、版本链撤销 |
-| 经验回注 | `MEMORY_RAG=on` 时注入 approved / auto_approved 经验（参考提示身份、上限、scope 过滤、可审计） |
-| 过程卡注入 | 三时机：run 开局通用卡、goal mention 预取（≤2 个 resolved App）、进场送卡 + app 规则（launch_app 成功或前台包检测，系统包过滤名单可叠加）；每包每 run 去重；`replay --channel procedure` 离线评估 |
-| 成功先例离线评估 | `python -m phone_agent.v2.replay`：时间序内存重放 episode 日志，coverage/relevance/steps-delta 三闸为"是否注入成功先例"提供离线证据 |
-| 能力体系 | 注册表 + apply/release 挂载层（装配 reconcile、依赖可见、run 快照审计、紧急撤销通道） |
-| 运行隔离 | runner 子进程执行、控制台重启不中断任务、断线重连回放 |
-| 观测加固 | FLAG_SECURE 黑屏检测、观测静置（全局 + 按动作可选 settle_ms） |
-| 控制台 | 步骤时间线、钉帧回看、任务板/应用库/记忆/产出页、软停止、每轮配置覆盖 |
-| 实机诊断 | 诊断 skill：证据流 + 截图落盘 + 逐步回放 HTML 报告 + 源码归因 + 录屏；解析路/召回对照/别名生命周期维度 |
-| 模型提供方插件 | 单层 models.json 注册表（项目 `.taskwizard.models.json` / `PHONE_AGENT_MODELS_FILE`），`openai-completions`/`anthropic-messages`/`google-generative-ai` 三种 API 构建器；五角色 `provider:model` 路由（actor/memory/verifier/safety_reviewer/distill 回落链不变）；roles 段每角色调用配置、DSH 式传输注册表；`PHONE_AGENT_THINKING` 按 `thinkingLevelMap` 翻译各家思考配置；`--list-models`；零配置与旧版逐字段一致；第三方插件可注册 provider |
-| 上下文与记忆加固 | model/pre_request 瀑布改为纯全列表变换（桥接器统一铸唯一 RemoveMessage，杜绝监听器 RemoveMessage 吃掉摘要/任务板）；token 计量算工具调用参数 + CJK 感知 + 无 usage 时 input+output 全计；compact 窗口计入 schema/output 预留；蒸馏游标 `(ts_end, run_id)` 失败可重试（3 次放弃留痕）；撤销后同 id 重提自动降格；规则按渲染行成本装箱；过程卡投递前对权威 lesson 视图复检（撤销/版本不一致即抑制）；replay 口径正名（app_grounded_hit_rate、重叠 run 不前视、calibrate 不自动改常数）；任务板结构预算（字段长度上限 + 渲染截断） |
+| thin-loop v2 | 每步一次模型调用、一个工具动作；harness 不做工作流编排 |
+| 原子观测与参考图 | 单生产者 + epoch 批次徽章 + mark 新鲜度闸门；观测失败但已取得有效截图时返回标注过的未验证参考图（不可寻址） |
+| 安全 | 预警制（`wary` 默认）、四档模式、finish 两段式 + 独立验收器（故障 fail-open 并记 `skipped`） |
+| 成本 | token 预算硬上限、两级 auto-compact |
+| marks 与 locate | 执行必须绑定当前批次 mark；窗口化分组展示（默认 `auto`，设备不支持自动回退）；`locate` 原图输入、可选 scope、命中开启新批次 |
+| App 名解析 | 归一化 → 多路候选 → 先验排序 → 证据分型三态；弱证据只给候选，绝不单独自动执行 |
+| App-KB | 设备事实 + learned 别名（验证启动写回 + 隐式纠正）+ dream 错别名覆盖 + 用户纠正入口（最高信任） |
+| 产出物 | `write_document` / `update_document` 产出单页 HTML（路径由 run id 派生），控制台可预览/删除 |
+| 经验档案 | episode 固定 schema + 隐私白名单 + dream 归档为聚合统计 |
+| 语义回想 | 本地向量索引（sqlite-vec + MLX 嵌入），默认 shadow 只观测；统计 Hit@1 等口径 |
+| 经验蒸馏与回注 | 离线 `--distill` 自判分级（auto_approved / needs_review）；`MEMORY_RAG=on` 受控注入 approved / auto_approved 经验，有上限、可撤销 |
+| 过程卡注入 | 三时机投递（开局 / mention 预取 / 进场），每包每 run 至多一次，额度独立 |
+| 模型提供方 | 单层 `models.json`、三种 API 构建器、五角色 `provider:model` 路由、`roles` 段、thinking 翻译、`--list-models`；正式 `PHONE_AGENT_STREAMING` 开关及模型/角色覆盖，默认 off，Web 可增量观察 actor 输出（协议经离线验证，未验证真实网关流式） |
+| 可用性降级 | 可选 `PHONE_AGENT_FALLBACK_MODEL`：首选构建/调用失败时降级一次（不猜端点/密钥、同目标不重复），并记录实际使用模型与原因；坏 models 声明逐项跳过 + 告警，env 网关保留 |
+| 能力体系与插件 | 统一装配层 + 事件总线；插件经 entry points 或 `plugin add` 挂入（API provisional v1） |
+| 运行隔离 | runner 子进程执行，控制台重启可回放重连 |
+| 实机诊断 | 证据流 + 截图落盘 + 逐步回放 HTML 报告（`--share` 脱敏） |
+| 控制台 | 固定顶栏 + 视口高度两栏工作台（336px 设备栏、右侧紧凑任务输入与步骤/任务板/应用库/记忆/产出页签）；运行状态区分等待模型/工具/人工与“已请求停止”；参考图与已钉历史帧区分；软停止、每轮配置覆盖、重启可回放重连 |
 
 ## 进行中
 
-- 经验数据积累与回想命中率观测（控制台「记忆」页，新口径 Hit@1 / 污染率）
+- **经验数据积累与回想命中率观测**：用真实使用数据校准阈值与注入效果。
 
 ## 下一步
 
 | 方向 | 状态 |
 |---|---|
-| 成功先例回注（run 开局注入同类成功 episode） | 离线三闸达标前不开工；等 replay 指标提供证据 |
-| prefix-cache 优化（任务板版本化 + 图片批量折叠） | 评审文档已备，待批准后开工 |
-| marks 可操作性进执行（op=blocked 执行前 fail-closed） | 待窗口分组真机验证后开工 |
+| 成功先例回注（run 开局注入同类成功 episode） | 离线三闸达标前不开工 |
+| prefix-cache 优化（任务板版本化 + 图片批量折叠） | 评审文档已备，待批准 |
+| marks `op=blocked` 执行门控 | 当前纯展示；未计划直接启用，如要改变需独立决策与真机验证 |
 | 产出物进语义索引（攻略可复用召回） | 待产出物积累 |
-| 强弱模型路由 | 按任务复杂度分流，降成本。角色级路由已由模型提供方插件交付（每角色 `provider:model`）；按任务复杂度动态分流仍是远期 |
+| 按任务复杂度的动态模型路由 | 远期；角色级路由已可用 |
 
 演进原则：先记录、再影子验证、蒸馏自判分级 + 人工 CLI 纠正；注入有上限、可撤销；记忆不旁路安全与验收。
+以上能力以本地 fake 与隔离测试验证为主，真机行为受设备厂商、系统版本与网关限制，本页不承诺成功率。

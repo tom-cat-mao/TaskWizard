@@ -76,6 +76,60 @@ class LocateAmbiguousError(RuntimeError):
         self.failure_code = failure_code
 
 
+# LocateAnything's stable provider failures are deliberately kept separate from
+# description failures.  The parser codes are listed here so a malformed model
+# response can be retried as-is without being mistaken for a missing target.
+LOCATE_PROVIDER_FAULT_CODES = frozenset(
+    {
+        "import_error",
+        "provider_error",
+        "model_not_found",
+        "unsupported_platform",
+        "provider_unavailable",
+        "missing_hint",
+    }
+)
+LOCATE_TRANSIENT_FAILURE_CODES = frozenset(
+    {
+        "timeout",
+        "out_of_range",
+        "bad_order",
+        "too_small",
+        "too_large",
+        "empty_output",
+        "invalid_format",
+        "invalid_bbox",
+        "invalid_resize",
+    }
+)
+LOCATE_PROVIDER_FAULT_STREAK_THRESHOLD = 3
+
+
+def normalize_locate_failure_code(code: str | None) -> str:
+    """Map provider description labels to the session/tool labels."""
+
+    if code == "grounding_ambiguous":
+        return "ambiguous"
+    if code in (None, "grounding_no_candidate"):
+        return "no_candidate"
+    return str(code)
+
+
+def classify_locate_failure(code: str | None) -> str:
+    """Return the shared tool-facing class for a locate failure code."""
+
+    normalized = normalize_locate_failure_code(code)
+    if normalized in {"ambiguous", "no_candidate"}:
+        return "description"
+    if normalized in LOCATE_PROVIDER_FAULT_CODES:
+        return "service_fault"
+    if normalized in LOCATE_TRANSIENT_FAILURE_CODES:
+        return "transient"
+    # Preserve the old wording for non-contract provider codes while keeping
+    # contract-defined parser codes explicitly transient above.
+    return "description"
+
+
 # U1 batch-badge separator: external mark ids are ``<provider_id>@e<epoch>``
 # (e.g. ``ax_1@e12``). The provider-internal id (``ax_1``) is kept only as
 # provenance; every id the model ever sees carries the batch suffix so a stale
@@ -164,6 +218,19 @@ class MarksSample:
     # so the digest header can surface ``active``/``focus`` — those live on the
     # window record, not on ``MarkCandidate``. Display only.
     windows: list[dict[str, Any]] | None = None
+
+
+@dataclass(frozen=True)
+class _FrameGeometry:
+    """Temporary geometry for a screenshot that has not been committed."""
+
+    screen_width: int
+    screen_height: int
+
+    def relative_to_abs(self, rx: int, ry: int) -> tuple[int, int]:
+        return convert_relative_to_absolute(
+            [rx, ry], self.screen_width, self.screen_height
+        )
 
 
 @dataclass
@@ -275,6 +342,7 @@ class PhoneSession:
         # lazy visual locate provider (singleton per session)
         self._locate_provider: "MarkProvider | None" = None
         self._locate_provider_built: bool = False
+        self._consecutive_locate_provider_faults: int = 0
         # WP-G2cB (B1): monotonic locate sequence. Every locate-minted mark id
         # carries this counter so two locates *in the same batch* can never
         # collide on the provider id (both providers tend to return ``la_1`` /
@@ -288,6 +356,8 @@ class PhoneSession:
         self._last_locate_shot: "Screenshot | None" = None
         self._last_locate_app: str = "unknown"
         self._last_locate_metadata: dict[str, Any] = {}
+        self._last_reference_frame: dict[str, Any] | None = None
+        self._reference_seq: int = 0
         # last-known dimensions for coordinate conversion
         self._last_width: int = 0
         self._last_height: int = 0
@@ -346,6 +416,7 @@ class PhoneSession:
 
         self._launched_this_run.clear()
         self._foreground_package = None
+        self._consecutive_locate_provider_faults = 0
 
     # -- foreground-change announcements (WP-WF4-A, scheme C) --------------
 
@@ -635,8 +706,6 @@ class PhoneSession:
                 failure_code=code,
                 failure_message=getattr(shot, "failure_message", None),
             )
-        self._last_width = int(shot.width)
-        self._last_height = int(shot.height)
         return shot
 
     def refresh_marks(self, shot: "Screenshot | None" = None) -> list[MarkCandidate]:
@@ -759,6 +828,13 @@ class PhoneSession:
         screenshot or persistent foreground instability is. A genuinely empty
         screen (``accessibility_dump_empty`` / ``no_interactive_marks``) does not
         retry.
+
+        A failed observation retains the most recent valid screenshot this call
+        captured as an unverified reference frame (:meth:`last_reference_frame`):
+        the renderer may show it with an explicit earlier/unverified label, but
+        it is never a batch — ``epoch``, ``screen_seq`` and display geometry stay
+        frozen while ``marks`` are invalidated. A protected-screen failure
+        (``secure_screenshot_blocked``) retains no frame.
         """
 
         if settle_ms is None:
@@ -769,10 +845,8 @@ class PhoneSession:
             effective_settle_ms, _was_clamped = clamp_action_settle_ms(settle_ms)
 
         last_error: Exception | None = None
-        last_sample: MarksSample | None = None
-        last_shot: "Screenshot | None" = None
-        last_after: "ForegroundAppObservation | None" = None
-        last_hash: str = ""
+        last_valid_shot: "Screenshot | None" = None
+        self._last_reference_frame = None
         for attempt in range(2):
             if effective_settle_ms > 0:
                 time.sleep(effective_settle_ms / 1000.0)
@@ -785,6 +859,7 @@ class PhoneSession:
             except ScreenshotError as exc:
                 last_error = exc
                 continue
+            last_valid_shot = shot
             before_c = self._component_of(before)
             after_c = self._component_of(after)
             if before_c is not None and after_c is not None and before_c != after_c:
@@ -793,10 +868,6 @@ class PhoneSession:
                     f"observation unstable: foreground {before_c!r} -> {after_c!r}"
                 )
                 continue
-            last_sample = sample
-            last_shot = shot
-            last_after = after
-            last_hash = screen_hash
             # A transient marks-dump failure is observation instability: retry
             # once (like a foreground change). A stable/empty screen or the
             # second attempt commits with whatever the dump produced.
@@ -815,17 +886,10 @@ class PhoneSession:
                 shot, sample, foreground=after, screen_hash=screen_hash
             )
 
-        # Screenshot itself never succeeded: fail closed, drop the whole batch.
-        if last_shot is None or last_sample is None:
-            self._invalidate_batch()
-            raise last_error or ScreenshotError("observation failed")
-
-        # Screenshot is valid but the marks dump kept failing across both
-        # attempts. The frame is real, so commit it annotated rather than losing
-        # the observation — a dump failure must never masquerade as "no controls".
-        return self._commit_observation(
-            last_shot, last_sample, foreground=last_after, screen_hash=last_hash
-        )
+        self._invalidate_batch()
+        error = last_error or ScreenshotError("observation failed")
+        self._remember_reference_frame(last_valid_shot, error)
+        raise error
 
     def _commit_observation(
         self,
@@ -844,6 +908,11 @@ class PhoneSession:
         """
 
         current_app = self._label_of(foreground)
+        # A committed observation is a successful fresh view of the device, so
+        # it breaks a run of locate-provider faults.
+        self._consecutive_locate_provider_faults = 0
+        self._last_width = int(shot.width)
+        self._last_height = int(shot.height)
         self.screen_seq += 1
         self.epoch += 1
         minted = self._mint_marks(sample.marks)
@@ -894,6 +963,45 @@ class PhoneSession:
         """Drop every current-batch mark (no stale authority after a failure)."""
 
         self.marks = {}
+
+    def _remember_reference_frame(
+        self, shot: "Screenshot | None", error: Exception
+    ) -> None:
+        """Retain the last valid screenshot of a failed observation as reference.
+
+        The frame is not an observation: ``screen_seq``/``epoch`` stay frozen,
+        nothing is added to ``marks``, and display geometry is untouched. It
+        exists only so renderers can show the model the last usable frame with an
+        explicit earlier/unverified label — never as a fresh batch. A protected
+        screen (``secure_screenshot_blocked``) retains nothing so the secure-black
+        boundary is never bypassed by an earlier capture.
+        """
+
+        if shot is None or not getattr(shot, "base64_data", None):
+            self._last_reference_frame = None
+            return
+        if getattr(error, "failure_code", None) == "secure_screenshot_blocked":
+            self._last_reference_frame = None
+            return
+        self._reference_seq += 1
+        self._last_reference_frame = {
+            "b64": shot.base64_data,
+            "mime": getattr(shot, "mime_type", None) or "image/png",
+            "ref": f"ref{self._reference_seq}",
+        }
+
+    def last_reference_frame(self) -> dict[str, Any] | None:
+        """Return the unverified reference frame of the latest failed observe.
+
+        ``{"b64", "mime", "ref"}`` when that observation captured a valid
+        screenshot, else ``None``. The frame is not a batch: it carries no screen
+        seq, no marks and no geometry, and every prior mark stays invalidated.
+        """
+
+        frame = self._last_reference_frame
+        if not frame or not frame.get("b64"):
+            return None
+        return dict(frame)
 
     # -- mark resolution --------------------------------------------------
 
@@ -1008,11 +1116,13 @@ class PhoneSession:
         already moved past. Any ``scope_*`` ids are resolved against the current
         batch **before** the bump, so scoping still fails closed on a stale id.
 
-        The single screenshot the visual model ran on is stashed
+        Provider failures retain their failure code and are surfaced as service
+        faults or transient failures; they are never rewritten as a description
+        miss. The single screenshot the visual model ran on is stashed
         (``_last_locate_shot`` / ``_last_locate_app``) so the locate tool can
         return that **same frame** without a second capture. Zero or multiple
-        confident candidates raise :class:`LocateAmbiguousError`; nothing is
-        registered, no batch is opened, and nothing executes.
+        confident candidates raise :class:`LocateAmbiguousError`; failures
+        register nothing, open no batch, and execute nothing.
         """
 
         self._last_locate_metadata = {}
@@ -1029,8 +1139,10 @@ class PhoneSession:
 
         provider = self._get_locate_provider()
         if provider is None:
+            self._last_locate_metadata["failure_code"] = "provider_unavailable"
+            self._consecutive_locate_provider_faults += 1
             raise LocateAmbiguousError(
-                "visual locate provider is unavailable",
+                "locate provider fault (provider_unavailable: unavailable)",
                 failure_code="provider_unavailable",
             )
         shot = self.screenshot()
@@ -1046,7 +1158,7 @@ class PhoneSession:
         if region is not None:
             scope_crop = build_scope_crop(
                 shot,
-                session=self,
+                session=_FrameGeometry(int(shot.width), int(shot.height)),
                 region_bbox_1000=region,
                 padding_ratio=self.config.scope_padding_ratio,
             )
@@ -1086,14 +1198,24 @@ class PhoneSession:
         }
         executable = [mark for mark in result.marks if getattr(mark, "valid", True)]
         if not result.success or len(executable) == 0:
-            failure_code = (
-                "ambiguous"
-                if getattr(result, "failure_code", None)
-                == "grounding_ambiguous"
-                else "no_candidate"
+            provider_failure_code = getattr(result, "failure_code", None)
+            failure_code = normalize_locate_failure_code(provider_failure_code)
+            # Keep the provider's raw diagnosis in the trace artifact.  The
+            # exception uses the normalized description labels for compatibility.
+            self._last_locate_metadata["failure_code"] = str(
+                provider_failure_code or failure_code
             )
+            failure_message = getattr(result, "message", None)
+            if classify_locate_failure(failure_code) == "service_fault":
+                self._consecutive_locate_provider_faults += 1
+                detail = (
+                    f": {failure_message}" if failure_message else ""
+                )
+                message = f"locate provider fault ({failure_code}{detail})"
+            else:
+                message = f"no confident match for {description!r}"
             raise LocateAmbiguousError(
-                f"no confident match for {description!r}",
+                message,
                 candidates=list(result.candidates),
                 failure_code=failure_code,
             )
@@ -1129,7 +1251,13 @@ class PhoneSession:
         # a fresh observe (single-producer: one screenshot per locate call).
         self._last_locate_shot = shot
         self._last_locate_app = self._foreground_label()
+        self._consecutive_locate_provider_faults = 0
         return minted
+
+    def locate_provider_fault_streak(self) -> int:
+        """Return consecutive service-fault locate failures for this run."""
+
+        return self._consecutive_locate_provider_faults
 
     def last_locate_metadata(self) -> dict[str, Any]:
         """Return trace-safe metadata for the most recent locate query."""
@@ -1186,7 +1314,7 @@ class PhoneSession:
           omitted. This is display only — nothing here gates execution.
         """
 
-        shown = list(marks[:max_items])
+        shown = PhoneSession.select_marks_for_digest(marks, max_items=max_items)
         window_ids = [m.window_id for m in shown if m.window_id]
         distinct = list(dict.fromkeys(window_ids))
         has_strong = any(
@@ -1215,6 +1343,64 @@ class PhoneSession:
                 f"... (+{len(marks) - max_items} more)"
             )
         return body
+
+    @staticmethod
+    def select_marks_for_digest(
+        marks: list[MarkCandidate], max_items: int = 40
+    ) -> list[MarkCandidate]:
+        """Select the final model-facing marks without starving a window.
+
+        Accessibility parsing already applies a per-window quota, but its retained
+        list may still exceed this smaller display budget.  Apply the same shape of
+        guarantee here, then let the grouped renderer order windows by layer.  The
+        selected marks retain document order so flat/single-window output stays
+        compatible.  This is presentation only; it never changes ``self.marks`` or
+        mark executability.
+        """
+
+        items = list(marks)
+        limit = max(0, int(max_items))
+        if len(items) <= limit:
+            return items
+        if limit == 0:
+            return []
+
+        buckets: dict[str, list[int]] = {}
+        first_seen: dict[str, int] = {}
+        layers: dict[str, int | None] = {}
+        for position, mark in enumerate(items):
+            window_id = str(mark.window_id or "")
+            if not window_id:
+                return items[:limit]
+            buckets.setdefault(window_id, []).append(position)
+            first_seen.setdefault(window_id, position)
+            if window_id not in layers or layers[window_id] is None:
+                layers[window_id] = mark.window_layer
+
+        if len(buckets) <= 1:
+            return items[:limit]
+
+        def priority(window_id: str) -> tuple[bool, int, int]:
+            layer = layers[window_id]
+            return (layer is None, -(layer or 0), first_seen[window_id])
+
+        ordered_windows = sorted(buckets, key=priority)[:limit]
+        guarantee = max(1, min(8, limit // len(ordered_windows)))
+        selected: set[int] = set()
+        for window_id in ordered_windows:
+            selected.update(buckets[window_id][:guarantee])
+
+        remaining = limit - len(selected)
+        for window_id in ordered_windows:
+            if remaining <= 0:
+                break
+            for position in buckets[window_id][guarantee:]:
+                if remaining <= 0:
+                    break
+                selected.add(position)
+                remaining -= 1
+
+        return [mark for position, mark in enumerate(items) if position in selected]
 
     @staticmethod
     def _window_flag_lookup(

@@ -18,6 +18,19 @@ Merge orders (per the design doc):
 * thinking: global ``PHONE_AGENT_THINKING`` level translated through
   ``ModelSpec.thinking_level_map`` + ``ProviderCompat.thinking_format``;
   unsupported/absent declarations omit the param silently.
+* streaming: the effective ``off``/``on`` decision (role > model entry >
+  global env) is forwarded as the transport's own ``streaming`` parameter on
+  all three supported apis, so the SDK streams and aggregates the complete
+  message by itself (headless included).  ``off`` emits no parameter, keeping
+  the default build unchanged.  ``supports_usage_in_streaming`` is a separate
+  *usage-reporting* declaration (see below) and never a streaming switch.
+* usage-in-streaming: an **explicit** ``ProviderCompat.supports_usage_in_streaming``
+  (models.json ``supportsUsageInStreaming``) is forwarded as ``stream_usage`` on
+  the openai and anthropic transports, where it only has a wire effect on a
+  streaming request (``stream_options.include_usage`` / streaming-event usage
+  capture); an absent field emits nothing so the zero-config build keeps the
+  legacy/SDK default.  The google protocol has no equivalent request option, so
+  the declaration is deliberately not translated there.
 
 ``parallel_tool_calls=False`` stays an openai-path-only default (P0 #15): the
 thin loop is one-observation-one-action, and only the ChatOpenAI transport
@@ -40,11 +53,14 @@ transport.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 import threading
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
+from phone_agent.v2.providers.roles import streaming_mode_from_tiers
 from phone_agent.v2.providers.types import (
     API_ANTHROPIC,
     API_GOOGLE,
@@ -83,6 +99,7 @@ if TYPE_CHECKING:
             headers: dict[str, str],
             level: str,
             compat: ResolvedCompat,
+            streaming: bool,
         ) -> "BaseChatModel": ...
 
 logger = logging.getLogger(__name__)
@@ -160,6 +177,35 @@ _GOOGLE_KNOWN_SAMPLING = frozenset(
 _GOOGLE_REASONING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
 
 
+@cache
+def _anthropic_client_type():
+    """Lazily define the native client with tail-SystemMessage support."""
+
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.messages import SystemMessage
+
+    class TailSystemChatAnthropic(ChatAnthropic):
+        """Native Anthropic client accepting harness tail SystemMessages."""
+
+        def _get_request_payload(self, input_, *, stop=None, **kwargs):
+            messages = self._convert_input(input_).to_messages()
+            system = [
+                message for message in messages if isinstance(message, SystemMessage)
+            ]
+            if system and messages[: len(system)] != system:
+                messages = [
+                    *system,
+                    *(
+                        message
+                        for message in messages
+                        if not isinstance(message, SystemMessage)
+                    ),
+                ]
+            return super()._get_request_payload(messages, stop=stop, **kwargs)
+
+    return TailSystemChatAnthropic
+
+
 def effective_compat(provider: ProviderSpec, model: ModelSpec) -> ResolvedCompat:
     """Merge model-level compat over the provider's, then resolve defaults."""
 
@@ -192,7 +238,6 @@ def effective_compat(provider: ProviderSpec, model: ModelSpec) -> ResolvedCompat
             ),
         )
     return base.resolved()
-
 
 def _mapped_thinking_value(level: str, model: ModelSpec) -> Any:
     """Resolve the thinking level through the model's three-state map.
@@ -400,8 +445,16 @@ def build_model_from_resolved(
     *,
     role_sampling: dict | None = None,
     role_headers: dict | None = None,
+    role_streaming: str | None = None,
 ) -> "BaseChatModel":
-    """Build the configured chat model for a resolved provider:model pair."""
+    """Build the configured chat model for a resolved provider:model pair.
+
+    ``streaming`` is resolved from the three documented tiers (role > model
+    entry > global env) and translated into the transport's own streaming
+    parameter, so the model streams and aggregates by itself; the web observer
+    only listens.  An ``off`` decision emits no parameter at all (the default
+    build stays byte-for-byte identical to the legacy client).
+    """
 
     provider = resolved.provider
     model = resolved.model
@@ -418,7 +471,15 @@ def build_model_from_resolved(
     )
     headers = _merge_headers(provider.headers, model.headers, role_headers)
     level = str(getattr(config, "thinking", "") or "").strip().lower()
-    return builder(
+    streaming = (
+        streaming_mode_from_tiers(
+            global_mode=getattr(config, "streaming", ""),
+            model_mode=model.streaming,
+            role_mode=role_streaming,
+        )
+        == "on"
+    )
+    built = builder(
         provider,
         model,
         config,
@@ -426,7 +487,9 @@ def build_model_from_resolved(
         headers=headers,
         level=level,
         compat=compat,
+        **({STREAMING_KWARG: streaming} if builder_accepts_streaming(builder) else {}),
     )
+    return built
 
 
 def _transport_kwargs(config: "V2Config") -> dict[str, Any]:
@@ -434,6 +497,31 @@ def _transport_kwargs(config: "V2Config") -> dict[str, Any]:
         "timeout": getattr(config, "model_timeout", 180.0),
         "max_retries": getattr(config, "model_max_retries", 2),
     }
+
+
+def _streaming_kwargs(streaming: bool) -> dict[str, Any]:
+    """Transport-level streaming switch (nothing emitted when off)."""
+
+    return {"streaming": True} if streaming else {}
+
+
+def builder_accepts_streaming(builder: "ApiBuilder") -> bool:
+    """Whether a registered builder takes the ``streaming`` transport input.
+
+    External/plugin transports registered against the earlier two-argument
+    shape keep working: the decision is then simply not forwarded to them.
+    """
+
+    try:
+        params = inspect.signature(builder).parameters
+    except (TypeError, ValueError):
+        return True
+    if "streaming" in params:
+        return True
+    return any(param.kind is param.VAR_KEYWORD for param in params.values())
+
+
+STREAMING_KWARG = "streaming"
 
 
 def _builtin_api(api_type: str):
@@ -456,6 +544,7 @@ def _build_openai(
     headers: dict[str, str],
     level: str,
     compat: ResolvedCompat,
+    streaming: bool = False,
 ) -> "BaseChatModel":
     from langchain_openai import ChatOpenAI
 
@@ -466,7 +555,10 @@ def _build_openai(
         "base_url": provider.base_url,
         "model": model.id,
         **_transport_kwargs(config),
+        **_streaming_kwargs(streaming),
     }
+    if compat.usage_in_streaming_declared is not None:
+        kwargs["stream_usage"] = bool(compat.usage_in_streaming_declared)
     if provider.api_key is not None:
         kwargs["api_key"] = provider.api_key
     if headers:
@@ -476,6 +568,9 @@ def _build_openai(
 
     model_kwargs: dict[str, Any] = {}
     max_tokens_field = compat.max_tokens_field or "max_tokens"
+    sampling_token_fields = {"max_tokens", "max_completion_tokens", max_tokens_field}
+    if model.max_tokens is not None and not sampling_token_fields.intersection(sampling):
+        kwargs[max_tokens_field] = model.max_tokens
     for key, value in sampling.items():
         if key == "max_tokens":
             kwargs[max_tokens_field] = value
@@ -504,13 +599,18 @@ def _build_anthropic(
     headers: dict[str, str],
     level: str,
     compat: ResolvedCompat,
+    streaming: bool = False,
 ) -> "BaseChatModel":
-    from langchain_anthropic import ChatAnthropic
-
     thinking_kwargs, _ = translate_thinking(level, model, compat)
     thinking_enabled = bool(thinking_kwargs.get("thinking"))
 
-    kwargs: dict[str, Any] = {"model": model.id, **_transport_kwargs(config)}
+    kwargs: dict[str, Any] = {
+        "model": model.id,
+        **_transport_kwargs(config),
+        **_streaming_kwargs(streaming),
+    }
+    if compat.usage_in_streaming_declared is not None:
+        kwargs["stream_usage"] = bool(compat.usage_in_streaming_declared)
     if provider.api_key:
         kwargs["api_key"] = provider.api_key
     if provider.base_url:
@@ -533,7 +633,7 @@ def _build_anthropic(
     if model_kwargs:
         kwargs["model_kwargs"] = model_kwargs
     kwargs.update(thinking_kwargs)
-    return ChatAnthropic(**kwargs)
+    return _anthropic_client_type()(**kwargs)
 
 
 @_builtin_api(API_GOOGLE)
@@ -546,6 +646,7 @@ def _build_google(
     headers: dict[str, str],
     level: str,
     compat: ResolvedCompat,
+    streaming: bool = False,
 ) -> "BaseChatModel":
     from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -554,7 +655,11 @@ def _build_google(
     if effort is not None and effort not in _GOOGLE_REASONING_LEVELS:
         thinking_kwargs = {}
 
-    kwargs: dict[str, Any] = {"model": model.id, **_transport_kwargs(config)}
+    kwargs: dict[str, Any] = {
+        "model": model.id,
+        **_transport_kwargs(config),
+        **_streaming_kwargs(streaming),
+    }
     if provider.api_key:
         kwargs["api_key"] = provider.api_key
     if provider.base_url:

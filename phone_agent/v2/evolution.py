@@ -28,7 +28,9 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+import fcntl
 import hashlib
 import json
 import math
@@ -465,14 +467,14 @@ class LessonStore:
         self.root = Path(lessons_dir)
         self.events_path = self.root / "events.jsonl"
         self.lessons_path = self.root / "lessons.json"
+        self.lock_path = self.root / "store.lock"
         self._lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
-        self.events_path.touch(exist_ok=True)
-        self._lessons, self._revoked_guard = _replay_lesson_events(self.events_path)
-        self._write_view()
+        with self._locked_refresh():
+            self._write_view()
 
     def lessons(self, *, status: str | None = None) -> list[LessonCandidate]:
-        with self._lock:
+        with self._locked_refresh():
             values = [
                 candidate
                 for candidate in self._lessons.values()
@@ -481,7 +483,7 @@ class LessonStore:
         return sorted(values, key=lambda item: (item.created_ts, item.lesson_id))
 
     def get(self, lesson_id: str) -> LessonCandidate | None:
-        with self._lock:
+        with self._locked_refresh():
             return self._lessons.get(lesson_id)
 
     def propose(
@@ -505,7 +507,7 @@ class LessonStore:
                 "a new lesson candidate must be filed as proposed,"
                 " needs_review, or auto_approved"
             )
-        with self._lock:
+        with self._locked_refresh():
             prior = self._lessons.get(candidate.lesson_id)
             if prior is None:
                 if candidate.version != 1:
@@ -567,7 +569,7 @@ class LessonStore:
     def approve(self, lesson_id: str) -> LessonCandidate:
         """Promote a proposed or very-uncertain (``needs_review``) proposal."""
 
-        with self._lock:
+        with self._locked_refresh():
             candidate = self._require(lesson_id)
             if candidate.status not in _APPROVABLE_STATUSES:
                 raise ValueError("only a proposed or needs_review lesson can be approved")
@@ -592,7 +594,7 @@ class LessonStore:
         clean_reason = _single_line(reason)
         if not clean_reason:
             raise ValueError("revoke reason must not be empty")
-        with self._lock:
+        with self._locked_refresh():
             candidate = self._require(lesson_id)
             if candidate.status == "revoked":
                 raise ValueError("lesson is already revoked")
@@ -627,7 +629,7 @@ class LessonStore:
         clean_reason = _single_line(reason)
         if not clean_reason:
             raise ValueError("demote reason must not be empty")
-        with self._lock:
+        with self._locked_refresh():
             candidate = self._require(lesson_id)
             if candidate.status not in _DEMOTABLE_STATUSES:
                 raise ValueError(
@@ -655,7 +657,7 @@ class LessonStore:
         clean_text = _single_line(text)
         if not clean_text:
             raise ValueError("replacement text must not be empty")
-        with self._lock:
+        with self._locked_refresh():
             prior = self._require(lesson_id)
             revision = replace(
                 prior,
@@ -684,6 +686,28 @@ class LessonStore:
         if candidate is None:
             raise KeyError(f"unknown lesson: {lesson_id}")
         return candidate
+
+    @contextmanager
+    def _locked_refresh(self):
+        """Serialize one store operation and replay authoritative events.
+
+        The process-local lock protects one instance; the small lock file protects
+        every instance and process using this lesson directory. Replaying only
+        after both locks are held prevents an old in-memory snapshot from writing
+        a materialized view that hides a peer's later revocation.
+        """
+
+        with self._lock:
+            with self.lock_path.open("a+b") as lock_stream:
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+                try:
+                    self.events_path.touch(exist_ok=True)
+                    self._lessons, self._revoked_guard = _replay_lesson_events(
+                        self.events_path
+                    )
+                    yield
+                finally:
+                    fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def _proposal_event(
@@ -829,6 +853,42 @@ def lessons_view_path(lessons_dir: str | os.PathLike[str]) -> Path:
     return Path(lessons_dir) / "lessons.json"
 
 
+def read_lessons_snapshot_status(
+    lessons_dir: str | os.PathLike[str],
+) -> tuple[str, list[LessonCandidate]]:
+    """Public read-only view of ``lessons.json`` with coarse status.
+
+    Returns ``(status, lessons)`` where ``status`` is one of ``ok``,
+    ``missing``, or ``corrupt``.  A missing file is distinguished from a
+    permission error, a non-UTF-8 file, or a schema-invalid file by actually
+    attempting the read.  Strictly read-only: opening a runtime run must never
+    create or rebuild lesson state.  The companion
+    :func:`read_lessons_snapshot` keeps the old list-only return for callers
+    that do not need diagnostics.
+    """
+
+    path = lessons_view_path(lessons_dir)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "missing", []
+    except (OSError, UnicodeError):
+        return "corrupt", []
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "corrupt", []
+    if not isinstance(payload, list):
+        return "corrupt", []
+    try:
+        lessons = [LessonCandidate.from_dict(item) for item in payload]
+    except (TypeError, ValueError):
+        return "corrupt", []
+    if len({lesson.lesson_id for lesson in lessons}) != len(lessons):
+        return "corrupt", []
+    return "ok", lessons
+
+
 def read_lessons_snapshot(
     lessons_dir: str | os.PathLike[str],
 ) -> list[LessonCandidate]:
@@ -851,17 +911,8 @@ def _read_lessons_snapshot(lessons_dir: str | os.PathLike[str]) -> list[LessonCa
     run must never create or rebuild lesson state.
     """
 
-    path = Path(lessons_dir) / "lessons.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, list):
-            return []
-        lessons = [LessonCandidate.from_dict(item) for item in payload]
-        if len({lesson.lesson_id for lesson in lessons}) != len(lessons):
-            return []
-        return lessons
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return []
+    _status, lessons = read_lessons_snapshot_status(lessons_dir)
+    return lessons
 
 
 def _lexical_terms(text: str) -> frozenset[str]:
@@ -2229,7 +2280,7 @@ def _append_distill_event(store: LessonStore, event: Mapping[str, Any]) -> None:
     """Best-effort append of a distill bookkeeping event (audit only)."""
 
     try:
-        with store._lock:
+        with store._locked_refresh():
             store._append(event)
     except OSError:
         pass

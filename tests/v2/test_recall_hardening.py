@@ -3,7 +3,7 @@ selection-path failure evidence.
 
 Two contracts are covered here:
 
-* **B1** — the shared embedder is warmed on a daemon thread when the recall
+* **B1** — the shared embedder is warmed synchronously when the recall
   capability mounts in ``on``/``shadow`` mode, and never in ``off`` mode.  A
   warm-up failure is recorded but cannot break assembly or the run.
 * **B2** — every exception on the ``episode`` / ``app_alias`` / ``procedure``
@@ -19,7 +19,6 @@ import json
 from pathlib import Path
 import sys
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -31,9 +30,11 @@ from phone_agent.v2.capabilities import (
 )
 from phone_agent.v2.recall import (
     HashEmbedder,
+    SelectionErrorObservers,
     VecIndex,
     embedder_needs_warmup,
     update_selection_error_stats,
+    warmup_embedder,
 )
 from phone_agent.v2.recall import MlxEmbedder as _MlxEmbedder  # noqa: F401 - patch target
 
@@ -52,20 +53,12 @@ class _RecordingEmbedder:
         self.loaded = False
         self.fail = fail
         self.calls: list[str] = []
-        self._done = threading.Event()
 
     def embed(self, texts):
         self.calls.extend(str(text) for text in texts)
-        self._done.set()
         if self.fail:
             raise RuntimeError("mlx exploded")
         return [[0.0] * self.dimension for _ in texts]
-
-    def wait(self, timeout: float = 5.0) -> bool:
-        deadline = time.monotonic() + timeout
-        while not self._done.is_set() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        return self._done.is_set()
 
 
 class _CountingHash(HashEmbedder):
@@ -139,15 +132,6 @@ def _assemble(config, **kwargs):
     )
 
 
-def _wait_until(predicate, timeout: float = 5.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return False
-
-
 def _collect_errors(index: VecIndex) -> list[tuple[str, str]]:
     """Register a ``(namespace, error_type)`` collector on this index's scope.
 
@@ -167,17 +151,34 @@ def _collect_errors(index: VecIndex) -> list[tuple[str, str]]:
 
 
 @pytest.mark.parametrize("mode", ["on", "shadow"])
-def test_warmup_runs_in_background_for_on_and_shadow(mode):
+def test_warmup_runs_synchronously_for_on_and_shadow(mode):
     embedder = _RecordingEmbedder()
     ctx = _assemble(
         _config(memory_rag=mode),
         injector=SimpleNamespace(embedder_factory=lambda: embedder),
     )
 
-    assert embedder.wait() is True
     assert embedder.calls == ["warmup"]
-    # Warm-up owns nothing on the assembly ledger: no new service/tool/hook.
-    assert ctx.service("recall_event_disposers")
+    assert ctx.service("recall_selection_observers") is not None
+
+
+def test_warmup_embedder_invokes_factory_before_return():
+    calls: list[str] = []
+    embedder = _RecordingEmbedder()
+
+    def factory():
+        calls.append("factory")
+        return embedder
+
+    warmup_embedder(factory)
+
+    assert calls == ["factory"]
+    assert embedder.calls == ["warmup"]
+    assert not [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "recall-embedder-warmup"
+    ]
 
 
 def test_warmup_is_skipped_when_recall_is_off():
@@ -187,9 +188,7 @@ def test_warmup_is_skipped_when_recall_is_off():
         injector=SimpleNamespace(embedder_factory=lambda: embedder),
     )
 
-    time.sleep(0.2)
     assert embedder.calls == []
-    assert embedder.wait(0.05) is False
 
 
 def test_warmup_is_skipped_without_a_configured_index():
@@ -201,7 +200,6 @@ def test_warmup_is_skipped_without_a_configured_index():
         injector=SimpleNamespace(embedder_factory=lambda: embedder),
     )
 
-    time.sleep(0.2)
     assert embedder.calls == []
 
 
@@ -213,7 +211,6 @@ def test_warmup_also_reads_the_private_factory_name():
         _config(memory_rag="on"),
         injector=SimpleNamespace(**{"_embedder_factory": lambda: embedder}),
     )
-    assert embedder.wait() is True
     assert embedder.calls == ["warmup"]
 
 
@@ -228,8 +225,6 @@ def test_deterministic_hash_embedder_is_never_warmed():
         _config(memory_rag="on"),
         injector=SimpleNamespace(embedder_factory=lambda: embedder),
     )
-    time.sleep(0.2)
-
     assert embedder_needs_warmup(embedder) is False
     assert embedder.calls == []
 
@@ -248,9 +243,6 @@ def test_warmup_failure_is_recorded_and_never_breaks_assembly(tmp_path):
         session=session,
     )
 
-    # The warm-up records the failure after the embed call returns, so wait for
-    # the evidence instead of for the call itself.
-    assert _wait_until(lambda: bool(events)) is True
     assert events == [
         {
             "event": "recall_selection_error",
@@ -260,6 +252,28 @@ def test_warmup_failure_is_recorded_and_never_breaks_assembly(tmp_path):
     ]
     # The warm-up namespace is trace-only: no scorecard counter, no file.
     assert not (tmp_path / "memory" / "experience" / "recall_stats.json").exists()
+
+
+def test_warmup_failure_notifies_embedder_observers_and_is_fail_open():
+    observed: list[tuple[str, str]] = []
+    observers = SelectionErrorObservers()
+    observers.add(lambda namespace, error_type: observed.append((namespace, error_type)))
+
+    warmup_embedder(
+        lambda: _RecordingEmbedder(fail=True),
+        observers=observers,
+    )
+
+    assert observed == [("embedder", "RuntimeError")]
+
+
+def test_warmup_skips_already_loaded_embedder():
+    embedder = _RecordingEmbedder()
+    embedder.loaded = True
+
+    warmup_embedder(lambda: embedder)
+
+    assert embedder.calls == []
 
 
 # --- B2: selection-path failure evidence --------------------------------
@@ -399,6 +413,47 @@ def test_unknown_namespace_records_no_counter(tmp_path):
     stats_path = tmp_path / "memory" / "experience" / "recall_stats.json"
     assert update_selection_error_stats(stats_path, "embedder") == {}
     assert not stats_path.exists()
+
+
+def test_procedure_suppressed_counters_split_by_kind_and_latest_isolated(tmp_path):
+    from phone_agent.v2.recall import update_procedure_delivery_suppressed
+
+    stats_path = tmp_path / "memory" / "experience" / "recall_stats.json"
+    update_procedure_delivery_suppressed(
+        stats_path, reason="not_injectable", kind="card", lesson_id="c1", run_id="r1"
+    )
+    update_procedure_delivery_suppressed(
+        stats_path,
+        reason="snapshot_missing",
+        kind="rule",
+        lesson_id="r1",
+        run_id="r1",
+    )
+    update_procedure_delivery_suppressed(
+        stats_path,
+        reason="version_mismatch",
+        kind="rule",
+        lesson_id="r2",
+        run_id="r2",
+    )
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+
+    assert stats["procedure_suppressed"] == 1
+    assert stats["rule_suppressed"] == 2
+    assert stats["latest_procedure_suppressed"]["kind"] == "card"
+    assert stats["latest_procedure_suppressed"]["reason"] == "not_injectable"
+    assert stats["latest_rule_suppressed"]["kind"] == "rule"
+    assert stats["latest_rule_suppressed"]["reason"] == "version_mismatch"
+
+
+def test_unknown_suppression_kind_is_rejected(tmp_path):
+    from phone_agent.v2.recall import update_procedure_delivery_suppressed
+
+    stats_path = tmp_path / "memory" / "experience" / "recall_stats.json"
+    with pytest.raises(ValueError):
+        update_procedure_delivery_suppressed(
+            stats_path, reason="x", kind="other", lesson_id="x"
+        )
 
 
 def test_release_of_the_recall_capability_removes_the_observer(tmp_path):

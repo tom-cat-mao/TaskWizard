@@ -146,6 +146,36 @@ def _is_cn(lang: str) -> bool:
     return (lang or "").strip().lower() in {"cn", "zh", "zh-cn", "zh_cn", "chinese"}
 
 
+def _actual_actor_ref(config: Any) -> str | None:
+    """Actor reference the built model came from, tolerating stub model modules.
+
+    ``actual_role_ref`` lives in the real model module; stubs carry only
+    ``build_chat_model``.  Falls back to plain role resolution and returns
+    ``None`` when no reference can be produced.
+    """
+
+    try:
+        from phone_agent.v2.model import actual_role_ref
+    except ImportError:
+        actual_role_ref = None
+    if callable(actual_role_ref):
+        try:
+            ref = actual_role_ref(config, "actor")
+        except Exception:  # noqa: BLE001 - fall through to role resolution
+            ref = None
+        if ref:
+            return str(ref)
+    try:
+        from phone_agent.v2.providers import resolve_role_ref
+
+        ref = resolve_role_ref(
+            config, "actor", registry=getattr(config, "_provider_registry", None)
+        )
+    except Exception:  # noqa: BLE001 - no resolvable actor reference
+        return None
+    return str(ref) if ref else None
+
+
 def _pinned_id(message: Any) -> bool:
     mid = getattr(message, "id", None) or ""
     return mid.startswith(TASKDOC_ID_PREFIX) or mid.startswith(COMPACT_ID_PREFIX)
@@ -265,10 +295,21 @@ class CompactMiddleware(AgentMiddleware):
         self.schema_reserve = max(0, int(schema_reserve))
         self.output_reserve = max(0, int(output_reserve))
         self.lang = lang
-        self.window = infer_context_window(
-            getattr(config, "model_name", None),
-            getattr(config, "context_window", None),
-        )
+        context_window = getattr(config, "context_window", None)
+        model_name_hint = getattr(config, "model_name", None)
+        if context_window is None:
+            registry = getattr(config, "_provider_registry", None)
+            if registry is not None:
+                actor_ref = _actual_actor_ref(config)
+                if actor_ref:
+                    model_name_hint = actor_ref
+                    try:
+                        resolved = registry.resolve(actor_ref)
+                    except Exception:  # noqa: BLE001 - name hint / default
+                        resolved = None
+                    if resolved is not None:
+                        context_window = resolved.model.context_window
+        self.window = infer_context_window(model_name_hint, context_window)
         self._warned = False
         # A lazily built memory model (config.memory_model) reused across folds.
         self._memory_model: Any | None = None

@@ -13,8 +13,8 @@ scope) followed by a single embedding top-1; the selector only *selects* — the
 two injection points and the prompt wiring land in WP-WF3.
 
 Recall hardening keeps that fail-open contract but makes it observable: the
-shared embedder is warmed on a daemon thread at capability mount (``on``/
-``shadow`` only), and every selection-path exception is recorded — one
+shared embedder is warmed synchronously at capability mount (``on``/``shadow``
+only), and every selection-path exception is recorded — one
 ``recall_selection_error`` trace event plus a per-namespace counter in
 ``recall_stats.json`` — before the caller's fail-open return.  Neither changes
 a selection result, a run outcome, or the meaning of an existing stats field.
@@ -59,9 +59,10 @@ _LAUNCH_RE = re.compile(
 )
 # The recall side plane must fail open *visibly*.  A selection-path exception
 # is recorded (one trace event plus a per-namespace counter in the shadow
-# scorecard) before the caller's fail-open return, and the embedder loads its
-# model off the run's critical path at capability mount time.  Neither the
-# warm-up nor the recording may change a selection result or block a run.
+# scorecard) before the caller's fail-open return.  The embedder loads its
+# model synchronously at capability mount time so native dependencies are
+# never cold-imported by a background thread.  Neither the warm-up nor the
+# recording may change a selection result or block a run.
 WARMUP_TEXT = "warmup"
 RECALL_SELECTION_ERROR = "recall_selection_error"
 # One observe-only counter per namespace; existing stats keys are never
@@ -235,11 +236,11 @@ class MlxEmbedder:
 
 
 def embedder_needs_warmup(embedder: Any) -> bool:
-    """Whether a background warm-up embed is worth running for ``embedder``.
+    """Whether a warm-up embed is worth running for ``embedder``.
 
     The deterministic test/office embedder has nothing to load, and an adapter
-    that reports itself loaded is already warm; only a lazy real model
-    benefits from paying the load cost off the run's critical path.
+    that reports itself loaded is already warm; only a lazy real model needs
+    the synchronous load at capability assembly.
     """
 
     if isinstance(embedder, HashEmbedder):
@@ -268,33 +269,26 @@ def warmup_embedder(
     *,
     text: str = WARMUP_TEXT,
     observers: SelectionErrorObservers | None = None,
-) -> threading.Thread | None:
-    """Run one trivial embed on a daemon thread (fail-open, fire-and-forget).
+) -> None:
+    """Run one trivial embed synchronously during capability assembly.
 
     The MLX stack loads its model on the first ``embed()``; doing that at
-    capability mount keeps the load off the first recall/selection of the run.
-    A failure is recorded on the supplied mount-scoped observer registry (when
-    one is given) and never reaches the caller.
+    capability mount ensures that the main thread owns the cold import before
+    the run starts.  A failure is recorded on the supplied mount-scoped
+    observer registry (when one is given) and never reaches the caller.
     """
 
     if not callable(embedder_factory):
-        return None
+        return
 
-    def run() -> None:
-        try:
-            embedder = embedder_factory()
-            if embedder is None or not embedder_needs_warmup(embedder):
-                return
-            embedder.embed([text])
-        except Exception as exc:  # noqa: BLE001 - warm-up is fail-open
-            if observers is not None:
-                observers.notify("embedder", exc)
-
-    thread = threading.Thread(
-        target=run, name="recall-embedder-warmup", daemon=True
-    )
-    thread.start()
-    return thread
+    try:
+        embedder = embedder_factory()
+        if embedder is None or not embedder_needs_warmup(embedder):
+            return
+        embedder.embed([text])
+    except Exception as exc:  # noqa: BLE001 - warm-up is fail-open
+        if observers is not None:
+            observers.notify("embedder", exc)
 
 
 def read_episode_events(events_path: str | Path) -> list[dict[str, Any]]:
@@ -1956,26 +1950,43 @@ def update_procedure_delivery_suppressed(
     *,
     reason: str,
     lesson_id: str | None = None,
+    kind: str = "card",
     run_id: str | None = None,
 ) -> dict[str, Any]:
     """Count one delivery suppressed by the authoritative lesson re-check.
 
     Observe-only and purely additive: the selection scorecard above stays
-    "what the index selected"; this counter records that a selected card was
-    **not** delivered because the authoritative ``lessons.json`` snapshot no
-    longer backed it (revoked, demoted, missing, version drift, or unreadable).
+    "what the index selected"; this counter records that a selected card or
+    app rule was **not** delivered because the authoritative ``lessons.json``
+    snapshot no longer backed it (revoked, demoted, missing, version drift, or
+    unreadable).  ``kind`` distinguishes ``card`` from ``rule`` suppression.
     """
+
+    if kind not in {"card", "rule"}:
+        raise ValueError(f"kind must be 'card' or 'rule', got {kind!r}")
 
     def accumulate(current: dict[str, Any]) -> dict[str, Any]:
         updated = dict(current)
-        updated["procedure_suppressed"] = (
-            int(current.get("procedure_suppressed", 0)) + 1
-        )
-        updated["latest_procedure_suppressed"] = {
-            "run_id": run_id,
-            "lesson_id": lesson_id,
-            "reason": str(reason),
-        }
+        if kind == "card":
+            updated["procedure_suppressed"] = (
+                int(current.get("procedure_suppressed", 0)) + 1
+            )
+            updated["latest_procedure_suppressed"] = {
+                "run_id": run_id,
+                "lesson_id": lesson_id,
+                "reason": str(reason),
+                "kind": kind,
+            }
+        else:
+            updated["rule_suppressed"] = (
+                int(current.get("rule_suppressed", 0)) + 1
+            )
+            updated["latest_rule_suppressed"] = {
+                "run_id": run_id,
+                "lesson_id": lesson_id,
+                "reason": str(reason),
+                "kind": kind,
+            }
         return updated
 
     return _accumulate_stats(stats_path, accumulate)

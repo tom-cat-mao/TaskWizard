@@ -106,8 +106,11 @@ docs/
 .codex/
 examples/
 resources/
-tests/
 bench/
+
+# Synthetic test sources are tracked; private/local grounding benches are not.
+tests/bench/
+tests/test_grounding_bench_*.py
 
 # MkDocs build output
 site/

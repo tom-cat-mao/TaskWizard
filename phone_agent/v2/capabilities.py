@@ -60,7 +60,7 @@ _RUN_HOOK_ORDER = {
 
 @runtime_checkable
 class CapabilityContext(Protocol):
-    """The only five seams through which a capability may affect assembly."""
+    """Public assembly seams plus owner-scoped lifecycle registration."""
 
     def register_middleware(self, middleware: Any) -> None: ...
 
@@ -73,6 +73,12 @@ class CapabilityContext(Protocol):
     def add_cli_command(self, name: str, handler: CliHandler) -> None: ...
 
     def register_service(self, name: str, value: Any) -> None: ...
+
+    def on(
+        self, event: str, listener: Callable[..., Any], *, prepend: bool = False
+    ) -> Callable[[], None]: ...
+
+    def on_dispose(self, disposer: Callable[[], None]) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -223,6 +229,7 @@ class CapabilityAssemblyContext:
         # tracked by owner so release removes them with zero residue and a
         # second mounted owner registering the same key fails visibly.
         self._service_owners: dict[str, str] = {}
+        self._disposers: dict[str, list[Callable[[], None]]] = {}
 
     @property
     def current_cap_id(self) -> str | None:
@@ -336,6 +343,28 @@ class CapabilityAssemblyContext:
         self._services[clean] = value
         self._service_owners[clean] = owner
 
+    def on(
+        self, event: str, listener: Callable[..., Any], *, prepend: bool = False
+    ) -> Callable[[], None]:
+        """Subscribe on the harness event bus under the current owner."""
+
+        self._owner()
+        bus = self.service("event_bus")
+        subscribe = getattr(bus, "on", None)
+        if not callable(subscribe):
+            raise RuntimeError("event_bus service is unavailable")
+        disposer = subscribe(event, listener, prepend=prepend)
+        self.on_dispose(disposer)
+        return disposer
+
+    def on_dispose(self, disposer: Callable[[], None]) -> None:
+        """Register one cleanup callback under the current capability."""
+
+        if not callable(disposer):
+            raise TypeError("capability disposer must be callable")
+        owner = self._owner()
+        self._disposers.setdefault(owner, []).append(disposer)
+
     # Core harness products use the same ordered collections, but cannot be
     # released by a capability because their owner is outside the cap_id space.
     def register_core_middleware(
@@ -427,6 +456,15 @@ class CapabilityAssemblyContext:
     def release_capability(self, cap_id: str) -> None:
         """Remove every registration owned by ``cap_id`` from all seams."""
 
+        disposers = self._disposers.pop(cap_id, [])
+        disposer_error: Exception | None = None
+        for disposer in reversed(disposers):
+            try:
+                disposer()
+            except Exception as exc:  # noqa: BLE001 - finish remaining cleanup
+                if disposer_error is None:
+                    disposer_error = exc
+
         self._middleware = [item for item in self._middleware if item.owner != cap_id]
         self._tools = [item for item in self._tools if item.owner != cap_id]
         self._prompt_blocks = [
@@ -447,6 +485,8 @@ class CapabilityAssemblyContext:
             self._service_owners.pop(name, None)
             self._services.pop(name, None)
         self._mounted.pop(cap_id, None)
+        if disposer_error is not None:
+            raise disposer_error
 
 
 def _register_factory(
@@ -516,11 +556,10 @@ def _register_cli(ctx: CapabilityAssemblyContext, names: Sequence[str]) -> None:
 def _apply_providers(ctx: CapabilityAssemblyContext) -> None:
     """Mount the S4 provider registry as the ``provider_registry`` service.
 
-    Reuses the registry the harness already built for the actor model (the
-    ``_provider_registry`` side channel on config) when present; otherwise
-    assembles one from config.  Fail-open: an unusable models.json leaves the
-    service unmounted and every role build degrades to the legacy
-    single-gateway path.  Plugins register extra providers through
+    Reuses the registry the harness bootstrap assembled before the actor model
+    (the ``_provider_registry`` side channel on config) when present; otherwise
+    assembles one from config. Invalid explicit models files fail visibly.
+    Plugins register extra providers through
     :func:`phone_agent.v2.providers.register_provider` on this service, and
     custom transports (api -> builder mappings) through
     :func:`phone_agent.v2.providers.register_api_builder` — both callable
@@ -531,12 +570,9 @@ def _apply_providers(ctx: CapabilityAssemblyContext) -> None:
     config = ctx.service("config")
     registry = getattr(config, "_provider_registry", None)
     if registry is None:
-        try:
-            from phone_agent.v2.providers import build_provider_registry
+        from phone_agent.v2.providers import build_provider_registry
 
-            registry = build_provider_registry(config)
-        except Exception:  # noqa: BLE001 - provider layer must never crash assembly
-            registry = None
+        registry = build_provider_registry(config)
     if registry is not None:
         # Leave the same handle on config so auxiliary role builds (compact,
         # verify, safety reviewer, distill) resolve providers without reaching
@@ -561,8 +597,7 @@ def _apply_taskdoc(ctx: CapabilityAssemblyContext) -> None:
             lang=getattr(config, "lang", "cn"),
             nudge_steps=getattr(config, "taskdoc_nudge_steps", 5),
         )
-        disposer = bus.on(MODEL_PRE_REQUEST, injector)
-        ctx.register_service("taskdoc_event_disposer", disposer)
+        ctx.on(MODEL_PRE_REQUEST, injector)
     _register_factory(ctx, "taskdoc_tool_factory", "register_tool")
     _register_service_hook(ctx, "start", "taskdoc_run_start")
 
@@ -573,23 +608,16 @@ def _apply_safety(ctx: CapabilityAssemblyContext) -> None:
         return
     from phone_agent.v2.middleware.safety import (
         build_capability_safety_listener,
-        register_default_safety_listener,
     )
 
     session = ctx.service("session")
     config = ctx.service("config")
     mode = getattr(config, "safety_mode", "wary")
-    if mode in {"wary", "reviewer"}:
-        pair = register_default_safety_listener(bus, session, config)
-        if pair is not None:
-            listener, disposer = pair
-            ctx.set_service("_safety_warning_listener", listener)
-            ctx.set_service("_safety_event_disposer", disposer)
-    elif mode == "hard":
-        listener = build_capability_safety_listener(session, config)
-        if listener is not None:
-            disposer = bus.on(TOOL_EXECUTE, listener)
-            ctx.set_service("_safety_event_disposer", disposer)
+    listener = build_capability_safety_listener(session, config)
+    if listener is not None:
+        ctx.on(TOOL_EXECUTE, listener)
+        if mode in {"wary", "reviewer"}:
+            ctx.register_service("safety_warning_listener", listener)
 
 
 def _apply_budget(ctx: CapabilityAssemblyContext) -> None:
@@ -600,13 +628,10 @@ def _apply_budget(ctx: CapabilityAssemblyContext) -> None:
     budget = factory()
     if budget is None:
         return
-    disposers = [
-        bus.on(MODEL_PRE_REQUEST, budget.on_pre_request),
-        bus.on(MODEL_REQUEST, budget.on_model_request),
-        bus.on(MODEL_POST_REQUEST, budget.on_post_request),
-    ]
+    ctx.on(MODEL_PRE_REQUEST, budget.on_pre_request)
+    ctx.on(MODEL_REQUEST, budget.on_model_request)
+    ctx.on(MODEL_POST_REQUEST, budget.on_post_request)
     ctx.register_service("budget_instance", budget)
-    ctx.register_service("budget_event_disposers", disposers)
 
 
 def _apply_compact(ctx: CapabilityAssemblyContext) -> None:
@@ -623,9 +648,8 @@ def _apply_compact(ctx: CapabilityAssemblyContext) -> None:
         return
     # Compact must run before other model/pre_request listeners (taskdoc, budget,
     # model_limit) so the coarse fold and image pruning happen at the old slot.
-    disposer = bus.on(MODEL_PRE_REQUEST, compact.on_pre_request, prepend=True)
+    ctx.on(MODEL_PRE_REQUEST, compact.on_pre_request, prepend=True)
     ctx.register_service("compact_instance", compact)
-    ctx.register_service("compact_pre_request_disposer", disposer)
 
 
 def _apply_finish_verify(ctx: CapabilityAssemblyContext) -> None:
@@ -705,7 +729,12 @@ def _install_recall_selection_observer(
 
 
 def _warmup_recall_embedder(ctx: CapabilityAssemblyContext, observers: Any) -> None:
-    """Load the shared embedder off the run path (``on``/``shadow`` only)."""
+    """Warm the shared embedder during assembly (``on``/``shadow`` only).
+
+    This deliberately pays the cold-import cost on the main thread before the
+    run loop starts, so no background thread can import the shared native MLX
+    stack concurrently with run-start recall.
+    """
 
     from phone_agent.v2.recall import resolve_embedder_factory, warmup_embedder
 
@@ -751,18 +780,15 @@ def _apply_recall(ctx: CapabilityAssemblyContext) -> None:
             injector.selection_error_observers = observers
         except Exception:  # noqa: BLE001 - assembly must never fail here
             pass
-    disposers: list[Callable[[], None]] = [
-        _install_recall_selection_observer(ctx, observers)
-    ]
+    ctx.on_dispose(_install_recall_selection_observer(ctx, observers))
     bus = ctx.service("event_bus")
     if bus is not None and injector is not None:
         from phone_agent.v2.events import APP_LAUNCHED
 
-        disposers.append(bus.on(APP_LAUNCHED, injector.on_app_launched))
-        disposers.append(bus.on(MODEL_PRE_REQUEST, injector.on_pre_request))
-    ctx.register_service("recall_event_disposers", disposers)
-    # Warm the shared embedder on a daemon thread so the model load is not
-    # charged to the first recall/selection of the run (fail-open).
+        ctx.on(APP_LAUNCHED, injector.on_app_launched)
+        ctx.on(MODEL_PRE_REQUEST, injector.on_pre_request)
+    # Warm the shared embedder before the run loop (fail-open).  The synchronous
+    # call ensures native dependencies are imported by the main thread only.
     _warmup_recall_embedder(ctx, observers)
     _register_cli(
         ctx,
@@ -789,26 +815,6 @@ def _owned_apply(cap_id: str, hook: CapabilityHook) -> CapabilityHook:
 
 def _owned_release(cap_id: str) -> CapabilityHook:
     def release(ctx: CapabilityAssemblyContext) -> None:
-        if cap_id == "safety":
-            disposer = ctx.service("_safety_event_disposer")
-            if callable(disposer):
-                disposer()
-            ctx.set_service("_safety_event_disposer", None)
-            ctx.set_service("_safety_warning_listener", None)
-        if cap_id == "taskdoc":
-            disposer = ctx.service("taskdoc_event_disposer")
-            if callable(disposer):
-                disposer()
-                ctx.set_service("taskdoc_event_disposer", None)
-        # Dispose any model-domain event listeners registered by the capability.
-        disposer = ctx.service(f"{cap_id}_pre_request_disposer")
-        if callable(disposer):
-            disposer()
-            ctx.set_service(f"{cap_id}_pre_request_disposer", None)
-        for d in ctx.service(f"{cap_id}_event_disposers") or ():
-            if callable(d):
-                d()
-        ctx.set_service(f"{cap_id}_event_disposers", None)
         ctx.release_capability(cap_id)
 
     return release
@@ -835,10 +841,27 @@ def assemble_capabilities(
         for cap_id, row in rows.items()
         if row["state"] in {"active", "shadow"}
     }
+    ordered_specs: list[CapabilitySpec] = []
+    pending = list(registry.specs())
+    ordered_ids: set[str] = set()
+    while pending:
+        ready = [
+            spec
+            for spec in pending
+            if all(dep not in desired or dep in ordered_ids for dep in spec.deps)
+        ]
+        if not ready:
+            ordered_specs.extend(pending)
+            break
+        for spec in ready:
+            ordered_specs.append(spec)
+            ordered_ids.add(spec.cap_id)
+            pending.remove(spec)
     ctx._capability_order = {
-        spec.cap_id: index for index, spec in enumerate(registry.specs())
+        spec.cap_id: index for index, spec in enumerate(ordered_specs)
     }
 
+    release_error: Exception | None = None
     for cap_id, (old_mode, old_spec) in reversed(tuple(ctx._mounted.items())):
         next_item = desired.get(cap_id)
         if next_item is not None and next_item[0] == old_mode:
@@ -847,12 +870,21 @@ def assemble_capabilities(
             with ctx.applying(cap_id):
                 if old_spec.release is not None:
                     old_spec.release(ctx)
+        except Exception as exc:
+            if release_error is None:
+                release_error = exc
         finally:
-            # Enforce zero residue even if a custom release hook is incomplete.
-            ctx.release_capability(cap_id)
+            try:
+                ctx.release_capability(cap_id)
+            except Exception as exc:
+                if release_error is None:
+                    release_error = exc
             ctx._mounted.pop(cap_id, None)
 
-    for spec in registry.specs():
+    if release_error is not None:
+        raise release_error
+
+    for spec in ordered_specs:
         item = desired.get(spec.cap_id)
         if item is None or spec.cap_id in ctx._mounted:
             continue
@@ -871,7 +903,10 @@ def assemble_capabilities(
                         f"{active_spec.provides!r} but registered no such service"
                     )
         except Exception:
-            ctx.release_capability(spec.cap_id)
+            try:
+                ctx.release_capability(spec.cap_id)
+            except Exception:
+                pass
             raise
         ctx._mounted[spec.cap_id] = (mode, active_spec)
     return ctx
