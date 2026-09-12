@@ -14,7 +14,7 @@ from phone_agent.v2.middleware._tokens import estimate_context_tokens, estimate_
 from phone_agent.v2.middleware.compact import CompactMiddleware, _has_native_content, build_compact_middleware
 from phone_agent.v2.middleware.context_admission import check_context_admission
 from phone_agent.v2.middleware.images import ContextPrunerService, NativeContextPruningError, _message_has_image
-from phone_agent.v2.providers.context import ModelContextProfile, ModelInputEstimate, bind_context_support
+from phone_agent.v2.providers.context import ModelContextProfile, ModelInputEstimate, bind_context_support, get_context_support
 from phone_agent.v2.usage import UsageLedger
 
 
@@ -361,9 +361,36 @@ def test_responses_sdk_function_id_bookkeeping_does_not_pin_tool_history():
         assert message.additional_kwargs["__openai_function_call_ids__"] == {
             call["id"]: f"fc-{call['id']}"
         }
-        message.additional_kwargs["ordinary_metadata"] = {"request_id": "synthetic"}
         assert not _has_native_content(message)
     assert folded(compact.before_model({"messages": messages}, None))
+
+
+@pytest.mark.parametrize("message_index", [2, 3])
+@pytest.mark.parametrize("extra_key", ["vendor_native_state", "ordinary_metadata"])
+def test_unknown_provider_continuation_is_counted_and_protected_without_adapter(
+    message_index, extra_key
+):
+    model = Model()
+    assert get_context_support(model) is None
+    compact = CompactMiddleware(
+        SimpleNamespace(task_doc=None, run_goal="original goal"),
+        SimpleNamespace(context_window=100_000, model_name="custom-no-context", memory_model=None),
+        model=model, work_target=32_000, schema_reserve=0, output_reserve=500,
+    )
+    messages = history()
+    native = messages[message_index]
+    native.additional_kwargs[extra_key] = {
+        "opaque": "SYNTHETIC_PROVIDER_STATE_" + "x" * 8000,
+    }
+    original = deepcopy(native)
+    bare = deepcopy(native)
+    bare.additional_kwargs.clear()
+    assert _has_native_content(native)
+    assert estimate_message_tokens(native) > estimate_message_tokens(bare)
+    out = compact.on_pre_request(messages, lambda value: value)
+    assert native in out and native == original
+    assert messages[2] in out and messages[3] in out  # entire call/result unit
+    assert model.requests == []
 
 
 def test_native_metadata_on_raw_call_envelope_is_not_lost_with_duplicate_call_filter():

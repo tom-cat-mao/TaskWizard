@@ -52,6 +52,7 @@ from langchain_core.messages import (
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from phone_agent.v2.middleware._tokens import (
+    CONTEXT_DUPLICATE_EXTRA_KEYS,
     estimate_context_tokens,
     estimate_message_tokens,
     has_native_metadata,
@@ -288,8 +289,7 @@ def _has_native_content(message: Any) -> bool:
                 return True
     extra = getattr(message, "additional_kwargs", None) or {}
     return has_native_metadata(extra) or any(
-        extra.get(key)
-        for key in ("reasoning_content", "reasoning", "thinking", "redacted_thinking", "tool_outputs")
+        value for key, value in extra.items() if key not in CONTEXT_DUPLICATE_EXTRA_KEYS
     )
 
 

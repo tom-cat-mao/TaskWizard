@@ -65,6 +65,8 @@ cp .env.example .env
 | 插件系统 | 策略层全事件化；插件经 entry points 或 `plugin add` 挂入同一装配层 | [插件开发](https://tom-cat-mao.github.io/TaskWizard/plugins/) |
 | 本地控制台 | 固定顶栏 + 设备栏 + 任务工作区（步骤/任务板/应用库/记忆/产出页签，人工确认置顶）；runner 子进程执行、可重连回放；可选模型流式增量面板 | [Web 控制台](https://tom-cat-mao.github.io/TaskWizard/console/) |
 
+自定义模型尚未声明上下文能力时，压缩仍保留无法识别的 Provider 续接信息；只有明确的重复调用表示或 SDK 记账字段可以忽略。
+
 ## 文档
 
 - **完整文档站：<https://tom-cat-mao.github.io/TaskWizard/>**（源文件在 [`pages/`](pages/)）

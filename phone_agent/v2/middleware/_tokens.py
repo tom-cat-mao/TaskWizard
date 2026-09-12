@@ -30,6 +30,10 @@ from phone_agent.v2.native_content import (
     native_metadata,
 )
 
+# Only these extra fields duplicate already represented calls or known SDK
+# bookkeeping. Unknown provider payloads remain counted and protected.
+CONTEXT_DUPLICATE_EXTRA_KEYS = frozenset({"tool_calls", "function_call"}) | CONTEXT_BOOKKEEPING_KEYS
+
 # Flat per-image token cost. A phone screenshot at gateway tiling lands in the
 # ~1-2k token range; 1500 is a middle estimate (design: "len//4 + 图1500").
 IMAGE_TOKEN_COST = 1500
@@ -176,7 +180,7 @@ def estimate_message_tokens(message: Any) -> int:
             total += _serialized_tokens(metadata)
         native = {
             key: value for key, value in extras.items()
-            if key not in {"tool_calls", "function_call", *CONTEXT_BOOKKEEPING_KEYS} and value
+            if key not in CONTEXT_DUPLICATE_EXTRA_KEYS and value
         }
         if native:
             total += max(1, estimate_text_tokens(json.dumps(
@@ -214,6 +218,7 @@ def usage_tokens(message: Any) -> int | None:
 
 __all__ = [
     "IMAGE_TOKEN_COST",
+    "CONTEXT_DUPLICATE_EXTRA_KEYS",
     "estimate_text_tokens",
     "estimate_message_tokens",
     "estimate_context_tokens",
