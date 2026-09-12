@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -9,9 +11,9 @@ from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, Syst
 
 from phone_agent.v2.config import V2Config
 from phone_agent.v2.middleware._tokens import estimate_context_tokens, estimate_message_tokens
-from phone_agent.v2.middleware.compact import CompactMiddleware, build_compact_middleware
+from phone_agent.v2.middleware.compact import CompactMiddleware, _has_native_content, build_compact_middleware
 from phone_agent.v2.middleware.context_admission import check_context_admission
-from phone_agent.v2.middleware.images import ContextPrunerService, _message_has_image
+from phone_agent.v2.middleware.images import ContextPrunerService, NativeContextPruningError, _message_has_image
 from phone_agent.v2.providers.context import ModelContextProfile, ModelInputEstimate, bind_context_support
 from phone_agent.v2.usage import UsageLedger
 
@@ -306,3 +308,143 @@ def test_work_config_validation_and_override(monkeypatch):
     monkeypatch.setenv("PHONE_AGENT_COMPACT_TARGET_RATIO", "1")
     with pytest.raises(ValueError, match="COMPACT_TARGET_RATIO"):
         V2Config.from_env()
+
+
+@pytest.mark.parametrize("key", ["signature", "thought_signature", "encrypted_content"])
+@pytest.mark.parametrize("location", ["top", "extras", "nested"])
+@pytest.mark.parametrize("block_type", ["text", "image"])
+@pytest.mark.parametrize("message_index", [2, 3])  # AI or its ToolMessage
+def test_standard_blocks_retain_nested_native_state_and_count_it(
+    key, location, block_type, message_index
+):
+    compact = middleware()
+    messages = history()
+    signed = messages[message_index]
+    block = (
+        {"type": "text", "text": "visible text"}
+        if block_type == "text" else
+        {"type": "image", "source_type": "base64", "data": "SYNTHETIC", "mime_type": "image/png"}
+    )
+    metadata = {key: "SYNTHETIC_NATIVE_" + "x" * 8000}
+    if location == "top":
+        block.update(metadata)
+    elif location == "extras":
+        block["extras"] = metadata
+    else:
+        block["extras"] = {"provider": [{"state": metadata}]}
+    signed.content = [block]
+    bare = deepcopy(signed)
+    bare.content[0].pop(key if location == "top" else "extras")
+    assert _has_native_content(signed)
+    assert estimate_message_tokens(signed) > estimate_message_tokens(bare)
+    original = deepcopy(signed)
+    out = compact.on_pre_request(messages, lambda value: value)
+    assert signed in out and signed == original
+    assert compact._main_model.requests == []
+
+
+def test_responses_sdk_function_id_bookkeeping_does_not_pin_tool_history():
+    from langchain_openai.chat_models._compat import _convert_to_v03_ai_message
+
+    compact = middleware()
+    messages = history()
+    for message in messages:
+        if not isinstance(message, AIMessage):
+            continue
+        call = message.tool_calls[0]
+        message.content = [{
+            "type": "function_call", "call_id": call["id"],
+            "id": f"fc-{call['id']}", "name": call["name"],
+            "arguments": json.dumps(call["args"]),
+        }]
+        _convert_to_v03_ai_message(message)
+        assert message.additional_kwargs["__openai_function_call_ids__"] == {
+            call["id"]: f"fc-{call['id']}"
+        }
+        message.additional_kwargs["ordinary_metadata"] = {"request_id": "synthetic"}
+        assert not _has_native_content(message)
+    assert folded(compact.before_model({"messages": messages}, None))
+
+
+def test_native_metadata_on_raw_call_envelope_is_not_lost_with_duplicate_call_filter():
+    signed = AIMessage(content="", additional_kwargs={"function_call": {
+        "name": "tap", "arguments": "{}", "extras": {"signature": "native" * 1000},
+    }})
+    bare = deepcopy(signed)
+    bare.additional_kwargs["function_call"].pop("extras")
+    assert _has_native_content(signed)
+    assert estimate_message_tokens(signed) > estimate_message_tokens(bare)
+
+
+@pytest.mark.parametrize("signed_block", ["image", "marks"])
+def test_signed_expiring_observation_fails_before_any_micro_mutation(signed_block):
+    messages = history(pairs=4, images=True)
+    # The first expiring observation is ordinary; the second contains a
+    # conflict. A one-pass mutator would already have changed the first one.
+    block = messages[5].content[-1 if signed_block == "image" else -2]
+    block["extras"] = {"provider": {"signature": "native-replay-state"}}
+    original = deepcopy(messages)
+    with pytest.raises(NativeContextPruningError, match="native_context_pruning_conflict"):
+        ContextPrunerService(2, 2).prune(messages)
+    assert messages == original
+
+
+def test_signed_other_text_does_not_prevent_unsigned_image_and_marks_pruning():
+    messages = history(pairs=3, images=True)
+    signed_text = {"type": "text", "text": "native reply", "extras": {"signature": "signed"}}
+    messages[3].content.insert(0, signed_text)
+    ContextPrunerService(2, 2).prune(messages)
+    assert signed_text in messages[3].content
+    assert not _message_has_image(messages[3])
+    assert sum(_message_has_image(message) for message in messages) == 2
+    assert _has_native_content(messages[3])
+
+
+@pytest.mark.parametrize("keep", [1, 2])
+def test_latest_k_signed_images_are_retained_verbatim(keep):
+    messages = history(pairs=4, images=True)
+    messages[-1].content[-1]["extras"] = {"thought_signature": "last-frame-state"}
+    expected = [deepcopy(m.content) for m in messages if _message_has_image(m)][-keep:]
+    ContextPrunerService(keep, keep).prune(messages)
+    assert [m.content for m in messages if _message_has_image(m)] == expected
+
+
+@pytest.mark.parametrize("work_target", [0, 32_000])
+def test_soft_target_cannot_veto_capacity_rescue_with_large_latest_html(work_target):
+    compact = middleware()
+    compact.work_target = work_target
+    messages = history(pairs=48, size=3000)
+    html = "<html>" + "x" * 100_000 + "</html>"
+    messages[-2].tool_calls[0]["args"]["html"] = html
+    newest = messages[-2:]
+    before = check_context_admission(compact._main_model, messages, schema_reserve=0, output_reserve=500)
+    assert not before.allowed
+    out = compact.on_pre_request(messages, lambda value: value)
+    after = check_context_admission(compact._main_model, out, schema_reserve=0, output_reserve=500)
+    assert after.allowed and after.input_tokens < before.input_tokens
+    assert all(message in out for message in newest)
+    assert newest[0].tool_calls[0]["args"]["html"] == html
+    assert compact.last_result["status"] == "completed"
+    assert compact.last_result["capacity_repair"]
+    if work_target:
+        assert compact.last_result["soft_target_unattainable"]
+        assert compact.last_result["reason"] == "soft_target_unattainable"
+
+
+@pytest.mark.parametrize("work_target", [0, 32_000])
+def test_protected_live_groups_may_exceed_physical_low_water_but_still_fit_capacity(work_target):
+    compact = middleware(pruner=ContextPrunerService(2, 2), min_reduction_tokens=200_000)
+    compact.work_target = work_target
+    messages = history(pairs=20, size=2000, images=True)
+    for index in (-4, -2):
+        # Each HTML body is below the actual deliverable's 256KiB bound.
+        messages[index].tool_calls[0]["args"]["html"] = "x" * 144_000
+    protected = messages[-4:]
+    original = deepcopy(protected)
+    assert estimate_context_tokens(protected) > compact.window * compact.warn_ratio
+    out = compact.on_pre_request(messages, lambda value: value)
+    assert check_context_admission(compact._main_model, out, schema_reserve=0, output_reserve=500).allowed
+    assert protected == original and all(message in out for message in protected)
+    assert sum(_message_has_image(message) for message in out) == 2
+    assert compact.last_result["status"] == "completed"
+    assert compact.last_result["capacity_repair"]

@@ -30,8 +30,14 @@ from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
 
+from phone_agent.v2.middleware._tokens import has_native_metadata
+
 _OBS_PREFIX = "[OBS] "
 _MARKS_MARKER = "\nmarks ("
+
+
+class NativeContextPruningError(ValueError):
+    """K-observation hygiene cannot safely rewrite a signed/native block."""
 
 
 def _is_image_block(block: Any) -> bool:
@@ -188,6 +194,22 @@ class ContextPrunerService:
         identity in a reducer-style update.
         """
 
+        # Validate every block we would rewrite before mutating any message.
+        # A signature cannot be silently dropped, moved to a placeholder, or
+        # used as a reason to retain extra old images beyond K.
+        for predicate, block_predicate, keep in (
+            (_message_has_image, _is_image_block, self.keep_images),
+            (_message_has_obs_marks, _is_obs_marks_block, self.keep_marks),
+        ):
+            bearers = [message for message in messages if predicate(message)]
+            for message in bearers[:-keep]:
+                for block in message.content:
+                    if block_predicate(block) and has_native_metadata(block):
+                        raise NativeContextPruningError(
+                            "native_context_pruning_conflict: an expiring observation "
+                            "block carries replay metadata; no safe projection is available"
+                        )
+
         modified: list[Any] = []
         modified.extend(self._prune_images(messages))
         modified.extend(self._fold_old_marks(messages))
@@ -259,6 +281,7 @@ def build_image_middleware() -> ImagePruningMiddleware:
 
 __all__ = [
     "ContextPrunerService",
+    "NativeContextPruningError",
     "ContextPruningMiddleware",
     "build_context_pruning_middleware",
     "ImagePruningMiddleware",

@@ -54,6 +54,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from phone_agent.v2.middleware._tokens import (
     estimate_context_tokens,
     estimate_message_tokens,
+    has_native_metadata,
 )
 from phone_agent.v2.middleware.images import ContextPrunerService
 from phone_agent.v2.middleware.context_admission import check_context_admission
@@ -279,15 +280,17 @@ def _has_native_content(message: Any) -> bool:
     """Unknown/opaque protocol blocks are never interpreted as ordinary text."""
 
     content = getattr(message, "content", None)
+    if has_native_metadata(content):
+        return True
     if isinstance(content, list):
         for block in content:
-            if isinstance(block, dict) and (
-                block.get("type") not in {"text", "image", "image_url"}
-                or any(key in block for key in ("signature", "thought_signature", "encrypted_content"))
-            ):
+            if isinstance(block, dict) and block.get("type") not in {"text", "image", "image_url"}:
                 return True
     extra = getattr(message, "additional_kwargs", None) or {}
-    return any(value for key, value in extra.items() if key not in {"tool_calls", "function_call"})
+    return has_native_metadata(extra) or any(
+        extra.get(key)
+        for key in ("reasoning_content", "reasoning", "thinking", "redacted_thinking", "tool_outputs")
+    )
 
 
 class CompactMiddleware(AgentMiddleware):
@@ -510,25 +513,50 @@ class CompactMiddleware(AgentMiddleware):
         self._summary_invokes = 0
         head, pinned, conversation, prior_summary = self._partition(messages)
         fixed = self._measure([*head, *pinned, SystemMessage(content=self._fresh_obs_text())])
-        physical_target = max(0, int((before.context_window or self.window) * self.warn_ratio) - before.output_reserve)
-        target = min(int(self.work_target * self.target_ratio), physical_target) if self.work_target else physical_target
-        tail_budget = max(0, target - fixed.input_tokens - self.summary_tokens)
-        if not self.work_target:
-            tail_budget = min(tail_budget, int(self.window * self.keep_ratio))
-        cut = self._choose_cut(conversation, budget=tail_budget)
+        window = before.context_window or self.window
+        hard_risk = before.required_tokens >= window * self.trigger_ratio
+        input_capacity = max(0, window - before.output_reserve)
+        physical_target = max(0, int(window * self.warn_ratio) - before.output_reserve)
+        soft_target = int(self.work_target * self.target_ratio)
+        target = min(soft_target, physical_target) if self.work_target else physical_target
+
+        def plan_tail(input_target: int, *, physical: bool = False):
+            tail_budget = max(0, input_target - fixed.input_tokens - self.summary_tokens)
+            if physical or not self.work_target:
+                tail_budget = min(tail_budget, int(window * self.keep_ratio))
+            cut = self._choose_cut(conversation, budget=tail_budget)
+            protected = self._measure([
+                *head, *conversation[cut:], *pinned,
+                SystemMessage(content=self._fresh_obs_text()),
+            ])
+            return cut, protected
+
+        cut, protected = plan_tail(target)
+        if target <= protected.input_tokens and hard_risk and protected.allowed:
+            # A soft low-water mark must not veto a legal capacity repair. The
+            # physical low-water mark is also a target: a large mandatory tail
+            # may need more space while still fitting the actual input limit.
+            target = min(
+                input_capacity,
+                max(physical_target, protected.input_tokens + self.summary_tokens),
+            )
+            cut, protected = plan_tail(target, physical=True)
         ancient = conversation[:cut]
         tail = conversation[cut:]
         if len(ancient) < self.min_fold_messages:
             self._record("skipped", "protected_or_recent_context", before_tokens=before.input_tokens)
             return None  # too little to fold -> skip (avoid a pointless LLM call)
 
-        protected = self._measure([*head, *tail, *pinned, SystemMessage(content=self._fresh_obs_text())])
         if not protected.allowed:
             self._record("skipped", "protected_context_exceeds_capacity", before_tokens=before.input_tokens)
             return None
         summary_limit = min(self.summary_tokens, max(0, target - protected.input_tokens))
         if summary_limit <= 0:
-            self._record("skipped", "protected_context_exceeds_work_target", before_tokens=before.input_tokens)
+            reason = (
+                "protected_context_leaves_no_summary_capacity"
+                if hard_risk else "protected_context_exceeds_work_target"
+            )
+            self._record("skipped", reason, before_tokens=before.input_tokens)
             return None
 
         summary_text = self._summarise(ancient, prior_summary, summary_limit)
@@ -553,7 +581,10 @@ class CompactMiddleware(AgentMiddleware):
         after = self._measure(rebuilt)
         reduction = before.input_tokens - after.input_tokens
         minimum = max(self.min_reduction_tokens, int(before.input_tokens * self.min_reduction_ratio))
-        if not after.allowed or after.input_tokens > target or reduction < minimum:
+        repairs_capacity = before.exceeds_capacity and after.allowed and reduction > 0
+        target_met = after.input_tokens <= target or (hard_risk and after.allowed and reduction > 0)
+        useful = reduction >= minimum or repairs_capacity
+        if not after.allowed or not target_met or not useful:
             self._record(
                 "skipped", "summary_not_useful_or_oversize",
                 before_tokens=before.input_tokens, after_tokens=after.input_tokens,
@@ -561,7 +592,13 @@ class CompactMiddleware(AgentMiddleware):
             return None
         self.generation += 1
         self._last_failed_signature = None
-        self._record("completed", "compacted", before_tokens=before.input_tokens, after_tokens=after.input_tokens)
+        soft_unattainable = bool(self.work_target and after.input_tokens > soft_target)
+        self._record(
+            "completed", "soft_target_unattainable" if soft_unattainable else "compacted",
+            before_tokens=before.input_tokens, after_tokens=after.input_tokens,
+            soft_target_unattainable=soft_unattainable,
+            capacity_repair=repairs_capacity,
+        )
         # Legacy reducer delta for the LangChain-middleware path. The
         # ``model/pre_request`` adapter (``on_pre_request``) strips this
         # sentinel head and forwards the full rebuilt list downstream; the
