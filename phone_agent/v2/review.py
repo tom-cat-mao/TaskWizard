@@ -15,6 +15,9 @@ the L0 mirror only.
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
+import hashlib
+import json
 from typing import Any
 
 from phone_agent.v2.tools._obs import format_marks_digest_fallback
@@ -25,6 +28,67 @@ from phone_agent.v2.tools._obs import format_marks_digest_fallback
 # ``...nexuslauncher``, ``com.huawei.android.launcher``) and display names
 # (``Launcher`` / ``桌面``) all trip it.
 _LAUNCHER_TOKENS: tuple[str, ...] = ("launcher", "miui.home", "桌面")
+
+
+def _closed_taskdoc_fingerprint(session: Any) -> str | None:
+    """Bind a completion transaction to real board state, never its flow line."""
+
+    doc = getattr(session, "task_doc", None)
+    try:
+        if doc is not None:
+            if doc.has_open_items() or doc.validate() is not None:
+                return None
+            board = asdict(doc)
+        else:
+            board = None
+        encoded = json.dumps(
+            {"board": board, "goal": getattr(session, "run_goal", "")},
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    except Exception:  # noqa: BLE001 - malformed boards never earn a budget exception
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class FinishReviewTicket:
+    """Harness-only proof of an observed, closed-board pending review.
+
+    This grants no completion authority. The budget may bind one extra actor
+    response to this exact object; the real finish tool still owns every gate.
+    The fingerprint is private in-memory state and is never written to trace.
+    """
+
+    screen_seq: int
+    taskdoc_fingerprint: str
+
+
+def store_finish_review_ticket(session: Any, ticket: FinishReviewTicket | None) -> None:
+    """Keep the optional budget proof without breaking older session doubles."""
+
+    try:
+        session.finish_review_ticket = ticket
+    except Exception:  # noqa: BLE001 - unavailable proof means no budget exception
+        pass
+
+
+def pending_finish_review(session: Any) -> FinishReviewTicket | None:
+    """Return only the current, fresh, valid transaction eligible for continuation."""
+
+    ticket = getattr(session, "finish_review_ticket", None)
+    if not isinstance(ticket, FinishReviewTicket):
+        return None
+    if (
+        getattr(session, "finished", False)
+        or getattr(session, "takeover_reason", None)
+        or not getattr(session, "finish_reviewed", False)
+        or getattr(session, "screen_seq", None) != ticket.screen_seq
+        or getattr(session, "finish_review_seq", None) != ticket.screen_seq
+        or _closed_taskdoc_fingerprint(session) != ticket.taskdoc_fingerprint
+    ):
+        return None
+    return ticket
 
 
 def is_launcher(current_app: str | None) -> bool:
@@ -148,6 +212,9 @@ def build_review_package(session: Any, config: Any) -> str:
     finish attempt and never fabricates an image (fail-closed).
     """
 
+    # A failed refresh must not leave an older successful review eligible for
+    # the one-shot token-boundary continuation (normal finish semantics remain).
+    store_finish_review_ticket(session, None)
     obs: Any = None
     obs_error: Exception | None = None
     try:
@@ -202,7 +269,28 @@ def build_review_package(session: Any, config: Any) -> str:
     lines.append("- update_task_doc：修正路线/补记证据")
     lines.append("- take_over：交人工处理")
 
-    return "\n".join(lines)
+    packet = "\n".join(lines)
+    fingerprint = _closed_taskdoc_fingerprint(session)
+    seq = getattr(obs, "screen_seq", None)
+    if (
+        obs_error is None
+        and obs is not None
+        and getattr(obs, "screenshot_b64", None)
+        and isinstance(seq, int)
+        and seq > 0
+        and seq == getattr(session, "screen_seq", None)
+        and fingerprint is not None
+        and (getattr(config, "finish_verify", "auto") or "auto") != "off"
+    ):
+        store_finish_review_ticket(session, FinishReviewTicket(seq, fingerprint))
+    return packet
 
 
-__all__ = ["build_review_package", "finish_doubts", "is_launcher"]
+__all__ = [
+    "FinishReviewTicket",
+    "build_review_package",
+    "finish_doubts",
+    "is_launcher",
+    "pending_finish_review",
+    "store_finish_review_ticket",
+]

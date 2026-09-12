@@ -92,7 +92,7 @@ provider、无法构建的显式引用不会静默改用其它 gateway；唯显�
 
 | 变量 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `PHONE_AGENT_TOKEN_BUDGET` | int | `1000000` | 单轮 input+output token 总预算，耗尽终止运行 |
+| `PHONE_AGENT_TOKEN_BUDGET` | int | `1000000` | 单轮累计 input+output token 阈值，达到后停止；已发有效 finish 复核包有一次确认续办机会（见下文） |
 | `PHONE_AGENT_TOKEN_WARN_REMAINING` | int | `100000` | 剩余低于该值时向模型注入一次余量提醒 |
 | `PHONE_AGENT_COMPACT` | bool | `true` | auto-compact 总开关 |
 | `PHONE_AGENT_COMPACT_WARN_RATIO` | float | `0.75` | 上下文占窗口比例达到此值时提醒模型收敛 |
@@ -103,6 +103,15 @@ provider、无法构建的显式引用不会静默改用其它 gateway；唯显�
 | `PHONE_AGENT_MEMORY_MODEL` | str | 主模型 | compact 摘要使用的模型 |
 | `PHONE_AGENT_IMAGE_KEEP` | int | `2` | 历史中保留的含图消息数 |
 | `PHONE_AGENT_OBS_MARKS_KEEP` | int | `2` | 历史中保留完整 marks 摘要的观测数 |
+
+Token 预算在模型调用边界检查，已发生的调用与验收用量仍完整累计，因此最终用量可以超过阈值。
+若达到阈值时已有由成功观测产生的 finish 复核包，且屏幕序号、目标与关闭的任务板仍匹配，本 run
+最多再给模型一次真实回复机会，处理该复核包的 `finish(confirm=true)`；不增加 `MAX_STEPS`，不自动完成。
+这份续办额度只覆盖该响应中的一次有效确认，其他工具操作返回 error-status 未执行回执。重复复核、
+确认被拒或人工中断恢复都不会补发额度；`ask_user` / `take_over` 的人工控制与其他停止条件继续生效。
+`FINISH_VERIFY=off` 不使用这份续办额度。独立验收器的拒绝与故障 `skipped` 语义保持原样。
+复核后再次委托执行普通工具时，旧复核立即失效；即使命令可能已派发但回执失败、没有新观测，也不能
+沿用旧复核续办。续办响应中被预算直接拒绝、未委托执行的普通工具不会撤销同响应的合法确认机会。
 
 ## 界面落地（Grounding）
 
