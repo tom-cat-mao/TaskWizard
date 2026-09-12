@@ -70,6 +70,8 @@ cp .env.example .env
 
 自定义模型尚未声明上下文能力时，压缩仍保留无法识别的 Provider 续接信息；只有明确的重复调用表示或 SDK 记账字段可以忽略。
 
+旧自定义 Provider 无需实现新 context 接口；已有模型窗口声明仍用于每次主/备用请求准入，未声明的能力保持未知。
+
 ## 文档
 
 - **完整文档站：<https://tom-cat-mao.github.io/TaskWizard/>**（源文件在 [`pages/`](pages/)）

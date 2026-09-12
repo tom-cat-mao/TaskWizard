@@ -495,7 +495,12 @@ def build_model_from_resolved(
         compat=compat,
         **({STREAMING_KWARG: streaming} if builder_accepts_streaming(builder) else {}),
     )
-    return built
+    # Declaration metadata is available even when an old custom builder omits
+    # all optional context support. Preserve that known limit for final primary
+    # and fallback admission without guessing an unknown serializer's output cap.
+    from phone_agent.v2.providers.context import bind_context_declaration
+
+    return bind_context_declaration(built, model.context_window)
 
 
 def _transport_kwargs(config: "V2Config") -> dict[str, Any]:

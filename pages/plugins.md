@@ -52,6 +52,10 @@ my_plugin = "my_plugin.plugin:CAPABILITY"
 实际 runner 启动后才 import/apply。插件不支持运行中热重载——内建能力同样是静态装配（无文件监视、无运行中
 工具表重建），要变更需重启进程。`ctx.on_dispose(...)` 可注册 release 或失败清理回调，归属当前 capability。
 
+自定义 API builder 即使没有实现 context support，注册表声明的 `ModelSpec.context_window` 也会私有绑定到
+构建结果，供主模型与备用模型最终准入使用。它不替换插件的 estimate/prepare/usage，也不会猜测未知
+serializer 如何处理 `maxTokens`；没有窗口声明时保持 unknown。
+
 ## 事件
 
 观察型监听器 `fn(payload) -> None`；洋葱型 `fn(payload, next) -> result`，先注册者居外，不调 `next()` 即短路，内层短路的结果对外层照常可见。

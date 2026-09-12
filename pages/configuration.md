@@ -140,7 +140,7 @@ provider、无法构建的显式引用不会静默改用其它 gateway；唯显�
 | `PHONE_AGENT_COMPACT_MIN_REDUCTION_RATIO` | float | `0.1` | 普通工作压缩至少释放原输入的比例；不得大于等于 1 |
 | `PHONE_AGENT_COMPACT_SCHEMA_RESERVE` | int | `3000` | T1/T2 比较时为随每轮请求发送的序列化工具 schema 预留的 token 数（估算不可见部分） |
 | `PHONE_AGENT_COMPACT_OUTPUT_RESERVE` | int | `2000` | T1/T2 比较时为下一轮回复预留的 token 数 |
-| `PHONE_AGENT_CONTEXT_WINDOW` | int | 按实际构建的 actor 推断，兜底 `256000` | 手动覆盖上下文窗口大小；显式值优先，未设置时按**实际构建**的 actor 模型（含构建降级后的备用目标）窗口推断 |
+| `PHONE_AGENT_CONTEXT_WINDOW` | int | 按实际构建的 actor 推断，兜底 `256000` | 用于窗口规划；最终请求准入只能收紧已知实际模型的窗口声明，不能放大。未设置时按**实际构建**的 actor（含构建降级目标）推断；旧自定义 Provider 没有新 support 时也保留 ModelSpec 的已知窗口，备用模型按自己的声明检查 |
 | `PHONE_AGENT_MEMORY_MODEL` | str | 主模型 | compact 摘要使用的模型 |
 | `PHONE_AGENT_IMAGE_KEEP` | int | `2` | 历史中保留的含图消息数 |
 | `PHONE_AGENT_OBS_MARKS_KEEP` | int | `2` | 历史中保留完整 marks 摘要的观测数 |

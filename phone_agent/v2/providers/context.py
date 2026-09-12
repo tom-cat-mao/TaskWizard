@@ -14,10 +14,11 @@ server-side continuation, or cache-resource provisioning lives here.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 _SUPPORT_ATTRIBUTE = "_taskwizard_context_support"
+_DECLARED_WINDOW_ATTRIBUTE = "_taskwizard_declared_context_window"
 _CACHE_FIELDS = frozenset({"cache_control", "prompt_cache_breakpoint"})
 _CACHE_PARAMETERS = frozenset(
     {
@@ -154,41 +155,67 @@ def unwrap_model(model: Any) -> tuple[Any, dict[str, Any]]:
     return current, settings
 
 
-def bind_context_support(model: Any, support: Any) -> Any:
-    """Bind a support object privately to the model; return the same model.
-
-    BaseChatModel's normal ``model_copy`` carries this private attribute. Tool
-    bindings are resolved by ``get_context_support``. Nothing is added to public
-    metadata/model_kwargs and no process-global ownership table is required.
-    """
+def _bind_private(model: Any, name: str, value: Any) -> Any:
     base, _ = unwrap_model(model)
     if hasattr(base, "__pydantic_private__"):
         private = dict(getattr(base, "__pydantic_private__", None) or {})
-        private[_SUPPORT_ATTRIBUTE] = support
+        private[name] = value
         object.__setattr__(base, "__pydantic_private__", private)
     else:
-        setattr(base, _SUPPORT_ATTRIBUTE, support)
+        setattr(base, name, value)
+    return model
+
+
+def _private_value(model: Any, name: str) -> Any:
+    base, _ = unwrap_model(model)
+    private = getattr(base, "__pydantic_private__", None)
+    if isinstance(private, dict) and name in private:
+        return private[name]
+    return getattr(base, name, None)
+
+
+def bind_context_support(model: Any, support: Any) -> Any:
+    """Bind optional support without changing model or wire serialization.
+
+    Private state survives model_copy and is unwrapped through tool bindings;
+    it is never placed in public metadata or invocation kwargs.
+    """
+    return _bind_private(model, _SUPPORT_ATTRIBUTE, support)
+
+
+def bind_context_declaration(model: Any, context_window: int | None) -> Any:
+    """Keep a registry-declared window even for a legacy custom API builder.
+
+    This is declaration metadata, not a new support implementation. In
+    particular, it does not infer the serializer's output cap from maxTokens.
+    """
+    if context_window is not None:
+        if isinstance(context_window, bool) or not isinstance(context_window, int) or context_window <= 0:
+            raise ValueError("declared context window must be a positive integer")
+        _bind_private(model, _DECLARED_WINDOW_ATTRIBUTE, context_window)
     return model
 
 
 def get_context_support(model: Any) -> Any | None:
-    base, _ = unwrap_model(model)
-    private = getattr(base, "__pydantic_private__", None)
-    if isinstance(private, dict) and _SUPPORT_ATTRIBUTE in private:
-        return private[_SUPPORT_ATTRIBUTE]
-    return getattr(base, _SUPPORT_ATTRIBUTE, None)
+    return _private_value(model, _SUPPORT_ATTRIBUTE)
 
 
 def model_context_profile(model: Any, tools: Any = ()) -> ModelContextProfile:
+    profile = ModelContextProfile()
     method = getattr(get_context_support(model), "profile", None)
     if callable(method):
         try:
             result = method(model, tools=tools)
             if isinstance(result, ModelContextProfile):
-                return result
+                profile = result
         except Exception:  # noqa: BLE001 - optional diagnostics fail open
             pass
-    return ModelContextProfile()
+    declared = _private_value(model, _DECLARED_WINDOW_ATTRIBUTE)
+    if declared is not None and (
+        profile.context_window is None or declared < profile.context_window
+    ):
+        profile = replace(profile, context_window=declared, source="model_declaration")
+    return profile
 
 
 def estimate_model_input(
