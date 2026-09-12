@@ -10,8 +10,11 @@ bills per token, so tokens are the meaningful ceiling. This middleware owns the
   facts into the TaskDoc / converge the route / take_over). Pure information.
 * **Hard cost ceiling (stops once)** — once cumulative usage reaches
   ``token_budget`` it jumps the graph to ``end`` with a ``[TOKEN_BUDGET_EXHAUSTED]``
-  marker. This is the cost cap; ``ModelCallLimitMiddleware`` (``PHONE_AGENT_MAX_STEPS``,
-  A4 default 100) is now only an independent **runaway-loop fuse**.
+  marker. A fresh, harness-issued finish review may receive one extra actor
+  response per run, scoped to a single real confirmation of that transaction.
+  Other tool operations cannot consume this allowance. Usage keeps accumulating;
+  this is a call-boundary threshold, not a guarantee of zero token overshoot.
+  ``PHONE_AGENT_MAX_STEPS`` remains an independent **runaway-loop fuse**.
 
 Cumulative accounting is compaction-proof: the auto-compact middleware replaces
 old ``AIMessage``s (and their ``usage_metadata``) with a summary, so re-summing
@@ -23,12 +26,13 @@ without one, the original private actor counter remains the compatibility path.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from typing import TYPE_CHECKING, Any
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import hook_config
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 
 from phone_agent.v2.middleware._tokens import (
     estimate_context_tokens,
@@ -38,6 +42,7 @@ from phone_agent.v2.middleware._tokens import (
 from phone_agent.v2.pins import TASKDOC_ID_PREFIX
 
 if TYPE_CHECKING:
+    from phone_agent.v2.review import FinishReviewTicket
     from phone_agent.v2.usage import UsageLedger
 
 # Terminal marker text the hard ceiling injects; agent._build_result keys on the
@@ -71,9 +76,23 @@ _EXHAUSTED_TEXT = {
     ),
 }
 
+_FINISH_CONTINUATION_TEXT = {
+    "cn": (
+        "Token 预算已耗尽；已有仍有效的 finish 复核包，本次仅提供一次真实回复机会处理该确认。"
+        "确认无误可调用 finish(confirm=true)，也可拒绝完成或请求人工介入。"
+        "这份续办额度不覆盖其他工具操作，不会补充总预算或再次续办。"
+    ),
+    "en": (
+        "The token budget is exhausted. A fresh finish review is pending; this is "
+        "one response opportunity to handle that confirmation. Confirm with "
+        "finish(confirm=true), decline completion, or request human assistance. "
+        "This allowance covers no other tool operations and cannot be renewed."
+    ),
+}
+
 
 class BudgetMiddleware(AgentMiddleware):
-    """Token-cost mirror (warn) + hard ceiling (stop); cumulative & compaction-proof."""
+    """Cumulative threshold with one bounded pending-finish continuation."""
 
     def __init__(
         self,
@@ -82,6 +101,7 @@ class BudgetMiddleware(AgentMiddleware):
         lang: str = "cn",
         ledger: UsageLedger | None = None,
         trace_recorder: Any | None = None,
+        session: Any | None = None,
     ) -> None:
         super().__init__()
         self.token_budget = max(1, int(token_budget))
@@ -94,11 +114,19 @@ class BudgetMiddleware(AgentMiddleware):
         self.lang = lang
         self.ledger = ledger
         self._trace_recorder = trace_recorder
+        self._session = session
         self._warned = False
         self._exhausted = False
         self._used_tokens = 0
         self._counted_id: str | None = None
         self._previous_input_blocks: tuple[str, str, tuple[str, ...]] | None = None
+        self._finish_continuation_granted = False
+        self._finish_continuation_active = False
+        self._finish_continuation_ticket: FinishReviewTicket | None = None
+        self._finish_response_bound = False
+        self._finish_call_id: str | None = None
+        self._finish_call_used = False
+        self._finish_continuation_closed = False
 
     def reset(self) -> None:
         """Clear per-run state so a reused agent budgets the next run from zero."""
@@ -108,6 +136,17 @@ class BudgetMiddleware(AgentMiddleware):
         self._used_tokens = 0
         self._counted_id = None
         self._previous_input_blocks = None
+        self._finish_continuation_granted = False
+        self._finish_continuation_active = False
+        self._finish_continuation_ticket = None
+        self._finish_response_bound = False
+        self._finish_call_id = None
+        self._finish_call_used = False
+        self._finish_continuation_closed = False
+        if self._session is not None:
+            from phone_agent.v2.review import store_finish_review_ticket
+
+            store_finish_review_ticket(self._session, None)
         if self.ledger is not None:
             self.ledger.reset()
 
@@ -190,6 +229,143 @@ class BudgetMiddleware(AgentMiddleware):
         template = _EXHAUSTED_TEXT.get(self.lang, _EXHAUSTED_TEXT["cn"])
         return template.format(used=self.used_tokens, budget=self.token_budget)
 
+    def _finish_event(self, stage: str, reason: str) -> None:
+        """Write only bounded world-state metadata, never review/board contents."""
+
+        if callable(self._trace_recorder):
+            try:
+                self._trace_recorder(
+                    "token_budget_finish_continuation",
+                    stage=stage,
+                    reason=reason,
+                    used_tokens=self.used_tokens,
+                    token_budget=self.token_budget,
+                )
+            except Exception:  # noqa: BLE001 - telemetry cannot grant or revoke authority
+                pass
+
+    def _close_finish_continuation(self, reason: str) -> None:
+        if not self._finish_continuation_closed:
+            self._finish_continuation_closed = True
+            self._finish_event("exhausted", reason)
+
+    def _grant_finish_continuation(self) -> bool:
+        if self._finish_continuation_granted or self._session is None:
+            return False
+        from phone_agent.v2.review import pending_finish_review
+
+        ticket = pending_finish_review(self._session)
+        if ticket is None:
+            return False
+        self._finish_continuation_granted = True
+        self._finish_continuation_ticket = ticket
+        self._finish_event("granted", "fresh_pending_review")
+        return True
+
+    def _start_finish_continuation(self) -> None:
+        if self._finish_continuation_granted and not self._finish_continuation_active:
+            self._finish_continuation_active = True
+            self._finish_event("used", "actor_request")
+
+    def _bind_finish_response(self, messages: list[Any]) -> None:
+        """Bind the exception to at most one confirm in the granted response."""
+
+        if not self._finish_continuation_active or self._finish_response_bound:
+            return
+        self._finish_response_bound = True
+        newest = self._newest_ai(messages)
+        for call in getattr(newest, "tool_calls", None) or []:
+            if not isinstance(call, dict) or call.get("name") != "finish":
+                continue
+            args = call.get("args") or {}
+            if isinstance(args, dict) and args.get("confirm") is True and call.get("id"):
+                self._finish_call_id = str(call["id"])
+            # Repeated review/confirm siblings never manufacture another chance.
+            break
+        if self._finish_call_id is None:
+            self._close_finish_continuation("no_confirmation")
+
+    def on_tool_execute(self, request: Any, next: Any) -> Any:
+        """Scope the single response allowance to its existing finish transaction.
+
+        Mount inside core admission/control HITL and outside safety. Ordinary
+        tools from the response that first crossed the threshold are untouched:
+        this fence activates only when the extra actor request actually runs.
+        """
+
+        if not self._finish_continuation_active:
+            return next(request)
+        call = getattr(request, "tool_call", None) or {}
+        name = str(call.get("name") or "")
+        call_id = str(call.get("id") or "")
+        if name in {"ask_user", "take_over"}:
+            return next(request)
+
+        from phone_agent.v2.review import pending_finish_review
+
+        args = call.get("args") or {}
+        allowed = (
+            name == "finish"
+            and isinstance(args, dict)
+            and args.get("confirm") is True
+            and call_id == self._finish_call_id
+            and not self._finish_call_used
+            and pending_finish_review(self._session) is self._finish_continuation_ticket
+        )
+        if not allowed:
+            self._finish_event("tool_blocked", "outside_completion_transaction")
+            return ToolMessage(
+                content=(
+                    "error: Token budget exhausted; this tool was not executed. "
+                    "The one-shot allowance only covers the pending finish confirmation."
+                ),
+                tool_call_id=call_id,
+                name=name,
+                status="error",
+            )
+        self._finish_call_used = True
+        try:
+            result = next(request)
+        except Exception as exc:
+            self._finish_call_failed(exc)
+            raise
+        if inspect.isawaitable(result):
+            async def complete():
+                try:
+                    resolved = await result
+                except Exception as exc:
+                    self._finish_call_failed(exc)
+                    raise
+                self._finish_call_completed()
+                return resolved
+
+            return complete()
+        self._finish_call_completed()
+        return result
+
+    def _finish_call_failed(self, error: Exception) -> None:
+        from langgraph.errors import GraphInterrupt
+
+        if isinstance(error, GraphInterrupt):
+            # Resume the identical interrupted tool, never another actor
+            # request or a sibling confirm; core HITL retains authority.
+            self._finish_call_used = False
+        else:
+            self._close_finish_continuation("confirmation_error")
+
+    def _finish_call_completed(self) -> None:
+        if getattr(self._session, "finished", False):
+            self._finish_event("confirmed", "finish_accepted")
+        else:
+            self._close_finish_continuation("confirmation_not_accepted")
+
+    def wrap_tool_call(self, request, handler):  # noqa: ANN001
+        return self.on_tool_execute(request, handler)
+
+    async def awrap_tool_call(self, request, handler):  # noqa: ANN001
+        result = self.on_tool_execute(request, handler)
+        return await result if inspect.isawaitable(result) else result
+
     def _record_first_diff(self, request: Any) -> None:
         """Trace the first changed coarse input block between model calls."""
 
@@ -214,8 +390,16 @@ class BudgetMiddleware(AgentMiddleware):
         remaining = self.token_budget - self.used_tokens
         # Hard cost ceiling: stop the run once the budget is fully spent.
         if remaining <= 0:
-            if not self._exhausted:
-                self._exhausted = True
+            was_exhausted = self._exhausted
+            self._exhausted = True
+            if self._grant_finish_continuation():
+                template = _FINISH_CONTINUATION_TEXT.get(
+                    self.lang, _FINISH_CONTINUATION_TEXT["cn"]
+                )
+                return {"messages": [SystemMessage(content=template)]}
+            if self._finish_continuation_granted:
+                self._close_finish_continuation("actor_opportunity_spent")
+            if not was_exhausted:
                 return {
                     "jump_to": "end",
                     "messages": [AIMessage(content=self._exhausted_text())],
@@ -234,16 +418,19 @@ class BudgetMiddleware(AgentMiddleware):
     def after_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
         messages = state.get("messages") if isinstance(state, dict) else None
         self._accumulate(messages or [])
+        self._bind_finish_response(messages or [])
         return None
 
     async def aafter_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ANN001
         return self.after_model(state, runtime)
 
     def wrap_model_call(self, request, handler):  # noqa: ANN001
+        self._start_finish_continuation()
         self._record_first_diff(request)
         return handler(request)
 
     async def awrap_model_call(self, request, handler):  # noqa: ANN001
+        self._start_finish_continuation()
         self._record_first_diff(request)
         return await handler(request)
 
@@ -269,6 +456,7 @@ class BudgetMiddleware(AgentMiddleware):
     def on_model_request(self, request: Any, next: Any) -> Any:
         """Adapter for the ``model/request`` waterfall (wraps the real call)."""
 
+        self._start_finish_continuation()
         self._record_first_diff(request)
         return next(request)
 
@@ -372,6 +560,7 @@ def build_budget_middleware(
     lang: str = "cn",
     ledger: UsageLedger | None = None,
     trace_recorder: Any | None = None,
+    session: Any | None = None,
 ) -> BudgetMiddleware:
     """Build a :class:`BudgetMiddleware` from the resolved config values."""
 
@@ -381,6 +570,7 @@ def build_budget_middleware(
         lang=lang,
         ledger=ledger,
         trace_recorder=trace_recorder,
+        session=session,
     )
 
 
