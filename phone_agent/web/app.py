@@ -1,7 +1,18 @@
 """NiceGUI application for live thin-loop watch and HITL steering (v2).
 
-Console v3: designed dark UI — timeline steps with status nodes, click-to-pin
-frames, per-role token bars, memory/capability tab, command-bar header.
+Layout: one fixed command bar (brand, truthful run status, settings) followed by
+a viewport-height two-column workbench — a 336px device rail whose screenshot is
+contained to the remaining height, and a wide stage column holding a compact
+multi-line task composer, one line of run metadata, and the secondary tabs
+(steps / task board / app library / memory / outputs). The narrow breakpoint
+falls back to a natural single-column flow.
+
+Truthfulness rules kept from the console contract: an absent provider model
+label reads 未上报 (never the requested label), a requested stop reads 已请求停止
+until a terminal event lands, and a screenshot that carries no committed
+``screen_seq`` is labeled an unverified reference frame instead of a fresh
+observation. The bridge stays the sole owner of runner state; this module only
+renders the public snapshot and forwards control actions.
 """
 
 from __future__ import annotations
@@ -9,7 +20,7 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi.responses import FileResponse
 from nicegui import app, ui
@@ -18,14 +29,22 @@ from phone_agent.v2.config import V2Config, load_project_env
 from phone_agent.web.bridge import WebRunBridge
 
 # ---------------------------------------------------------------- design tokens
+# Deep navy surfaces with a single violet accent. Hierarchy comes from spacing,
+# type scale and hairlines — not from stacking bordered grey boxes.
 
-_ACCENT = "#8b5cf6"
-_BG = "#070b14"
-_PANEL = "#0d1526"
-_PANEL_SOFT = "#111c33"
-_BORDER = "rgba(148,163,184,.10)"
-_TEXT = "#e2e8f0"
-_MUTED = "#64748b"
+_ACCENT = "#7c6cf7"
+_ACCENT_SOFT = "rgba(124,108,247,.13)"
+_BG = "#070a13"
+_PANEL = "#0c1220"
+_PANEL_SOFT = "#111a2c"
+_LINE = "rgba(148,163,184,.10)"
+_LINE_2 = "rgba(148,163,184,.20)"
+_TEXT = "#e6ebf5"
+_MUTED = "#8d9ab2"
+_DIM = "rgba(148,163,184,.55)"
+_OK = "#34d399"
+_WARN = "#fbbf24"
+_BAD = "#f87171"
 
 # ------------------------------------------------------- deliverables (WP-DOC)
 
@@ -81,7 +100,10 @@ def _api_deliverables() -> list[dict[str, Any]]:
 
 @app.get("/deliverables/{run_id}")
 def _serve_deliverable(run_id: str) -> FileResponse:
-    target = _deliverable_path(run_id)
+    try:
+        target = _deliverable_path(run_id)
+    except ValueError as exc:
+        raise FileNotFoundError(run_id) from exc
     if not target.is_file():
         raise FileNotFoundError(run_id)
     return FileResponse(target, media_type="text/html")
@@ -89,148 +111,301 @@ def _serve_deliverable(run_id: str) -> FileResponse:
 
 @app.post("/api/deliverables/{run_id}/delete")
 def _delete_deliverable(run_id: str) -> dict[str, bool]:
-    target = _deliverable_path(run_id)
+    try:
+        target = _deliverable_path(run_id)
+    except ValueError:
+        return {"deleted": False}
     existed = target.is_file()
     if existed:
         target.unlink()
     return {"deleted": existed}
 
+
 _CSS = f"""
 :root {{ color-scheme: dark; }}
-body {{ background: {_BG}; color: {_TEXT};
-       font-family: -apple-system, "SF Pro Text", "PingFang SC", "Segoe UI", sans-serif;
-       -webkit-font-smoothing: antialiased; }}
+html, body {{ height: 100%; }}
+body {{ background: {_BG}; color: {_TEXT}; margin: 0; font-size: 14px;
+  font-family: -apple-system, "SF Pro Text", "PingFang SC", "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased; }}
 .mono {{ font-family: ui-monospace, "SF Mono", Menlo, monospace; }}
+body::before {{ content: ''; position: fixed; left: 0; right: 0; top: 0; height: 260px;
+  pointer-events: none; z-index: 0;
+  background: radial-gradient(720px 200px at 24% -80px, {_ACCENT}29, transparent 72%); }}
 
-/* header */
-.tw-header {{ background: rgba(13,21,38,.82); backdrop-filter: blur(12px);
-  border-bottom: 1px solid {_BORDER}; }}
-.tw-mark {{ width: 26px; height: 26px; border-radius: 8px;
-  background: linear-gradient(135deg, #8b5cf6, #6366f1);
-  box-shadow: 0 0 14px rgba(139,92,246,.45); }}
-.tw-cmd {{ border-radius: 10px; }}
-.tw-cmd .q-field__control {{ border-radius: 10px; background: rgba(148,163,184,.06); }}
-.tw-cmd.q-field--focused .q-field__control {{ box-shadow: 0 0 0 2px rgba(139,92,246,.5); }}
+/* ---------------------------------------------------------- command bar */
+.tw-bar {{ height: 52px; background: rgba(8,11,20,.90); backdrop-filter: blur(14px);
+  border-bottom: 1px solid {_LINE}; }}
+.tw-mark {{ width: 25px; height: 25px; border-radius: 8px;
+  background: linear-gradient(135deg, #8b5cf6, #4f46e5);
+  box-shadow: 0 5px 16px -7px rgba(139,92,246,.95); }}
+.tw-title {{ font-size: 15px; font-weight: 700; line-height: 17px; letter-spacing: .01em; }}
+.tw-sub {{ font-size: 10.5px; line-height: 13px; color: {_MUTED}; letter-spacing: .05em; }}
+.tw-pill {{ display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px;
+  border-radius: 999px; font-size: 12.5px; font-weight: 600;
+  border: 1px solid {_LINE}; background: {_PANEL_SOFT}; }}
+.tw-dot {{ width: 7px; height: 7px; border-radius: 50%; }}
+.tw-dot.live {{ animation: tw-pulse 1.5s ease-in-out infinite; }}
+@keyframes tw-pulse {{ 0%,100% {{ opacity: 1; }} 50% {{ opacity: .32; }} }}
+.tw-hint {{ font-size: 11.5px; color: {_MUTED}; }}
+.tw-badge {{ font-size: 10px; font-weight: 700; letter-spacing: .1em;
+  text-transform: uppercase; color: {_WARN}; background: rgba(251,191,36,.10);
+  border: 1px solid rgba(251,191,36,.30); border-radius: 6px; padding: 2px 6px; }}
+.tw-gear .q-icon {{ font-size: 19px; color: {_MUTED}; }}
+.tw-gear:hover .q-icon {{ color: {_TEXT}; }}
 
-/* status pill */
-.tw-pill {{ display:inline-flex; align-items:center; gap:7px; padding:4px 12px;
-  border-radius:999px; font-size:12.5px; font-weight:600;
-  border:1px solid {_BORDER}; background:{_PANEL_SOFT}; }}
-.tw-dot {{ width:8px; height:8px; border-radius:50%; }}
-.tw-dot.live {{ animation: tw-pulse 1.6s ease-in-out infinite; }}
-@keyframes tw-pulse {{ 0%,100% {{ opacity:1; box-shadow:0 0 0 0 currentColor; }}
-  50% {{ opacity:.55; }} }}
+/* ---------------------------------------------------------------- shell */
+.tw-shell {{ max-width: 1440px; margin: 0 auto; padding: 12px; display: flex;
+  flex-direction: column; gap: 12px; position: relative; z-index: 1; }}
+@media (min-width: 1081px) {{
+  body {{ overflow: hidden; }}
+  .tw-shell {{ position: fixed; left: 0; right: 0; top: 52px; bottom: 0;
+    padding: 14px 18px; flex-direction: row; gap: 14px; }}
+}}
 
-/* panels */
-.panel {{ background:{_PANEL}; border:1px solid {_BORDER}; border-radius:14px;
-  box-shadow: 0 1px 2px rgba(2,6,23,.4); }}
-.section-title {{ font-size:12px; font-weight:700; letter-spacing:.08em;
-  text-transform:uppercase; color:{_MUTED}; }}
+/* ----------------------------------------------------------- device rail */
+.tw-rail {{ width: 336px; flex: 0 0 336px; min-height: 0; display: flex;
+  flex-direction: column; gap: 10px; padding: 12px; border-radius: 16px;
+  background: {_PANEL}; border: 1px solid {_LINE}; }}
+.tw-rail-head {{ display: flex; align-items: center; gap: 8px; }}
+.tw-screen {{ flex: 1 1 auto; min-height: 0; height: 58vh; display: flex;
+  align-items: center; justify-content: center; padding: 8px; border-radius: 13px;
+  background: #05070e; border: 1px solid {_LINE}; overflow: hidden; }}
+.tw-screen img {{ display: block; max-width: 100%; max-height: 100%;
+  width: auto; height: auto; object-fit: contain; border-radius: 9px; }}
+.tw-screen.is-ref {{ border-color: rgba(251,191,36,.42); }}
+.tw-film {{ display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden;
+  padding-bottom: 2px; scrollbar-width: thin; flex: 0 0 auto; }}
+.tw-thumb {{ width: 42px; height: 58px; border-radius: 6px; cursor: pointer;
+  opacity: .5; border: 2px solid transparent; transition: opacity .15s, border-color .15s;
+  flex: 0 0 auto; }}
+.tw-thumb:hover {{ opacity: .85; }}
+.tw-thumb.sel {{ border-color: {_ACCENT}; opacity: 1; }}
+.tw-thumb.is-ref {{ border-style: dashed; border-color: rgba(251,191,36,.55); }}
+.tw-thumb.is-ref.sel {{ border-color: {_WARN}; }}
 
-/* device bezel */
-.phone-frame {{ background: linear-gradient(160deg,#0b1224,#020617);
-  border:1px solid rgba(148,163,184,.16); border-radius:26px; padding:12px;
-  box-shadow: 0 18px 40px -18px rgba(2,6,23,.9), inset 0 1px 0 rgba(255,255,255,.04); }}
-.phone-frame img {{ border-radius:16px; display:block; }}
-.filmstrip {{ scroll-snap-type:x mandatory; scrollbar-width:thin; }}
-.thumb {{ scroll-snap-align:start; cursor:pointer; border-radius:8px;
-  border:2px solid transparent; opacity:.55; transition:all .15s ease; }}
-.thumb:hover {{ opacity:.9; }}
-.thumb.sel {{ border-color:{_ACCENT}; opacity:1; }}
+/* ---------------------------------------------------------------- stage */
+.tw-stage {{ flex: 1 1 auto; min-width: 0; min-height: 0; display: flex;
+  flex-direction: column; gap: 10px; }}
+.tw-board {{ flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
+  gap: 8px; padding: 10px 12px 8px; border-radius: 16px;
+  background: {_PANEL}; border: 1px solid {_LINE}; }}
 
-/* timeline */
-.tl {{ position:relative; }}
-.tl-item {{ position:relative; padding-left:46px; padding-bottom:10px; }}
-.tl-item::before {{ content:''; position:absolute; left:16px; top:38px; bottom:-2px;
-  width:2px; background:{_BORDER}; }}
-.tl-item:last-child::before {{ display:none; }}
-.tl-node {{ position:absolute; left:0; top:6px; width:34px; height:34px;
-  border-radius:11px; display:flex; align-items:center; justify-content:center;
-  background:{_PANEL_SOFT}; border:1px solid {_BORDER}; }}
-.tl-node .q-icon {{ font-size:17px; }}
-.tl-item[data-st="running"] .tl-node {{ border-color:{_ACCENT};
-  box-shadow:0 0 12px rgba(139,92,246,.35); animation:tw-pulse 1.6s infinite; }}
-.tl-item[data-st="success"] .tl-node {{ border-color:rgba(52,211,153,.45); color:#34d399; }}
-.tl-item[data-st="error"] .tl-node {{ border-color:rgba(248,113,113,.5); color:#f87171; }}
-.tl-item[data-st="warning"] .tl-node {{ border-color:rgba(251,191,36,.5); color:#fbbf24; }}
-.tl-card {{ background:{_PANEL_SOFT}; border:1px solid {_BORDER}; border-radius:11px;
-  transition:border-color .15s ease; }}
-.tl-card:hover {{ border-color:rgba(139,92,246,.4); }}
-.tl-card .q-item {{ padding:9px 14px; min-height:0; }}
-.tl-card .q-expansion-item__content {{ padding:0; }}
-.chip {{ display:inline-flex; align-items:center; gap:4px; padding:2px 9px;
-  border-radius:6px; font-size:11.5px; font-weight:600;
-  background:rgba(139,92,246,.13); color:#c4b5fd; border:1px solid rgba(139,92,246,.25); }}
-.chip.grey {{ background:rgba(148,163,184,.09); color:#94a3b8;
-  border-color:rgba(148,163,184,.18); }}
-.latbar {{ height:4px; border-radius:2px; background:rgba(148,163,184,.12);
-  overflow:hidden; }}
-.latbar > div {{ height:100%; border-radius:2px; }}
+/* composer */
+.tw-composer {{ display: flex; flex-direction: column; gap: 6px; }}
+.tw-field .q-field__control {{ background: {_PANEL_SOFT}; border-radius: 10px;
+  border: 1px solid {_LINE}; }}
+.tw-field .q-field__control:hover {{ border-color: {_LINE_2}; }}
+.tw-field.q-field--focused .q-field__control {{ border-color: {_ACCENT};
+  box-shadow: 0 0 0 3px {_ACCENT_SOFT}; }}
+.tw-field .q-field__control::before, .tw-field .q-field__control::after {{ display: none; }}
+.tw-field .q-field__native, .tw-field .q-field__input {{ color: {_TEXT};
+  font-size: 13.5px; line-height: 1.45; }}
+.tw-field textarea {{ padding-top: 9px !important; padding-bottom: 9px !important; }}
+.tw-run {{ width: 92px; height: 31px; border-radius: 9px; font-weight: 700;
+  background: {_ACCENT}; color: #fff;
+  box-shadow: 0 6px 18px -10px rgba(124,108,247,1); }}
+.tw-stop {{ width: 92px; height: 31px; border-radius: 9px; color: {_BAD};
+  border: 1px solid rgba(248,113,113,.35); }}
+.tw-meta-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px;
+  padding: 0 2px; font-size: 11.5px; }}
+.tw-sep {{ color: {_LINE_2}; }}
+.tw-meta-k {{ color: {_DIM}; }}
+.tw-meta-v {{ color: {_MUTED}; }}
+
+/* hitl */
+.tw-hitl {{ padding: 12px; border-radius: 14px;
+  background: linear-gradient(180deg, rgba(251,191,36,.10), rgba(251,191,36,.04));
+  border: 1px solid rgba(251,191,36,.34); }}
+.tw-hitl-title {{ font-size: 14px; font-weight: 700; color: {_WARN}; }}
+.tw-hitl-body {{ font-size: 13px; white-space: pre-wrap; margin-top: 6px; }}
+
+/* toolbar + panels */
+.tw-toolbar {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  min-height: 26px; }}
+.tw-panels {{ flex: 1 1 auto; min-height: 0; }}
+.tw-panels .q-tab-panel {{ padding: 0; height: 100%; overflow: hidden; }}
+.tw-fill {{ height: 100%; display: flex; flex-direction: column; gap: 8px; min-height: 0; }}
+.tw-scroll {{ flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  padding-right: 2px; }}
+@media (max-width: 1080px) {{
+  .tw-rail {{ width: 100%; flex: 0 0 auto; }}
+  .tw-screen {{ height: 62vh; }}
+  .tw-panels .q-tab-panel {{ height: auto; overflow: visible; }}
+  .tw-fill, .tw-scroll {{ height: auto; overflow: visible; }}
+}}
+@media (max-width: 900px) {{
+  .tw-hide-sm {{ display: none !important; }}
+}}
 
 /* tabs */
-.tw-tabs .q-tab {{ text-transform:none; font-weight:600; color:{_MUTED}; }}
-.tw-tabs .q-tab--active {{ color:{_TEXT}; }}
-.q-tab-panels {{ background:transparent; }}
+.tw-tabs .q-tab {{ text-transform: none; font-weight: 600; font-size: 13px;
+  color: {_MUTED}; padding: 4px 10px; min-height: 34px; }}
+.tw-tabs .q-tab--active {{ color: {_TEXT}; }}
+.tw-tabs .q-tab__indicator {{ background: {_ACCENT}; height: 2px; }}
+.q-tab-panels {{ background: transparent; }}
+.q-tab-panels .q-tab-panel {{ padding: 0; }}
 
-/* tables */
-.q-table__container, .q-table {{ background: transparent; box-shadow: none;
-  border: none; }}
-.q-table__card {{ background: transparent; box-shadow: none; }}
-.q-table th {{ font-size:11px; letter-spacing:.07em; text-transform:uppercase;
-  color:{_MUTED}; border-bottom:1px solid {_BORDER}; background:transparent; }}
-.q-table td {{ border-bottom:1px solid rgba(148,163,184,.06); font-size:13px;
-  background:transparent; }}
-.q-table tbody tr:hover {{ background:rgba(148,163,184,.05); }}
-.q-table__bottom {{ border-top:1px solid {_BORDER}; color:{_MUTED}; }}
+/* type helpers */
+.tw-label {{ font-size: 11.5px; font-weight: 700; letter-spacing: .09em;
+  text-transform: uppercase; color: {_MUTED}; }}
+.tw-note {{ font-size: 11.5px; color: {_DIM}; line-height: 1.5; }}
+.tw-chip {{ display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px;
+  border-radius: 6px; font-size: 11px; font-weight: 600; white-space: nowrap;
+  background: {_ACCENT_SOFT}; color: {_ACCENT}; border: 1px solid {_ACCENT}38; }}
+.tw-chip.grey {{ background: rgba(148,163,184,.08); color: {_MUTED};
+  border-color: rgba(148,163,184,.18); }}
+.tw-chip.ok {{ color: {_OK}; border-color: {_OK}55; background: {_OK}18; }}
+.tw-chip.warn {{ color: {_WARN}; border-color: {_WARN}55; background: {_WARN}18; }}
+.tw-chip.bad {{ color: {_BAD}; border-color: {_BAD}55; background: {_BAD}18; }}
+.tw-pre {{ font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;
+  color: {_MUTED}; white-space: pre-wrap; word-break: break-word; }}
+.tw-result {{ font-size: 13px; white-space: pre-wrap; word-break: break-word;
+  line-height: 1.55; }}
+.tw-dim {{ color: {_DIM}; }}
+.tw-link {{ color: {_ACCENT}; font-size: 11.5px; }}
+.tw-latbar {{ height: 3px; border-radius: 2px; background: rgba(148,163,184,.14);
+  overflow: hidden; }}
+.tw-latbar > div {{ height: 100%; border-radius: 2px; }}
+
+/* steps */
+.tw-steps {{ display: flex; flex-direction: column; }}
+.tw-current {{ display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+  border-radius: 10px; background: {_ACCENT_SOFT}; border: 1px solid {_ACCENT}33; }}
+.tw-current-icon {{ font-size: 16px; color: {_ACCENT}; }}
+.tw-current-text {{ font-size: 13.5px; font-weight: 600; flex: 0 1 auto; }}
+.tw-stream {{ display: flex; flex-direction: column; gap: 6px; padding: 8px 10px;
+  border-radius: 10px; border: 1px solid {_LINE_2};
+  background: rgba(148,163,184,.05); }}
+.tw-stream-text {{ font-size: 13px; white-space: pre-wrap; word-break: break-word;
+  line-height: 1.55; max-height: 168px; overflow-y: auto; }}
+.tw-stream-think {{ font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  color: {_MUTED}; border-left: 2px solid {_LINE_2}; padding-left: 8px;
+  max-height: 96px; overflow-y: auto; }}
+.tw-step {{ border-bottom: 1px solid {_LINE}; }}
+.tw-step:last-child {{ border-bottom: none; }}
+.tw-step .q-expansion-item__container > .q-item {{ padding: 0; min-height: 0; }}
+.tw-step .q-item__section--side {{ display: none; }}
+.tw-step .q-expansion-item__content {{ padding: 0; }}
+.tw-step .q-item {{ background: transparent; }}
+.tw-step .q-focus-helper {{ display: none; }}
+.tw-step .q-item__label {{ padding: 0; }}
+.tw-step-body {{ display: flex; flex-direction: column; gap: 6px;
+  padding: 4px 10px 12px; }}
+.tw-step-num {{ font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+  color: {_DIM}; min-width: 24px; }}
+.tw-step-title {{ font-size: 13.5px; font-weight: 600; }}
+.tw-step-lat {{ font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+  color: {_DIM}; }}
+.tw-step[data-st="running"] {{ background: {_ACCENT_SOFT}; box-shadow: inset 2px 0 0 {_ACCENT}; }}
+.tw-step[data-st="error"] {{ box-shadow: inset 2px 0 0 {_BAD}; }}
+.tw-step[data-st="warning"] {{ box-shadow: inset 2px 0 0 {_WARN}; }}
+.tw-step:hover {{ background: rgba(148,163,184,.04); }}
 
 /* task board */
-.board-goal {{ background:{_PANEL_SOFT}; border:1px solid {_BORDER};
-  border-radius:11px; padding:12px 16px; }}
-.board-item {{ display:flex; gap:10px; padding:7px 4px; align-items:flex-start;
-  border-bottom:1px solid rgba(148,163,184,.06); }}
-.board-flow {{ font-family:ui-monospace,Menlo,monospace; font-size:11.5px;
-  color:{_MUTED}; padding:3px 0; border-bottom:1px dashed rgba(148,163,184,.08);
-  white-space:pre-wrap; word-break:break-all; }}
+.tw-board-goal {{ padding: 10px 12px; border-radius: 11px; background: {_PANEL_SOFT};
+  border: 1px solid {_LINE}; }}
+.tw-board-item {{ display: flex; gap: 9px; padding: 6px 2px; align-items: flex-start;
+  border-bottom: 1px solid {_LINE}; }}
+.tw-board-flow {{ font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;
+  color: {_MUTED}; padding: 3px 0; border-bottom: 1px dashed {_LINE};
+  white-space: pre-wrap; word-break: break-all; }}
 
-/* stat cards */
-.stat-card {{ background:{_PANEL_SOFT}; border:1px solid {_BORDER};
-  border-radius:12px; padding:12px 16px; min-width:120px; }}
-.stat-num {{ font-size:22px; font-weight:700; font-family:ui-monospace,Menlo,monospace; }}
+/* outputs */
+.tw-out {{ display: flex; align-items: center; gap: 10px; padding: 9px 10px;
+  border-bottom: 1px solid {_LINE}; }}
+.tw-out:hover {{ background: rgba(148,163,184,.04); }}
 
-/* empty states */
-.empty {{ display:flex; flex-direction:column; align-items:center; gap:8px;
-  padding:36px 0; color:{_MUTED}; }}
+/* stats + empty states */
+.tw-stats {{ display: flex; align-items: stretch; gap: 14px; flex-wrap: wrap; }}
+.tw-stat {{ display: flex; flex-direction: column; gap: 1px; padding-right: 14px;
+  border-right: 1px solid {_LINE}; }}
+.tw-stat:last-child {{ border-right: none; }}
+.tw-stat-num {{ font-size: 17px; font-weight: 700;
+  font-family: ui-monospace, Menlo, monospace; line-height: 20px; }}
+.tw-stat-cap {{ font-size: 11px; color: {_MUTED}; }}
+.tw-empty {{ display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 6px; padding: 44px 16px; text-align: center; }}
+.tw-empty .q-icon {{ font-size: 30px; color: rgba(148,163,184,.42); }}
+.tw-empty-title {{ font-size: 13.5px; font-weight: 600; color: {_MUTED}; }}
+.tw-empty-hint {{ font-size: 12px; color: {_DIM}; max-width: 400px;
+  line-height: 1.55; }}
 
-/* hitl banner */
-.hitl {{ border:1px solid rgba(251,191,36,.4); background:rgba(251,191,36,.07);
-  border-radius:14px; }}
-
-/* drawer */
-.q-drawer {{ background:{_PANEL}; border-left:1px solid {_BORDER}; }}
-.q-drawer .q-field .q-field__control {{ background:rgba(148,163,184,.06);
-  border-radius:9px; }}
-.step-detail {{ white-space:pre-wrap; word-break:break-all; }}
+/* tables + drawer */
+.q-table__container, .q-table, .q-table__card {{ background: transparent;
+  box-shadow: none; border: none; }}
+.q-table th {{ font-size: 10.5px; letter-spacing: .07em; text-transform: uppercase;
+  color: {_MUTED}; border-bottom: 1px solid {_LINE}; background: transparent; }}
+.q-table td {{ border-bottom: 1px solid {_LINE}; font-size: 12.5px;
+  background: transparent; }}
+.q-table tbody tr:hover {{ background: rgba(148,163,184,.05); }}
+.q-drawer {{ background: {_PANEL}; border-left: 1px solid {_LINE}; }}
+.q-drawer .q-field .q-field__control {{ background: rgba(148,163,184,.06);
+  border-radius: 9px; }}
+.q-dialog .q-card {{ background: {_PANEL}; border: 1px solid {_LINE_2}; }}
 """
 
+# Terminal / non-active status → pill label + color.
 _STATUS_META = {
-    "idle": ("待命", "#64748b", False),
-    "starting": ("启动中", "#38bdf8", True),
-    "running": ("运行中", _ACCENT, True),
-    "waiting_hitl": ("等待人工", "#fbbf24", True),
-    "succeeded": ("已完成", "#34d399", False),
-    "failed": ("未完成", "#f87171", False),
-    "takeover": ("已接管/停止", "#fbbf24", False),
-    "budget_exhausted": ("预算耗尽", "#f87171", False),
-    "loop_fuse": ("保险丝触发", "#f87171", False),
-    "error": ("运行错误", "#f87171", False),
+    "idle": ("待命", _MUTED, False),
+    "succeeded": ("已完成", _OK, False),
+    "failed": ("未完成", _BAD, False),
+    "takeover": ("已接管/停止", _WARN, False),
+    "budget_exhausted": ("预算耗尽", _BAD, False),
+    "loop_fuse": ("保险丝触发", _BAD, False),
+    "error": ("运行错误", _BAD, False),
+}
+
+# Active-run activity → pill label + color + a short "what we're waiting on" hint.
+_ACTIVITY_META = {
+    "starting": ("启动中", _ACCENT, True, "正在拉起运行进程"),
+    "running": ("运行中", _ACCENT, True, "模型已返回，正在处理"),
+    "waiting_model": ("等待模型调用返回", _ACCENT, True, "网络 / 队列 / 推理，无法区分"),
+    "executing_tool": ("执行工具", _ACCENT, True, "工具正在设备上执行"),
+    "waiting_human": ("等待人工", _WARN, True, "需要你做出决定"),
+    "stopping": ("已请求停止", _WARN, True, "等待当前调用/步骤返回后收尾"),
 }
 
 _STEP_META = {
     "running": ("执行中", _ACCENT),
-    "success": ("成功", "#34d399"),
-    "warning": ("预警", "#fbbf24"),
-    "error": ("失败", "#f87171"),
+    "success": ("成功", _OK),
+    "warning": ("预警", _WARN),
+    "error": ("失败", _BAD),
 }
+
+_STREAM_TAIL_CHARS = 2400
+_STREAM_STATUS = {
+    "streaming": ("接收中", ""),
+    "done": ("完成", "ok"),
+    "failed": ("中断", "bad"),
+}
+
+
+def _stream_selection(
+    attempts: list[dict[str, Any]], *, attempt: int | None, follow: bool
+) -> tuple[dict[str, Any] | None, int | None]:
+    """Pick the attempt to display: newest while following, else the pinned one.
+
+    Following is the default; a pinned attempt survives later appends and only
+    falls back to the newest when it leaves the retained window.
+    """
+
+    if not attempts:
+        return None, attempt
+    numbers = [int(item["attempt"]) for item in attempts]
+    if follow or attempt not in numbers:
+        attempt = numbers[-1]
+    record = next(
+        (item for item in attempts if item["attempt"] == attempt), attempts[-1]
+    )
+    return record, attempt
+
+
+def _stream_tail(text: str, limit: int = _STREAM_TAIL_CHARS) -> str:
+    """Tail view for the live panel; a leading marker keeps the cut visible."""
+
+    if len(text) <= limit:
+        return text
+    return "…" + text[-limit:]
 
 _TOOL_ICON = {
     "tap": "touch_app",
@@ -260,6 +435,12 @@ _USAGE_ROLE_TEXT = {
 }
 
 _VERIFIER_TEXT = {"pass": "通过", "fail": "未通过", "skipped": "跳过"}
+
+_RAG_MODE_TEXT = {
+    "on": "on：注入已批准课程（非强制参考）",
+    "shadow": "shadow：只观测、不注入",
+    "off": "off：关闭",
+}
 
 _BOARD_ITEM_RE = re.compile(r"^- \[(?P<status>\w+)\] (?P<ident>\S+): (?P<rest>.*)$")
 _BOARD_NOTE_RE = re.compile(r"（(?:证据|原因)：(?P<note>.*)）$|\((?:evidence|reason): (?P<note_en>.*)\)$")
@@ -339,13 +520,14 @@ def _parse_board(text: str) -> dict[str, Any]:
     out["raw"] = out["raw"].strip()
     return out
 
+
 _KIND_TEXT = {"device": "设备", "alias": "别名", "learned": "学习", "user": "用户"}
 
 _CAP_STATE_STYLE = {
-    "active": ("#34d399", "生效"),
+    "active": (_OK, "生效"),
     "shadow": (_ACCENT, "影子"),
-    "off": ("#64748b", "关闭"),
-    "pending": ("#fbbf24", "待岗"),
+    "off": (_MUTED, "关闭"),
+    "pending": (_WARN, "待岗"),
 }
 
 
@@ -354,26 +536,45 @@ def _display(value: Any, fallback: str = "—") -> str:
     return text or fallback
 
 
+def _frame_key(frame: dict) -> str:
+    """Stable identity for a frame.
+
+    A verified observation is keyed by its committed ``screen_seq``; an
+    unverified reference frame (``seq is None``) is keyed by its own
+    ``screen_ref`` so multiple reference frames never collapse onto one another
+    or onto a real observation.
+    """
+
+    if frame.get("reference"):
+        ref = frame.get("screen_ref")
+        return f"ref:{ref if ref is not None else id(frame)}"
+    return f"seq:{frame.get('seq')}"
+
+
 def _choose_frame(screens: list[dict], selected: dict) -> dict | None:
     """Main-frame choice: follow the newest frame unless the user pinned one."""
 
     latest = screens[-1] if screens else None
-    if not selected["pinned"]:
-        selected["seq"] = latest.get("seq") if latest else None
+    if not selected.get("pinned"):
+        selected["key"] = _frame_key(latest) if latest else None
         return latest
-    if latest is not None and selected["seq"] not in {s.get("seq") for s in screens}:
+    keys = {_frame_key(s) for s in screens}
+    if latest is not None and selected.get("key") not in keys:
         selected["pinned"] = False
-        selected["seq"] = latest.get("seq")
-    return next((s for s in screens if s.get("seq") == selected["seq"]), latest)
+        selected["key"] = _frame_key(latest)
+        return latest
+    return next(
+        (s for s in screens if _frame_key(s) == selected.get("key")), latest
+    )
 
 
-def _pin_toggle(selected: dict, seq: Any) -> None:
+def _pin_toggle(selected: dict, key: Any) -> None:
     """Click a thumbnail/step: pin it; click the pinned one again: follow latest."""
 
-    if selected["pinned"] and selected["seq"] == seq:
-        selected.update(seq=None, pinned=False)
+    if selected.get("pinned") and selected.get("key") == key:
+        selected.update(key=None, pinned=False)
     else:
-        selected.update(seq=seq, pinned=True)
+        selected.update(key=key, pinned=True)
 
 
 def _mask_url(url: str) -> str:
@@ -388,11 +589,97 @@ def _tokens_fmt(n: int | float) -> str:
     return f"{n / 1000:.1f}k" if n >= 10000 else f"{n:,}"
 
 
-def _stat_card(label: str, accent: str = _ACCENT) -> ui.label:
-    with ui.element("div").classes("stat-card"):
-        ui.label(label).classes("section-title")
-        value = ui.label("—").classes("stat-num").style(f"color:{accent}")
+def _duration_fmt(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}:{sec:02d}"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{sec:02d}"
+
+
+def _age_fmt(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    seconds = max(0, int(seconds))
+    if seconds < 1:
+        return "刚刚"
+    if seconds < 60:
+        return f"{seconds}s 前"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}min 前"
+    return f"{minutes // 60}h 前"
+
+
+def _empty(icon: str, title: str, hint: str = "") -> ui.element:
+    """Product-grade empty state: a short guide, never a fabricated result."""
+
+    with ui.element("div").classes("tw-empty") as box:
+        ui.icon(icon)
+        ui.label(title).classes("tw-empty-title")
+        if hint:
+            ui.label(hint).classes("tw-empty-hint")
+    return box
+
+
+def _stat_inline(label: str, accent: str = _ACCENT) -> ui.label:
+    with ui.element("div").classes("tw-stat"):
+        value = ui.label("—").classes("tw-stat-num").style(f"color:{accent}")
+        ui.label(label).classes("tw-stat-cap")
     return value
+
+
+def _device_override(value: Any) -> str:
+    """Return the explicit UI device serial; blank or whitespace means auto."""
+
+    return str(value or "").strip()
+
+
+def _streaming_hint(config: Any, *, switch_on: bool) -> str:
+    """Effective actor streaming decision for the drawer (best-effort, read-only).
+
+    A models.json model entry or ``roles.actor.streaming`` outweighs the
+    drawer's global switch, so the panel must state what will actually run
+    instead of echoing the switch.
+    """
+
+    try:
+        from dataclasses import replace
+
+        from phone_agent.v2.providers import (
+            build_provider_registry,
+            get_role_specs,
+            resolve_role_ref,
+            resolve_streaming_mode,
+        )
+
+        active = replace(config, streaming="on" if switch_on else "off")
+        registry = build_provider_registry(active)
+        enabled = resolve_streaming_mode(active, "actor", registry) == "on"
+        role_mode = getattr(get_role_specs(registry).get("actor"), "streaming", None)
+        model_mode = None
+        try:
+            resolved = registry.resolve(resolve_role_ref(active, "actor", registry=registry))
+            model_mode = getattr(resolved.model, "streaming", None)
+        except Exception:  # noqa: BLE001 - unresolved refs add no tier
+            model_mode = None
+        if role_mode:
+            source = "roles.actor.streaming"
+        elif model_mode:
+            source = "models.json 模型条目"
+        elif switch_on:
+            source = "抽屉/全局开关"
+        else:
+            source = "默认"
+        text = f"流式生效：{'on' if enabled else 'off'}（{source}）"
+        if enabled != switch_on:
+            text += " · 模型/角色声明覆盖了抽屉开关"
+        return text
+    except Exception:  # noqa: BLE001 - the hint must never break the drawer
+        return f"流式生效：{'on' if switch_on else 'off'}（未能读取 models.json）"
 
 
 class _ConfigPanel:
@@ -401,18 +688,25 @@ class _ConfigPanel:
     def __init__(self, config: V2Config) -> None:
         self._config = config
         with ui.drawer("right", bordered=True, value=False).classes(
-            "p-5 gap-3 w-80"
+            "p-4 gap-3 w-80"
         ) as drawer:
-            ui.label("运行配置").classes("text-lg font-bold")
-            ui.label("本次生效，不写回 .env").classes("text-xs").style(
+            ui.label("运行配置").classes("text-base font-bold")
+            ui.label("仅对下一次运行生效，不写回 .env").classes("text-[11.5px]").style(
                 f"color:{_MUTED}; margin-top:-8px"
             )
             self.device_id = ui.input(
                 "设备 serial（留空=自动）", value=config.device_id or ""
             ).props("outlined dense dark").classes("w-full")
-            self.model_name = ui.input("模型", value=config.model_name).props(
+            self.model_name = ui.input("主模型", value=config.model_name).props(
                 "outlined dense dark"
             ).classes("w-full")
+            # A-package fallback field: read compatibly. When the core config
+            # has no fallback_model yet, default to empty and never guess a
+            # substitute for the user.
+            self.fallback_model = ui.input(
+                "备用模型（留空=不设）",
+                value=str(getattr(config, "fallback_model", "") or ""),
+            ).props("outlined dense dark").classes("w-full")
             self.safety_mode = ui.select(
                 ["wary", "off", "hard", "reviewer"],
                 value=getattr(config, "safety_mode", "wary"),
@@ -435,8 +729,17 @@ class _ConfigPanel:
             self.app_kb = ui.switch(
                 "App-KB 记忆", value=bool(getattr(config, "app_kb_enabled", True))
             ).props("dark")
+            self.streaming = ui.switch(
+                "模型流式增量", value=getattr(config, "streaming", "off") == "on"
+            ).props("dark")
+            self.streaming_hint = ui.label("").classes("text-[11.5px]").style(
+                f"color:{_MUTED}; margin-top:-6px"
+            )
+            self.streaming.on_value_change(lambda _e: self._refresh_streaming())
+            self.model_name.on_value_change(lambda _e: self._refresh_streaming())
+            self._refresh_streaming()
             ui.separator()
-            ui.label("当前生效（只读）").classes("section-title")
+            ui.label("当前生效（只读）").classes("tw-label")
             ui.label(f"网关 {_mask_url(getattr(config, 'base_url', ''))}").classes(
                 "text-xs mono"
             ).style(f"color:{_MUTED}")
@@ -450,21 +753,37 @@ class _ConfigPanel:
             )
         self.drawer = drawer
 
+    def _refresh_streaming(self) -> None:
+        """Show the effective streaming decision, not just the switch value."""
+
+        from dataclasses import replace
+
+        active = replace(
+            self._config,
+            model_name=str(self.model_name.value or self._config.model_name).strip(),
+        )
+        self.streaming_hint.set_text(
+            _streaming_hint(active, switch_on=bool(self.streaming.value))
+        )
+
     def reset(self) -> None:
         cfg = self._config
         self.device_id.value = cfg.device_id or ""
         self.model_name.value = cfg.model_name
+        self.fallback_model.value = str(getattr(cfg, "fallback_model", "") or "")
         self.safety_mode.value = getattr(cfg, "safety_mode", "wary")
         self.lang.value = getattr(cfg, "lang", "cn")
         self.max_steps.value = getattr(cfg, "max_model_calls", 100)
         self.token_budget.value = getattr(cfg, "token_budget", 1_000_000)
         self.grounding_provider.value = getattr(cfg, "grounding_provider", "hybrid")
         self.app_kb.value = bool(getattr(cfg, "app_kb_enabled", True))
+        self.streaming.value = getattr(cfg, "streaming", "off") == "on"
+        self._refresh_streaming()
         ui.notify("已恢复为当前 .env 生效值", type="positive")
 
     def overrides(self) -> dict[str, Any]:
-        return {
-            "device_id": str(self.device_id.value or "") or None,
+        result: dict[str, Any] = {
+            "device_id": _device_override(self.device_id.value),
             "model_name": str(self.model_name.value or "") or None,
             "safety_mode": self.safety_mode.value,
             "lang": self.lang.value,
@@ -473,6 +792,14 @@ class _ConfigPanel:
             "grounding_provider": self.grounding_provider.value,
             "app_kb_enabled": bool(self.app_kb.value),
         }
+        if hasattr(self._config, "streaming"):
+            result["streaming"] = "on" if self.streaming.value else "off"
+        # Only send fallback_model when the core config actually accepts it, so
+        # a base checkout without the A-package field is not handed an unknown
+        # override (V2Config.from_env rejects unknown names).
+        if hasattr(self._config, "fallback_model"):
+            result["fallback_model"] = str(self.fallback_model.value or "") or None
+        return result
 
 
 # ------------------------------------------------------------------ main UI
@@ -483,198 +810,284 @@ def create_ui(
     *,
     config: V2Config,
     refresh_seconds: float = 0.5,
+    header_slot: Callable[[], None] | None = None,
 ) -> None:
-    """Build the single-page UI and attach it to ``bridge``."""
+    """Build the single-page UI and attach it to ``bridge``.
 
-    ui.colors(primary=_ACCENT, positive="#34d399", negative="#f87171")
+    ``header_slot`` renders extra trailing content inside the command bar; the
+    synthetic preview uses it for its small demo badge, so debug affordances
+    never occupy the workbench.
+    """
+
+    ui.colors(primary=_ACCENT, positive=_OK, negative=_BAD, warning=_WARN)
     ui.dark_mode().enable()
     ui.add_css(_CSS)
 
     panel = _ConfigPanel(config)
     set_deliverable_root(config.deliverable_dir)
 
-    # --- header ---------------------------------------------------------
-    with ui.header().classes("tw-header items-center gap-3 px-5 py-2.5"):
+    # --- command bar ------------------------------------------------------
+    with ui.header().classes("tw-bar items-center gap-3 px-4"):
         ui.element("div").classes("tw-mark")
         with ui.column().classes("gap-0"):
-            ui.label("TaskWizard").classes("text-base font-bold leading-5")
-            ui.label("thin-loop 实时控制台").classes("text-[11px] leading-4").style(
-                f"color:{_MUTED}"
-            )
-        task_input = (
-            ui.input(placeholder="输入手机任务，回车运行 — 例如：打开设置并进入 WLAN")
-            .props("outlined dense clearable dark")
-            .classes("grow min-w-64 tw-cmd")
-        )
-        start_button = ui.button("运行", icon="play_arrow").props(
-            "unelevated no-caps"
-        ).style(
-            f"background:{_ACCENT}; box-shadow:0 4px 16px -4px rgba(139,92,246,.5);"
-            " border-radius:10px; font-weight:600"
-        )
-        stop_button = ui.button("停止", icon="stop").props("flat no-caps text-negative")
+            ui.label("TaskWizard").classes("tw-title")
+            ui.label("thin-loop 实时控制台").classes("tw-sub")
+        ui.element("div").classes("w-px h-6").style(f"background:{_LINE_2}")
         with ui.element("div").classes("tw-pill") as status_pill:
-            status_dot = ui.element("span").classes("tw-dot").style(
-                "background:#64748b; color:#64748b"
-            )
+            status_dot = ui.element("span").classes("tw-dot").style(f"background:{_MUTED}")
             status_text = ui.label("待命").classes("text-[12.5px]")
-        tokens_chip = ui.label("").classes("mono text-xs").style(f"color:{_MUTED}")
+        activity_hint = ui.label("").classes("tw-hint tw-hide-sm")
+        ui.space()
         ui.button(icon="tune", on_click=panel.drawer.toggle).props(
             "flat round dense"
-        ).style(f"color:{_MUTED}")
+        ).classes("tw-gear")
+        if header_slot is not None:
+            header_slot()
 
-    # --- main stage ------------------------------------------------------
-    with ui.column().classes("w-full max-w-[1460px] mx-auto p-5 gap-5"):
-        with ui.row().classes("w-full items-stretch gap-5 flex-wrap lg:flex-nowrap"):
+    # --- workbench --------------------------------------------------------
+    with ui.element("div").classes("tw-shell"):
 
-            # device rail
-            with ui.element("div").classes("panel w-full lg:w-[370px] p-4"):
-                with ui.row().classes("w-full items-center justify-between"):
-                    ui.label("设备").classes("section-title")
-                    screen_meta = ui.label("—").classes("mono text-[11px]").style(
-                        f"color:{_MUTED}"
-                    )
-                with ui.element("div").classes(
-                    "phone-frame w-full flex justify-center items-start mt-3"
-                ) as phone_frame:
-                    screen_image = ui.element("img").style(
-                        "max-height: 62vh; max-width: 100%; width: auto;"
-                        " height: auto; margin: 0 auto;"
-                    )
-                phone_frame.set_visibility(False)
-                with ui.element("div").classes("empty") as no_screen:
-                    ui.icon("smartphone").style("font-size:34px")
-                    ui.label("运行后这里显示实时画面").classes("text-xs")
-                thumbs = ui.row().classes(
-                    "filmstrip w-full gap-2 mt-3 overflow-x-auto flex-nowrap pb-1"
+        # device rail
+        with ui.element("section").classes("tw-rail"):
+            with ui.element("div").classes("tw-rail-head"):
+                ui.label("设备").classes("tw-label")
+                pin_chip = ui.label("跟随最新").classes("tw-chip grey")
+                ui.space()
+                screen_meta = ui.label("—").classes("tw-note mono truncate")
+                back_live = ui.button(
+                    icon="my_location", on_click=lambda: _release_pin()
+                ).props("flat dense round size=sm").classes("tw-link")
+            reference_tag = ui.element("div").classes("w-full")
+            screen_box = ui.element("div").classes("tw-screen")
+            with screen_box:
+                screen_image = ui.element("img")
+            screen_box.set_visibility(False)
+            with ui.element("div").classes("tw-screen") as no_screen:
+                _empty(
+                    "smartphone",
+                    "运行后显示设备实时画面",
+                    "截图按窗口等比缩放；历史帧进入下方缩略条，点击可钉住对比。",
                 )
+            thumbs = ui.element("div").classes("tw-film")
 
-            # stage
-            with ui.element("div").classes("panel grow p-4").style(
-                "min-height: 72vh"
-            ):
+        # stage
+        with ui.element("section").classes("tw-stage"):
+
+            # HITL first: the decision belongs at the top of the workspace.
+            with ui.element("div").classes("tw-hitl") as hitl_panel:
+                with ui.row().classes("items-center gap-2 no-wrap"):
+                    ui.icon("front_hand").style(f"color:{_WARN}; font-size:18px")
+                    ui.label("需要你决定").classes("tw-hitl-title")
+                hitl_prompt = ui.label().classes("tw-hitl-body")
+                with ui.row().classes("w-full gap-2 mt-3 items-center no-wrap"):
+                    hitl_answer = (
+                        ui.input(placeholder="也可以输入文本回答")
+                        .props("outlined dense dark")
+                        .classes("grow tw-field")
+                    )
+                    approve_button = ui.button("同意", icon="check").props(
+                        "unelevated dense no-caps"
+                    ).classes("tw-run").style(
+                        "width:auto; padding:0 12px; background:#12a06a"
+                    )
+                    reject_button = ui.button("拒绝", icon="close").props(
+                        "flat dense no-caps"
+                    ).classes("tw-stop").style("width:auto; padding:0 12px")
+                    answer_button = ui.button("提交", icon="send").props(
+                        "outline dense no-caps"
+                    ).classes("tw-stop").style(
+                        f"width:auto; padding:0 12px; color:{_TEXT};"
+                        f" border-color:{_LINE_2}"
+                    )
+            hitl_panel.set_visibility(False)
+
+            # composer: multi-line task + run/stop + one line of run metadata
+            with ui.element("div").classes("tw-composer"):
+                with ui.row().classes("w-full items-stretch gap-2 no-wrap"):
+                    task_input = (
+                        ui.textarea(
+                            placeholder="描述手机任务，可多行 — 例如：打开设置进入 WLAN，"
+                            "连接名为 office 的网络后返回桌面"
+                        )
+                        .props("outlined dense autogrow rows=2 input-style=max-height:92px")
+                        .classes("grow tw-field")
+                    )
+                    with ui.column().classes("gap-2 shrink-0 justify-between"):
+                        start_button = ui.button("运行", icon="play_arrow").props(
+                            "unelevated dense no-caps"
+                        ).classes("tw-run")
+                        stop_button = ui.button("停止", icon="stop").props(
+                            "outline dense no-caps"
+                        ).classes("tw-stop")
+                with ui.element("div").classes("tw-meta-row"):
+                    ui.label("run").classes("tw-meta-k")
+                    run_id_label = ui.label("—").classes("tw-meta-v mono")
+                    ui.label("·").classes("tw-sep")
+                    ui.label("首选模型").classes("tw-meta-k")
+                    req_model_label = ui.label("—").classes("tw-meta-v mono")
+                    ui.label("·").classes("tw-sep")
+                    ui.label("实际模型").classes("tw-meta-k")
+                    act_model_label = ui.label("未上报").classes("tw-meta-v mono")
+                    ui.label("·").classes("tw-sep")
+                    tokens_label = ui.label("—").classes("tw-meta-v mono")
+                    ui.label("·").classes("tw-sep")
+                    elapsed_label = ui.label("—").classes("tw-meta-v mono")
+                    ui.label("·").classes("tw-sep")
+                    age_label = ui.label("—").classes("tw-meta-v mono")
+                    ui.space()
+                    ui.label("Ctrl / ⌘ + Enter 运行，回车换行").classes("tw-meta-k")
+
+            # secondary tabs board
+            with ui.element("section").classes("tw-board"):
                 with ui.tabs().classes("w-full tw-tabs") as tabs:
                     tab_steps = ui.tab("steps", label="步骤")
                     tab_board = ui.tab("board", label="任务板")
                     tab_kb = ui.tab("appkb", label="应用库")
                     tab_memory = ui.tab("memory", label="记忆")
                     tab_outputs = ui.tab("outputs", label="产出")
-                ui.separator().style(f"background:{_BORDER}")
-                with ui.tab_panels(tabs, value=tab_steps).classes("w-full"):
+                with ui.tab_panels(tabs, value=tab_steps).classes("w-full tw-panels"):
 
-                    with ui.tab_panel(tab_steps).classes("p-0 pt-3"):
-                        with ui.row().classes(
-                            "w-full items-center justify-between mb-2"
-                        ):
-                            step_count = ui.label("0 步").classes(
-                                "mono text-xs font-bold"
-                            ).style(f"color:{_MUTED}")
-                            usage_total = ui.label("").classes("mono text-xs").style(
-                                f"color:{_MUTED}"
+                    with ui.tab_panel(tab_steps).classes("tw-fill"):
+                        with ui.element("div").classes("tw-toolbar"):
+                            step_count = ui.label("0 步").classes("tw-label")
+                            usage_total = ui.label("").classes("tw-note mono")
+                            ui.space()
+                            usage_bars = ui.element("div").classes(
+                                "flex items-center gap-2 flex-wrap justify-end"
                             )
-                        usage_bars = ui.row().classes(
-                            "w-full gap-2 items-center flex-wrap mb-2"
-                        )
-                        timeline = ui.column().classes(
-                            "tl w-full gap-0 max-h-[52vh] overflow-y-auto pr-1"
-                        )
+                        with ui.element("div").classes("tw-stream") as stream_panel:
+                            with ui.row().classes(
+                                "items-center gap-2 no-wrap w-full"
+                            ):
+                                ui.icon("graphic_eq").style(
+                                    f"color:{_ACCENT}; font-size:15px"
+                                )
+                                ui.label("模型流式输出").classes("tw-label")
+                                stream_chip = ui.label("").classes("tw-chip")
+                                stream_meta = ui.label("").classes(
+                                    "tw-note mono truncate"
+                                )
+                                ui.space()
+                                stream_picks = ui.element("div").classes(
+                                    "flex items-center gap-1"
+                                )
+                            stream_think_label = ui.label("推理（SDK 上报）").classes(
+                                "tw-label"
+                            )
+                            stream_think_label.set_visibility(False)
+                            stream_think = ui.label("").classes("tw-stream-think")
+                            stream_think.set_visibility(False)
+                            stream_text = ui.label("").classes("tw-stream-text")
+                            stream_tail = ui.label("").classes("tw-note")
+                        stream_panel.set_visibility(False)
+                        with ui.element("div").classes("tw-current") as current_step:
+                            current_icon = ui.icon("bolt").classes("tw-current-icon")
+                            current_text = ui.label("—").classes(
+                                "tw-current-text truncate"
+                            )
+                            current_meta = ui.label("").classes("tw-note mono truncate")
+                            current_state = ui.label("").classes("tw-chip")
+                        current_step.set_visibility(False)
+                        with ui.element("div").classes("tw-scroll"):
+                            empty_steps = _empty(
+                                "route",
+                                "还没有执行步骤",
+                                "运行任务后，每一步的意图、工具与真实结果会实时出现在这里；"
+                                "点开任一步可看参数、回执和耗时拆分。",
+                            )
+                            timeline = ui.column().classes("tw-steps")
 
-                    with ui.tab_panel(tab_board).classes("p-0 pt-3"):
-                        board_box = ui.column().classes(
-                            "w-full gap-3 max-h-[52vh] overflow-y-auto pr-1"
-                        )
+                    with ui.tab_panel(tab_board).classes("tw-fill"):
+                        board_box = ui.column().classes("tw-scroll w-full gap-3")
 
-                    with ui.tab_panel(tab_kb).classes("p-0 pt-3"):
-                        with ui.row().classes(
-                            "w-full items-center justify-between mb-2"
-                        ):
-                            kb_count = ui.label("0 条").classes(
-                                "mono text-xs font-bold"
-                            ).style(f"color:{_MUTED}")
+                    with ui.tab_panel(tab_kb).classes("tw-fill"):
+                        with ui.element("div").classes("tw-toolbar"):
+                            kb_count = ui.label("0 条").classes("tw-label")
+                            ui.space()
                             dream_button = ui.button(
                                 "立即整理", icon="auto_fix_high"
-                            ).props("outline dense no-caps")
-                        kb_table = ui.table(
-                            columns=[
-                                {"name": "label", "label": "名称", "field": "label"},
-                                {"name": "package", "label": "包名", "field": "package"},
-                                {"name": "kind", "label": "类型", "field": "kind"},
-                                {
-                                    "name": "success_count",
-                                    "label": "成功",
-                                    "field": "success_count",
-                                },
-                                {"name": "stale", "label": "状态", "field": "stale"},
-                            ],
-                            rows=[],
-                            row_key="package",
-                        ).classes("w-full max-h-[42vh]")
+                            ).props("outline dense no-caps").classes("tw-stop").style(
+                                f"width:auto; padding:0 10px; color:{_MUTED};"
+                                f" border-color:{_LINE_2}"
+                            )
+                        kb_hint = ui.label(
+                            "agent 成功启动过的应用会沉淀在这里；整理只做合并与失效标记。"
+                        ).classes("tw-note")
+                        with ui.element("div").classes("tw-scroll"):
+                            kb_table = ui.table(
+                                columns=[
+                                    {"name": "label", "label": "名称", "field": "label"},
+                                    {"name": "package", "label": "包名", "field": "package"},
+                                    {"name": "kind", "label": "类型", "field": "kind"},
+                                    {
+                                        "name": "success_count",
+                                        "label": "成功",
+                                        "field": "success_count",
+                                    },
+                                    {"name": "stale", "label": "状态", "field": "stale"},
+                                ],
+                                rows=[],
+                                row_key="package",
+                            ).props("flat dense hide-bottom no-data-label=暂无条目").classes("w-full")
 
-                    with ui.tab_panel(tab_memory).classes("p-0 pt-3"):
-                        ui.label("能力状态").classes("section-title")
-                        caps_row = ui.row().classes("w-full gap-2 flex-wrap mt-1 mb-3")
-                        with ui.row().classes("w-full gap-3 flex-wrap"):
-                            stat_eps = _stat_card("任务档案", _ACCENT)
-                            stat_evals = _stat_card("回想评估", "#38bdf8")
-                            stat_hit = _stat_card("Hit@1", "#34d399")
-                            stat_false = _stat_card("污染率", "#fbbf24")
-                        memory_table = ui.table(
-                            columns=[
-                                {"name": "time", "label": "时间", "field": "time"},
-                                {"name": "goal", "label": "任务", "field": "goal"},
-                                {
-                                    "name": "outcome",
-                                    "label": "结果",
-                                    "field": "outcome",
-                                },
-                                {"name": "steps", "label": "步数", "field": "steps"},
-                                {"name": "tokens", "label": "Token", "field": "tokens"},
-                                {
-                                    "name": "verifier",
-                                    "label": "验收",
-                                    "field": "verifier",
-                                },
-                            ],
-                            rows=[],
-                            row_key="time",
-                        ).classes("w-full max-h-[36vh] mt-3")
-                        ui.label(
-                            "回想处于 shadow 模式：只观测不注入；命中率由每次运行的实际行为自动对答案。"
-                        ).classes("text-xs mt-2").style(f"color:{_MUTED}")
-
-                    with ui.tab_panel(tab_outputs).classes("p-0 pt-3"):
-                        with ui.row().classes(
-                            "w-full items-center justify-between mb-2"
-                        ):
-                            outputs_count = ui.label("0 份").classes(
-                                "mono text-xs font-bold"
-                            ).style(f"color:{_MUTED}")
-                            ui.label("agent 产出可写可改；删除只有你能做").classes(
-                                "text-[11px]"
-                            ).style(f"color:{_MUTED}")
-                        outputs_list = ui.column().classes(
-                            "w-full gap-2 max-h-[52vh] overflow-y-auto pr-1"
+                    with ui.tab_panel(tab_memory).classes("tw-fill"):
+                        ui.label("能力状态").classes("tw-label")
+                        caps_row = ui.element("div").classes(
+                            "w-full flex gap-2 flex-wrap mb-1"
                         )
+                        with ui.element("div").classes("tw-stats"):
+                            stat_eps = _stat_inline("任务档案", _ACCENT)
+                            stat_evals = _stat_inline("回想评估", "#818cf8")
+                            stat_hit = _stat_inline("Hit@1", _OK)
+                            stat_false = _stat_inline("污染率", _WARN)
+                            stat_card_sup = _stat_inline("卡片抑制", _WARN)
+                            stat_rule_sup = _stat_inline("规则抑制", _WARN)
+                        rag_mode_label = ui.label("").classes("tw-note")
+                        with ui.element("div").classes("tw-scroll"):
+                            memory_table = ui.table(
+                                columns=[
+                                    {"name": "time", "label": "时间", "field": "time"},
+                                    {"name": "goal", "label": "任务", "field": "goal"},
+                                    {
+                                        "name": "outcome",
+                                        "label": "结果",
+                                        "field": "outcome",
+                                    },
+                                    {"name": "steps", "label": "步数", "field": "steps"},
+                                    {"name": "tokens", "label": "Token", "field": "tokens"},
+                                    {
+                                        "name": "verifier",
+                                        "label": "验收",
+                                        "field": "verifier",
+                                    },
+                                ],
+                                rows=[],
+                                row_key="time",
+                            ).props("flat dense hide-bottom no-data-label=暂无档案").classes("w-full")
+
+                    with ui.tab_panel(tab_outputs).classes("tw-fill"):
+                        with ui.element("div").classes("tw-toolbar"):
+                            outputs_count = ui.label("0 份").classes("tw-label")
+                            ui.space()
+                            ui.label("agent 可写可改；删除只有你能做").classes("tw-note")
+                        with ui.element("div").classes("tw-scroll"):
+                            outputs_list = ui.column().classes("w-full gap-0")
                         with ui.dialog() as preview_dialog, ui.card().classes(
                             "w-[86vw] max-w-5xl p-4"
-                        ).style("background:#10131a; border:1px solid #232838"):
+                        ):
                             with ui.row().classes(
                                 "w-full items-center justify-between mb-2"
                             ):
-                                preview_title = ui.label("").classes(
-                                    "text-sm font-bold"
-                                )
-                                ui.button(icon="close", on_click=preview_dialog.close).props(
-                                    "flat round dense"
-                                )
+                                preview_title = ui.label("").classes("text-sm font-bold")
+                                ui.button(
+                                    icon="close", on_click=preview_dialog.close
+                                ).props("flat round dense")
                             preview_frame = ui.element("iframe").classes(
                                 "w-full rounded-lg"
                             ).props("sandbox").style(
-                                "height:72vh; border:1px solid #232838; background:#fff"
+                                f"height:72vh; border:1px solid {_LINE}; background:#fff"
                             )
-                        with ui.dialog() as delete_dialog, ui.card().classes(
-                            "p-4"
-                        ).style("background:#10131a; border:1px solid #232838"):
+                        with ui.dialog() as delete_dialog, ui.card().classes("p-4"):
                             delete_hint = ui.label("").classes("text-sm mb-3")
                             with ui.row().classes("gap-2 justify-end w-full"):
                                 ui.button("取消", on_click=delete_dialog.close).props(
@@ -684,32 +1097,23 @@ def create_ui(
                                     "unelevated no-caps dense color=negative"
                                 )
 
-        # HITL banner
-        with ui.element("div").classes("hitl w-full p-4") as hitl_panel:
-            with ui.row().classes("items-center gap-2 mb-2"):
-                ui.icon("front_hand", color="warning").style("font-size:20px")
-                ui.label("需要人工决定").classes("text-base font-bold")
-            hitl_prompt = ui.label().classes("text-sm whitespace-pre-wrap")
-            with ui.row().classes("w-full gap-2 mt-3 items-center"):
-                hitl_answer = (
-                    ui.input(placeholder="也可以输入文本回答")
-                    .props("outlined dense clearable dark")
-                    .classes("grow tw-cmd")
-                )
-                approve_button = ui.button("同意", icon="check").props(
-                    "unelevated no-caps color=positive"
-                )
-                reject_button = ui.button("拒绝", icon="close").props(
-                    "flat no-caps text-negative"
-                )
-                answer_button = ui.button("提交", icon="send").props(
-                    "outline no-caps"
-                )
-        hitl_panel.set_visibility(False)
-
-    last_signature: tuple[Any, ...] | None = None
-    selected: dict[str, Any] = {"seq": None, "pinned": False}
+    # --- mutable view state ----------------------------------------------
+    ui_state: dict[str, Any] = {"sig": None}
+    selected: dict[str, Any] = {"key": None, "pinned": False}
     last_run_id: dict[str, Any] = {"id": None}
+    clock_state: dict[str, Any] = {
+        "started_at": None,
+        "last_event_ts": None,
+        "active": False,
+    }
+    step_rows: dict[int, dict[str, Any]] = {}
+    step_choice: dict[int, bool] = {}
+    stream_view: dict[str, Any] = {
+        "attempt": None,
+        "follow": True,
+        "sig": None,
+        "shown": False,
+    }
 
     # --- actions ---------------------------------------------------------
     def submit_hitl(answer: str) -> None:
@@ -723,6 +1127,9 @@ def create_ui(
     approve_button.on("click", lambda: submit_hitl("approve"))
     reject_button.on("click", lambda: submit_hitl("reject"))
     answer_button.on("click", lambda: submit_hitl(str(hitl_answer.value or "")))
+    hitl_answer.on(
+        "keydown.enter", lambda: submit_hitl(str(hitl_answer.value or ""))
+    )
 
     def start_run() -> None:
         try:
@@ -732,11 +1139,13 @@ def create_ui(
             ui.notify(str(exc), type="warning")
 
     start_button.on("click", start_run)
-    task_input.on("keydown.enter", start_run)
+    # Ctrl/Cmd+Enter runs; a bare Enter keeps inserting newlines (multi-line safe).
+    task_input.on("keydown.enter.ctrl", start_run)
+    task_input.on("keydown.enter.meta", start_run)
 
     def stop_run() -> None:
         if bridge.request_stop():
-            ui.notify("已请求停止（当前步完成后收尾）", type="warning")
+            ui.notify("已请求停止（等待当前调用/步骤返回后收尾）", type="warning")
         else:
             ui.notify("当前没有可停止的运行", type="warning")
 
@@ -748,108 +1157,305 @@ def create_ui(
 
     dream_button.on("click", run_dream)
 
+    def pin_frame(key: str) -> None:
+        selected.update(key=key, pinned=True)
+        render()
+
+    def toggle_pin(key: str) -> None:
+        """Thumbnail click: pin the frame, or release it back to latest."""
+
+        _pin_toggle(selected, key)
+        render()
+
+    def _release_pin() -> None:
+        selected.update(key=None, pinned=False)
+        render()
+
     # --- renderers -------------------------------------------------------
-    def _render_steps(steps: list[dict[str, Any]]) -> None:
+    def _reset_steps() -> None:
+        step_rows.clear()
+        step_choice.clear()
         timeline.clear()
-        with timeline:
-            if not steps:
-                with ui.element("div").classes("empty"):
-                    ui.icon("route").style("font-size:30px")
-                    ui.label("尚无执行步骤").classes("text-xs")
-                return
-            for step in steps:
-                status_key = step["status"]
-                _, color = _STEP_META.get(status_key, ("", _MUTED))
-                is_closing = not step.get("tool") and not step.get("result")
-                icon = _TOOL_ICON.get(step.get("tool", ""), "bolt")
-                if is_closing:
-                    head_text = f"#{step['step']} 模型收尾"
-                    icon = "check_circle"
-                    status_key = "success"
-                else:
-                    head_text = _display(step["intent"], "（未声明意图）")
-                with ui.element("div").classes("tl-item w-full").props(
+        stream_view.update(attempt=None, follow=True, sig=None, shown=False)
+        stream_panel.set_visibility(False)
+        stream_text.set_text("")
+        stream_think.set_text("")
+        stream_think.set_visibility(False)
+        stream_think_label.set_visibility(False)
+        stream_tail.set_text("")
+        stream_picks.clear()
+
+    def _render_step_body(body: ui.element, step: dict, is_closing: bool, color: str) -> None:
+        body.clear()
+        with body:
+            badge_text = "收尾" if is_closing else _STEP_META.get(step["status"], ("",))[0]
+            with ui.row().classes("items-center gap-2 flex-wrap"):
+                if badge_text:
+                    cls = "tw-chip"
+                    if step["status"] == "error":
+                        cls = "tw-chip bad"
+                    elif step["status"] == "warning":
+                        cls = "tw-chip warn"
+                    elif step["status"] == "success":
+                        cls = "tw-chip ok"
+                    ui.label(badge_text).classes(cls)
+                if step.get("screen_seq") is not None:
+                    ui.button(
+                        "查看该步画面",
+                        icon="image",
+                        on_click=lambda _e, s=step["screen_seq"]: pin_frame(f"seq:{s}"),
+                    ).props("flat dense no-caps size=sm").classes("tw-link")
+            if step.get("args"):
+                ui.label("参数").classes("tw-label")
+                ui.label(str(step["args"])).classes("tw-pre")
+            if step.get("result"):
+                ui.label("结果").classes("tw-label")
+                ui.label(str(step["result"])).classes("tw-result")
+            elif step["status"] == "running":
+                ui.label("等待工具返回…").classes("tw-result tw-dim")
+            else:
+                ui.label("没有结果回执").classes("tw-result tw-dim")
+            model_lat = int(step.get("model_latency_ms", 0) or 0)
+            tool_lat = int(step.get("tool_latency_ms", 0) or 0)
+            total = model_lat + tool_lat
+            if total:
+                with ui.element("div").classes("tw-latbar"):
+                    ui.element("div").style(
+                        f"width:{model_lat / total * 100:.0f}%; background:{_ACCENT}"
+                    )
+                ui.label(
+                    f"模型调用 {model_lat}ms · 工具 {tool_lat}ms（端到端，含网络）"
+                ).classes("tw-note mono")
+
+    def _sync_step_row(step: dict) -> None:
+        """Create or update one step row in place (keeps scroll and expansion)."""
+
+        number = int(step["step"])
+        is_closing = not step.get("tool") and not step.get("result")
+        status_key = "success" if is_closing else step["status"]
+        color = _STEP_META.get(status_key, ("", _MUTED))[1]
+        icon = "check_circle" if is_closing else _TOOL_ICON.get(step.get("tool", ""), "bolt")
+        title = "模型收尾" if is_closing else _display(step["intent"], "（未声明意图）")
+        lat = int(step.get("model_latency_ms", 0) or 0) + int(
+            step.get("tool_latency_ms", 0) or 0
+        )
+        sig = (
+            status_key,
+            title,
+            step.get("tool", ""),
+            step.get("target", ""),
+            step.get("result", ""),
+            step.get("args"),
+            lat,
+            step.get("screen_seq"),
+        )
+
+        refs = step_rows.get(number)
+        if refs is None:
+            with timeline:
+                row = ui.element("div").classes("tw-step").props(
                     f'data-st="{status_key}"'
-                ):
-                    with ui.element("div").classes("tl-node"):
-                        ui.icon(icon).style(f"font-size:17px; color:{color}")
-                    with ui.expansion().classes("tl-card w-full").props("dense") as ex:
-                        with ex.add_slot("header"):
-                            with ui.row().classes(
-                                "w-full items-center gap-2 no-wrap"
-                            ):
-                                ui.label(f"#{step['step']}").classes(
-                                    "mono text-[11px]"
-                                ).style(f"color:{_MUTED}")
-                                ui.label(head_text).classes(
-                                    "text-[13.5px] font-semibold ellipsis"
-                                ).style("max-width:46%")
-                                if step.get("tool"):
-                                    ui.label(step["tool"]).classes("chip mono")
-                                if step.get("target"):
-                                    ui.label(
-                                        str(step["target"])[:26]
-                                    ).classes("chip grey mono ellipsis")
-                                ui.space()
-                                lat_total = step.get("model_latency_ms", 0) + step.get(
-                                    "tool_latency_ms", 0
-                                )
-                                if lat_total:
-                                    ui.label(f"{lat_total / 1000:.1f}s").classes(
-                                        "mono text-[11px]"
-                                    ).style(f"color:{_MUTED}")
-                        with ui.column().classes("gap-2 px-4 py-3"):
-                            badge_text = (
-                                "收尾"
-                                if is_closing
-                                else _STEP_META.get(step["status"], ("",))[0]
+                )
+                with row:
+                    ex = ui.expansion(
+                        value=step_choice.get(number, status_key == "running")
+                    )
+                    ex.classes("w-full")
+                    ex.on_value_change(
+                        lambda e, n=number: step_choice.__setitem__(n, bool(e.value))
+                    )
+                    with ex.add_slot("header"):
+                        with ui.row().classes(
+                            "w-full items-center gap-2 no-wrap py-2 px-3"
+                        ):
+                            icon_label = ui.icon(icon).style(
+                                f"color:{color}; font-size:17px"
                             )
-                            if badge_text:
-                                ui.label(badge_text).classes("chip").style(
-                                    f"color:{color}; border-color:{color}55;"
-                                    f" background:{color}18"
-                                )
-                            if step.get("args"):
-                                ui.label("参数").classes("section-title")
-                                ui.label(str(step["args"])).classes(
-                                    "mono text-[11.5px] step-detail"
-                                ).style(f"color:{_MUTED}")
-                            if step.get("result"):
-                                ui.label("结果").classes("section-title")
-                                ui.label(str(step["result"])).classes(
-                                    "text-[13px] step-detail"
-                                )
-                            model_lat = step.get("model_latency_ms", 0)
-                            tool_lat = step.get("tool_latency_ms", 0)
-                            total = model_lat + tool_lat
-                            if total:
-                                with ui.element("div").classes("latbar w-full"):
-                                    ui.element("div").style(
-                                        f"width:{model_lat / total * 100:.0f}%;"
-                                        f" background:{_ACCENT}"
-                                    )
-                                ui.label(
-                                    f"模型 {model_lat}ms · 工具 {tool_lat}ms"
-                                ).classes("mono text-[10.5px]").style(
-                                    f"color:{_MUTED}"
-                                )
-                    if step["status"] == "running" and not is_closing:
-                        ex.set_value(True)
-                    if step.get("screen_seq") is not None:
-                        ex.on(
-                            "click",
-                            lambda _e, s=step["screen_seq"]: _pin_toggle(selected, s),
-                        )
+                            ui.label(f"#{number}").classes("tw-step-num")
+                            title_label = ui.label(title).classes(
+                                "tw-step-title truncate grow"
+                            )
+                            target_label = ui.label("").classes("tw-chip grey mono")
+                            tool_label = ui.label("").classes("tw-chip mono")
+                            lat_label = ui.label("").classes("tw-step-lat")
+                    body = ui.element("div").classes("tw-step-body")
+            refs = {
+                "row": row,
+                "ex": ex,
+                "icon": icon_label,
+                "title": title_label,
+                "target": target_label,
+                "tool": tool_label,
+                "lat": lat_label,
+                "body": body,
+                "sig": None,
+            }
+            step_rows[number] = refs
+
+        if refs["sig"] == sig:
+            return
+        refs["sig"] = sig
+        refs["row"].props(f'data-st="{status_key}"')
+        refs["icon"].set_name(icon)
+        refs["icon"].style(f"color:{color}; font-size:17px")
+        refs["title"].set_text(title)
+        tool = str(step.get("tool") or "")
+        refs["tool"].set_text(tool or "—")
+        refs["tool"].set_visibility(bool(tool))
+        target = str(step.get("target") or "")
+        refs["target"].set_text(target[:28] + ("…" if len(target) > 28 else ""))
+        refs["target"].set_visibility(bool(target))
+        refs["lat"].set_text(f"{lat / 1000:.1f}s" if lat else "")
+        _render_step_body(refs["body"], step, is_closing, color)
+        if status_key == "running":
+            refs["ex"].value = step_choice.get(number, True)
+
+    def _render_current_step(steps: list[dict[str, Any]]) -> None:
+        """Keep the in-flight step visible above the (scrolling) history."""
+
+        running = next(
+            (
+                step
+                for step in reversed(steps)
+                if step["status"] == "running"
+                and (step.get("tool") or step.get("result"))
+            ),
+            None,
+        )
+        if running is None:
+            current_step.set_visibility(False)
+            return
+        tool = str(running.get("tool") or "")
+        target = str(running.get("target") or "")
+        current_icon.set_name(_TOOL_ICON.get(tool, "bolt"))
+        current_text.set_text(
+            f"#{running['step']} " + _display(running["intent"], "（当前步骤未声明意图）")
+        )
+        current_meta.set_text(" · ".join(part for part in (tool, target[:30]) if part))
+        current_state.set_text("执行中")
+        current_step.set_visibility(True)
+
+    def _pick_stream_attempt(number: int) -> None:
+        """Pin one streamed attempt for the live panel (keeps history)."""
+
+        stream_view.update(attempt=int(number), follow=False, sig=None)
+        render()
+
+    def _follow_stream_latest() -> None:
+        """Resume following the newest streamed attempt."""
+
+        stream_view.update(follow=True, sig=None)
+        render()
+
+    def _render_stream(attempts: list[dict[str, Any]]) -> None:
+        """Lightweight incremental model-text view (per attempt, observe-only).
+
+        Follows the newest attempt by default; clicking a history chip pins it
+        until "回到最新".  Each attempt keeps its own text: a failed partial
+        answer is labeled ``中断`` and never merged with the attempt that
+        replaced it. Only provider-reported reasoning is shown.
+        """
+
+        if not attempts:
+            if stream_view["sig"] is not None or stream_view["shown"]:
+                stream_view.update(sig=None, attempt=None, shown=False)
+                stream_panel.set_visibility(False)
+            return
+        numbers = [int(item["attempt"]) for item in attempts]
+        record, stream_view["attempt"] = _stream_selection(
+            attempts, attempt=stream_view["attempt"], follow=stream_view["follow"]
+        )
+        if record is None:
+            stream_panel.set_visibility(False)
+            return
+        signature = (
+            tuple(
+                (
+                    item["attempt"],
+                    item["status"],
+                    item.get("revision"),
+                    item.get("chars_total"),
+                    item.get("reasoning_total"),
+                    item.get("text_truncated"),
+                    item.get("reasoning_truncated"),
+                    item["error"],
+                )
+                for item in attempts
+            ),
+            stream_view["attempt"],
+            stream_view["follow"],
+        )
+        if stream_view["sig"] == signature:
+            return
+        stream_view["sig"] = signature
+        stream_view["shown"] = True
+        stream_panel.set_visibility(True)
+
+        label, chip_cls = _STREAM_STATUS.get(record["status"], ("—", "grey"))
+        stream_chip.set_text(label)
+        stream_chip.classes(f"tw-chip {chip_cls}", remove="grey ok bad")
+        text = str(record.get("text") or "")
+        reasoning = str(record.get("reasoning") or "")
+        chars_total = int(record.get("chars_total") or len(text))
+        step_part = f"第 {record['step']} 步 · " if record.get("step") else ""
+        stream_meta.set_text(f"尝试 {record['attempt']} · {step_part}{chars_total} 字")
+        stream_picks.clear()
+        with stream_picks:
+            if not stream_view["follow"]:
+                ui.button(
+                    "回到最新",
+                    icon="south",
+                    on_click=lambda _e: _follow_stream_latest(),
+                ).props("flat dense no-caps size=sm").classes("tw-link")
+            for number in numbers:
+                picked = number == record["attempt"]
+                ui.button(
+                    f"#{number}",
+                    on_click=lambda _e, n=number: _pick_stream_attempt(n),
+                ).props("flat dense no-caps size=sm").classes(
+                    "tw-label" if picked else "tw-link"
+                )
+        if reasoning:
+            stream_think_label.set_visibility(True)
+            stream_think.set_visibility(True)
+            stream_think.set_text(_stream_tail(reasoning))
+        else:
+            stream_think_label.set_visibility(False)
+            stream_think.set_visibility(False)
+        stream_text.set_text(_stream_tail(text) or "（本次尝试没有可展示的正文）")
+        notes: list[str] = []
+        if record["status"] == "streaming":
+            notes.append("接收中，完成后仍会保留完整消息与工具调用")
+        if record["status"] == "failed":
+            notes.append(
+                f"该次尝试未完成（{_display(record.get('error'), '未上报')}）；"
+                "以上是已收到的部分文本，后续尝试单独呈现"
+            )
+        if record.get("text_truncated"):
+            notes.append(f"仅显示末尾 {_STREAM_TAIL_CHARS} 字（已接收 {chars_total} 字）")
+        if record.get("reasoning_truncated"):
+            notes.append("推理文本同样只显示末尾")
+        stream_tail.set_text(" · ".join(notes))
+
+    def _render_steps(steps: list[dict[str, Any]]) -> None:
+        live = {int(step["step"]) for step in steps}
+        for number in [n for n in step_rows if n not in live]:
+            refs = step_rows.pop(number)
+            refs["row"].delete()
+        for step in steps:
+            _sync_step_row(step)
+        empty_steps.set_visibility(not steps)
+        _render_current_step(steps)
 
     _BOARD_STATUS_ICON = {
-        "completed": ("check_circle", "#34d399"),
+        "completed": ("check_circle", _OK),
         "in_progress": ("radio_button_checked", _ACCENT),
-        "pending": ("radio_button_unchecked", "#64748b"),
-        "blocked": ("block", "#f87171"),
+        "pending": ("radio_button_unchecked", _MUTED),
+        "blocked": ("block", _BAD),
     }
 
     def _render_board(text: str) -> None:
-        """任务板：结构化渲染 TaskDoc——目标卡 + 路线检查单 + 紧凑流程线。"""
+        """任务板：结构化渲染 TaskDoc——目标 + 路线检查单 + 紧凑流程线。"""
 
         board_box.clear()
         parsed = _parse_board(text)
@@ -857,42 +1463,40 @@ def create_ui(
             if not any(
                 [parsed["goal"], parsed["amendments"], parsed["items"], parsed["flow"]]
             ):
-                with ui.element("div").classes("empty"):
-                    ui.icon("assignment").style("font-size:30px")
-                    ui.label("等待任务板…").classes("text-xs")
+                _empty(
+                    "assignment",
+                    "任务板还没有内容",
+                    "agent 写入 TaskDoc 后，这里显示目标、路线检查单与流程线。",
+                )
                 return
             if parsed["goal"] or parsed["amendments"]:
-                ui.label("目标").classes("section-title")
-                with ui.element("div").classes("board-goal w-full"):
+                ui.label("目标").classes("tw-label")
+                with ui.element("div").classes("tw-board-goal w-full"):
                     if parsed["goal"]:
-                        ui.label(parsed["goal"]).classes("text-[14px] font-semibold")
+                        ui.label(parsed["goal"]).classes("text-[13.5px] font-semibold")
                     for amendment in parsed["amendments"]:
                         ui.label(f"· {amendment}").classes("text-xs mt-1").style(
                             f"color:{_MUTED}"
                         )
             if parsed["items"]:
-                ui.label("路线").classes("section-title")
+                ui.label("路线").classes("tw-label")
                 with ui.column().classes("w-full gap-0"):
                     for item in parsed["items"]:
                         icon, color = _BOARD_STATUS_ICON.get(
-                            item["status"], ("radio_button_unchecked", "#64748b")
+                            item["status"], ("radio_button_unchecked", _MUTED)
                         )
-                        with ui.row().classes("board-item w-full no-wrap"):
+                        with ui.row().classes("tw-board-item w-full no-wrap"):
                             ui.icon(icon).style(f"font-size:17px; color:{color}")
-                            ui.label(item["id"]).classes("mono text-[11px]").style(
-                                f"color:{_MUTED}; min-width:18px"
-                            )
+                            ui.label(item["id"]).classes("tw-step-num")
                             with ui.column().classes("gap-0 grow"):
                                 ui.label(item["content"]).classes("text-[13px]")
                                 if item["note"]:
-                                    ui.label(item["note"]).classes(
-                                        "text-[11.5px]"
-                                    ).style(f"color:{_MUTED}")
+                                    ui.label(item["note"]).classes("tw-note")
             if parsed["flow"]:
-                ui.label("流程线").classes("section-title mt-1")
+                ui.label("流程线").classes("tw-label mt-1")
                 with ui.column().classes("w-full gap-0"):
                     for line in parsed["flow"]:
-                        ui.label(line).classes("board-flow")
+                        ui.label(line).classes("tw-board-flow")
             if parsed["raw"]:
                 ui.label(parsed["raw"]).classes(
                     "text-xs whitespace-pre-wrap"
@@ -913,24 +1517,23 @@ def create_ui(
         kb_table.rows = rows
         kb_table.update()
         kb_count.set_text(f"{len(rows)} 条")
+        kb_hint.set_visibility(not rows)
 
     def _render_caps(caps: list[dict[str, Any]]) -> None:
         caps_row.clear()
         with caps_row:
             if not caps:
-                ui.label("首次运行后显示能力状态").classes("text-xs").style(
-                    f"color:{_MUTED}"
-                )
+                ui.label("首次运行后显示能力状态").classes("tw-note")
                 return
             for cap in caps:
                 state_key = str(cap.get("state", ""))
-                color, text = _CAP_STATE_STYLE.get(state_key, ("#64748b", state_key))
+                color, text = _CAP_STATE_STYLE.get(state_key, (_MUTED, state_key))
                 missing = cap.get("missing_deps") or []
                 label = f"{cap.get('title', cap.get('cap_id'))} · {text}"
                 if missing:
                     label += f"（缺 {', '.join(missing)}）"
-                with ui.element("span").classes("chip grey"):
-                    ui.element("span").classes("tw-dot").style(
+                with ui.element("span").classes("tw-chip grey"):
+                    ui.element("span").style(
                         f"background:{color}; color:{color}"
                     ).classes("tw-dot" + (" live" if state_key == "shadow" else ""))
                     ui.label(label)
@@ -952,6 +1555,8 @@ def create_ui(
         stat_false.set_text(
             f"{contaminated / evaluations:.0%}" if evaluations else "—"
         )
+        stat_card_sup.set_text(str(int(stats.get("procedure_suppressed", 0) or 0)))
+        stat_rule_sup.set_text(str(int(stats.get("rule_suppressed", 0) or 0)))
         episodes = snapshot.get("episodes") or []
         stat_eps.set_text(str(len(episodes)))
         rows = []
@@ -976,6 +1581,13 @@ def create_ui(
             )
         memory_table.rows = rows
         memory_table.update()
+        # Mode text reflects the actual configured RAG mode, not a hardcoded label.
+        mode = str(getattr(config, "memory_rag", "shadow"))
+        rag_mode_label.set_text(
+            "回想模式 "
+            + _RAG_MODE_TEXT.get(mode, mode)
+            + "。抑制计数=授权复检拒绝下发的卡片/规则数，仅记 id 与原因，不含经验正文。"
+        )
 
     outputs_sig: list[tuple] = [()]
 
@@ -992,24 +1604,23 @@ def create_ui(
         outputs_list.clear()
         if not items:
             with outputs_list:
-                ui.label("还没有产出 — 任务要求攻略/计划/报告时 agent 会在这里生成").classes(
-                    "text-xs"
-                ).style(f"color:{_MUTED}")
+                _empty(
+                    "description",
+                    "还没有产出",
+                    "当任务要求攻略、计划或报告时，agent 会把 HTML 产物写到这里，"
+                    "可沙箱预览、打开或删除。",
+                )
             return
         for item in items:
             rid = item["run_id"]
-            with outputs_list, ui.element("div").classes(
-                "w-full flex items-center gap-3 p-3 rounded-xl"
-            ).style("background:#10131a; border:1px solid #232838"):
-                ui.icon("description").style("color:#38bdf8; font-size:20px")
+            with outputs_list, ui.element("div").classes("tw-out w-full"):
+                ui.icon("description").style(f"color:{_ACCENT}; font-size:19px")
                 with ui.column().classes("gap-0 grow min-w-0"):
-                    ui.label(item["title"] or rid).classes(
-                        "text-sm font-bold truncate"
-                    )
+                    ui.label(item["title"] or rid).classes("text-[13.5px] font-bold truncate")
                     ui.label(
                         f"{time.strftime('%m-%d %H:%M', time.localtime(item['mtime']))}"
                         f" · {item['size'] / 1024:.1f} KB · {rid[:8]}"
-                    ).classes("mono text-[10.5px]").style(f"color:{_MUTED}")
+                    ).classes("tw-note mono")
 
                 def _preview(_e, rid=rid, title=item["title"]):
                     preview_title.set_text(title or rid)
@@ -1033,24 +1644,51 @@ def create_ui(
 
                 ui.button("预览", icon="visibility", on_click=_preview).props(
                     "flat dense no-caps"
-                )
+                ).classes("tw-link")
                 ui.button(
                     "打开",
                     icon="open_in_new",
                     on_click=lambda _e, rid=rid: ui.navigate.to(
                         f"/deliverables/{rid}", new_tab=True
                     ),
-                ).props("flat dense no-caps")
+                ).props("flat dense no-caps").classes("tw-link")
                 ui.button("删除", icon="delete", on_click=_delete).props(
                     "flat dense no-caps"
-                ).style("color:#f87171")
+                ).style(f"color:{_BAD}; font-size:11.5px")
+
+    def _tick_clock() -> None:
+        """Update time-derived labels every second, independent of new events.
+
+        A long stall must still visibly age — the elapsed and last-event
+        counters advance here so the operator can tell the run is waiting, not
+        dead, even when no new event arrives.
+        """
+
+        if not clock_state["active"]:
+            return
+        started = clock_state["started_at"]
+        if started:
+            elapsed_label.set_text(f"已持续 {_duration_fmt(time.time() - started)}")
+        last_ts = clock_state["last_event_ts"]
+        age_label.set_text(
+            f"最近事件 {_age_fmt(time.time() - last_ts)}" if last_ts else "最近事件 —"
+        )
 
     def render() -> None:
-        nonlocal last_signature
         state = bridge.snapshot()
         result = state["final_result"] or {}
+
+        # Clock inputs are refreshed every render so _tick_clock has current data.
+        clock_state["started_at"] = state.get("started_at")
+        clock_state["last_event_ts"] = state.get("last_event_ts")
+        status = state["status"]
+        active = status in {"starting", "running", "waiting_hitl"}
+        clock_state["active"] = active
+
         signature = (
-            state["status"],
+            status,
+            state.get("activity"),
+            state.get("stop_requested"),
             state["screen_seq"],
             len(state["steps"]),
             tuple(
@@ -1068,86 +1706,164 @@ def create_ui(
                 for step in state["steps"]
             ),
             state["current_app"],
-            len(state["screens"]),
+            tuple(_frame_key(frame) for frame in state["screens"]),
+            selected["key"],
+            selected["pinned"],
             state["task_board"],
             state["pending_hitl_prompt"],
             state["tokens"],
             tuple(sorted((state["usage"] or {}).items())),
             result.get("reason"),
+            state.get("requested_model"),
+            state.get("actual_model"),
+            tuple(
+                (
+                    item.get("attempt"),
+                    item.get("status"),
+                    item.get("revision"),
+                    item.get("chars_total"),
+                    item.get("reasoning_total"),
+                    item.get("text_truncated"),
+                    item.get("reasoning_truncated"),
+                    item.get("error"),
+                )
+                for item in (state.get("stream_attempts") or [])
+            ),
+            stream_view["attempt"],
+            stream_view["follow"],
+            state.get("run_id"),
             tuple(
                 (cap.get("cap_id"), cap.get("state"))
                 for cap in (state.get("capabilities") or [])
             ),
         )
-        if signature == last_signature:
+        if signature == ui_state["sig"]:
             return
-        last_signature = signature
+        ui_state["sig"] = signature
 
-        status = state["status"]
-        text, color, live = _STATUS_META.get(status, (status, "#64748b", False))
+        # --- status pill + "what are we waiting on" -----------------------
+        activity = str(state.get("activity") or "")
+        if active and activity in _ACTIVITY_META:
+            text, color, live, hint = _ACTIVITY_META[activity]
+        elif active:
+            text, color, live, hint = ("运行中", _ACCENT, True, "")
+        else:
+            text, color, live = _STATUS_META.get(status, (status, _MUTED, False))
+            hint = ""
         status_text.set_text(text)
-        status_dot.style(f"background:{color}; color:{color}")
+        status_dot.style(f"background:{color}")
         status_dot.classes("tw-dot" + (" live" if live else ""), remove="tw-dot")
-        status_pill.style(f"border-color:{color}44")
-        running = status in {"starting", "running", "waiting_hitl"}
-        start_button.set_enabled(not running)
-        stop_button.set_enabled(bool(running))
+        status_pill.style(f"border-color:{color}55")
+        activity_hint.set_text(hint)
+
+        start_button.set_enabled(not active)
+        stop_button.set_enabled(bool(active))
         step_count.set_text(f"{len(state['steps'])} 步")
+
+        # --- run metadata (one compact line) ------------------------------
+        run_id = state.get("run_id")
+        run_id_label.set_text(run_id[:12] if run_id else "—")
+        # Requested vs actual model. Actual is only ever what the provider
+        # reported; with no such evidence we show 未上报 and never substitute
+        # the requested (or a configured fallback) as if it were used.
+        req_model = state.get("requested_model")
+        req_model_label.set_text(_display(req_model))
+        act_model = state.get("actual_model")
+        if act_model:
+            act_model_label.set_text(str(act_model))
+            act_model_label.style(f"color:{_TEXT}")
+        else:
+            act_model_label.set_text("未上报")
+            act_model_label.style(f"color:{_MUTED}")
+        tokens_label.set_text(f"{_tokens_fmt(state['tokens'])} tokens")
+        _tick_clock()
 
         usage = state["usage"] or {}
         total_usage = sum(usage.values())
         usage_total.set_text(f"共 {_tokens_fmt(total_usage)}" if usage else "")
-        tokens_chip.set_text(f"⏱ {_tokens_fmt(state['tokens'])} tokens")
         usage_bars.clear()
-        if usage:
+        if usage and total_usage:
             with usage_bars:
-                for role, tokens in sorted(
-                    usage.items(), key=lambda pair: -pair[1]
-                ):
-                    ui.label(_USAGE_ROLE_TEXT.get(role, role)).classes(
-                        "chip grey"
-                    ).style("font-size:10.5px; padding:1px 7px")
-                    with ui.element("div").classes("latbar").style("width:64px"):
-                        ui.element("div").style(
-                            f"width:{tokens / total_usage * 100:.0f}%;"
-                            f" background:{_ACCENT}"
-                        )
-                    ui.label(_tokens_fmt(tokens)).classes("mono text-[10.5px]").style(
-                        f"color:{_MUTED}"
-                    )
+                for role, tokens in sorted(usage.items(), key=lambda pair: -pair[1]):
+                    ui.label(_USAGE_ROLE_TEXT.get(role, role)).classes("tw-chip grey")
+                    ui.label(_tokens_fmt(tokens)).classes("tw-note mono")
 
         # --- device frame + filmstrip ------------------------------------
         screens = state["screens"]
-        latest = screens[-1] if screens else None
         if state["run_id"] != last_run_id["id"]:
             last_run_id["id"] = state["run_id"]
-            selected["seq"] = None
+            selected["key"] = None
             selected["pinned"] = False
+            _reset_steps()
         shown = _choose_frame(screens, selected)
-        if shown and shown.get("image"):
+        is_reference = bool(shown and shown.get("reference"))
+        has_shot = bool(shown and shown.get("image"))
+        screen_box.set_visibility(has_shot)
+        no_screen.set_visibility(not has_shot)
+        if has_shot:
             screen_image.props(f'src="{shown["image"]}"')
-            phone_frame.set_visibility(True)
-            no_screen.set_visibility(False)
-        else:
-            phone_frame.set_visibility(False)
-            no_screen.set_visibility(True)
-        screen_meta.set_text(
-            f"{_display(state['current_app'])} · #{_display(state['screen_seq'])}"
-            + (" · 已钉住历史帧" if selected["pinned"] and shown is not latest else "")
+            if is_reference:
+                screen_box.classes("is-ref")
+            else:
+                screen_box.classes(remove="is-ref")
+
+        latest = screens[-1] if screens else None
+        pinned_history = (
+            selected["pinned"] and shown is not None and shown is not latest
         )
+        if not has_shot:
+            screen_meta.set_text("—")
+        elif pinned_history:
+            screen_meta.set_text(
+                f"{_display(shown.get('app'))} · "
+                + (
+                    f"参考帧 {_display(shown.get('screen_ref'))}"
+                    if is_reference
+                    else f"#{_display(shown.get('seq'))}"
+                )
+            )
+        elif is_reference:
+            screen_meta.set_text(
+                f"{_display(shown.get('app'))} · 参考帧 {_display(shown.get('screen_ref'))}"
+            )
+        else:
+            screen_meta.set_text(
+                f"{_display(state['current_app'])} · #{_display(state['screen_seq'])}"
+            )
+        if pinned_history:
+            pin_chip.set_text("已钉住")
+            pin_chip.classes("tw-chip", remove="grey")
+        elif is_reference:
+            pin_chip.set_text("参考帧未验证")
+            pin_chip.classes("tw-chip warn", remove="grey")
+        else:
+            pin_chip.set_text("跟随最新")
+            pin_chip.classes("tw-chip grey", remove="warn")
+        back_live.set_visibility(pinned_history)
+
+        reference_tag.clear()
+        if is_reference:
+            with reference_tag:
+                with ui.row().classes("items-center gap-2"):
+                    ui.label(
+                        "参考图：当前未验证（无 screen_seq，不代表新观测）"
+                    ).classes("tw-chip warn")
 
         thumbs.clear()
         with thumbs:
-            for item in screens[-12:]:
-                seq = item.get("seq")
-                cls = "thumb w-14"
-                if selected["pinned"] and seq == selected["seq"]:
+            for item in screens[-14:]:
+                key = _frame_key(item)
+                cls = "tw-thumb"
+                if item.get("reference"):
+                    cls += " is-ref"
+                if selected["pinned"] and key == selected["key"]:
                     cls += " sel"
-                ui.image(item["image"]).classes(cls).props("fit=contain").on(
-                    "click", lambda _e, s=seq: _pin_toggle(selected, s)
+                ui.image(item["image"]).classes(cls).props("fit=cover").on(
+                    "click", lambda _e, k=key: toggle_pin(k)
                 )
 
         _render_steps(state["steps"])
+        _render_stream(state.get("stream_attempts") or [])
         _render_board(state["task_board"] or "")
 
         prompt = state["pending_hitl_prompt"]
@@ -1157,6 +1873,7 @@ def create_ui(
         _render_caps(state.get("capabilities") or [])
 
     ui.timer(refresh_seconds, render)
+    ui.timer(1.0, _tick_clock)
     ui.timer(2.0, _render_kb)
     ui.timer(2.0, _render_memory)
     ui.timer(2.0, _render_outputs)

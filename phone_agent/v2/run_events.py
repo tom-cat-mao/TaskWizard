@@ -20,20 +20,13 @@ from langchain.agents.middleware.types import hook_config
 from phone_agent.v2.agent import RunResult
 from phone_agent.v2.middleware._redact import redact_text
 from phone_agent.v2.middleware._tokens import estimate_message_tokens, usage_tokens
+from phone_agent.v2.middleware.streaming import (
+    ModelStreamObserver,
+    model_with_stream_observer,
+)
 from phone_agent.v2.middleware.trace import redact_args
 
 OBS_RE = re.compile(r"\[OBS\]\s+app=(?P<app>.*?)\s+screen#(?P<seq>\d+)")
-_FAIL_PREFIXES = (
-    "error:",
-    "错误",
-    "失败",
-    "denied:",
-    "未定位",
-    "定位失败",
-    "未写入（输入无效）",
-    "未写入（校验失败）",
-    "⚠️ 已拦截（未执行）",
-)
 _SAFETY_MARKERS = ("⚠️ 已拦截（未执行）", "confirm_irreversible=true")
 
 
@@ -79,16 +72,44 @@ def _response_message(response: Any) -> Any | None:
     return messages[-1] if messages and messages[-1] is not None else None
 
 
+def _requested_model(request: Any) -> str | None:
+    """Best-effort configured/bound model label from the outgoing request.
+
+    This is provenance from the real request object (never fabricated): the
+    bound chat model exposes ``model_name`` (OpenAI-style) or ``model``. When a
+    test double or an unusual transport exposes neither, the label stays absent
+    rather than being guessed.
+    """
+
+    model = getattr(request, "model", None)
+    for attr in ("model_name", "model"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _actual_model(message: Any) -> str | None:
+    """Model label actually reported by the provider, from response metadata.
+
+    Only a provider-reported value is surfaced; the console labels this the
+    *actual* model. Absence means the provider did not report one — the caller
+    must not substitute the requested label for it.
+    """
+
+    metadata = getattr(message, "response_metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("model_name", "model"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _safe_result_text(content: Any, limit: int = 1200) -> str:
     text = redact_text(_message_text(content)).strip()
     return text if len(text) <= limit else text[:limit] + "…"
-
-
-def _result_ok(result: Any, text: str, error: str | None = None) -> bool:
-    if error or str(getattr(result, "status", "")).lower() == "error":
-        return False
-    normalized = text.strip().lower()
-    return not any(normalized.startswith(prefix.lower()) for prefix in _FAIL_PREFIXES)
 
 
 def _taskdoc_from_messages(messages: list[Any]) -> str | None:
@@ -101,9 +122,20 @@ def _taskdoc_from_messages(messages: list[Any]) -> str | None:
 
 
 class WebEventMiddleware(AgentMiddleware):
-    """Publish the established compact event stream to a pluggable sink."""
+    """Publish the established compact event stream to a pluggable sink.
 
-    def __init__(self, events: EventSink) -> None:
+    ``streaming`` (the actor's resolved decision) additionally projects
+    incremental model text as ``model_stream_start`` / ``model_stream_delta`` /
+    ``model_stream_end`` events.  The instrumentation is observe-only: the
+    transport streams on its own because the providers were built with the
+    resolved decision, and this middleware merely attaches a listener to a copy
+    of the request's model.  Models listed in ``inactive_models`` (an
+    availability fallback whose own model/global configuration keeps streaming
+    off) are never instrumented, so tool calls, usage accounting, retries and
+    safety policy are unchanged.
+    """
+
+    def __init__(self, events: EventSink, *, streaming: bool = False) -> None:
         super().__init__()
         self.events = events
         self._step = 0
@@ -112,6 +144,58 @@ class WebEventMiddleware(AgentMiddleware):
         self._last_screen_key: tuple[str, Any] | None = None
         self._session: Any | None = None
         self._stop_requested = threading.Event()
+        self._streaming_enabled = bool(streaming)
+        self._streaming_inactive: tuple[Any, ...] = ()
+        self._stream_attempts = 0
+        self._stream_lock = threading.Lock()
+
+    def set_streaming(
+        self, enabled: bool, *, inactive_models: tuple[Any, ...] = ()
+    ) -> None:
+        """Attach the run's streaming decision and the models it must not touch.
+
+        ``inactive_models`` carries provider-built models whose own decision is
+        off (an availability fallback built from its own model/global
+        configuration); the observer is never attached to them.
+        """
+
+        self._streaming_enabled = bool(enabled)
+        self._streaming_inactive = tuple(inactive_models)
+
+    @property
+    def streaming(self) -> bool:
+        return self._streaming_enabled
+
+    def _next_stream_attempt(self) -> int:
+        with self._stream_lock:
+            self._stream_attempts += 1
+            return self._stream_attempts
+
+    def _on_stream_event(self, name: str, payload: dict[str, Any]) -> None:
+        """Project one observer payload (adds the step and a strict envelope)."""
+
+        event: dict[str, Any] = {"event": name, "step": self._step + 1}
+        for key in ("attempt", "text", "reasoning", "ok", "error"):
+            if key in payload:
+                event[key] = payload[key]
+        self._emit(event)
+
+    def _streamed_request(self, request: Any) -> Any:
+        """Wrap this model call for incremental observation when enabled."""
+
+        model = getattr(request, "model", None)
+        enabled = bool(getattr(model, "streaming", self._streaming_enabled))
+        if model is None or not enabled:
+            return request
+        if any(request.model is model for model in self._streaming_inactive):
+            return request
+        observer = ModelStreamObserver(
+            self._on_stream_event, self._next_stream_attempt
+        )
+        instrumented = model_with_stream_observer(request.model, observer)
+        if instrumented is None:
+            return request
+        return request.override(model=instrumented)
 
     def attach_session(self, session: Any) -> None:
         self._session = session
@@ -174,7 +258,14 @@ class WebEventMiddleware(AgentMiddleware):
     ) -> dict[str, Any] | None:  # noqa: ANN001
         return self.before_model(state, runtime)
 
-    def _record_model(self, response: Any, latency_ms: int, error: str | None) -> None:
+    def _record_model(
+        self,
+        response: Any,
+        latency_ms: int,
+        error: str | None,
+        *,
+        requested_model: str | None = None,
+    ) -> None:
         self._step += 1
         message = _response_message(response) if response is not None else None
         turn_tokens = 0
@@ -186,18 +277,36 @@ class WebEventMiddleware(AgentMiddleware):
                 else estimate_message_tokens(message)
             )
         self._tokens += turn_tokens
-        self._emit(
-            {
-                "event": "model_call",
-                "step": self._step,
-                "latency_ms": latency_ms,
-                "tokens": turn_tokens,
-                "tokens_total": self._tokens,
-                "error": redact_text(error) if error else None,
-            }
-        )
+        event: dict[str, Any] = {
+            "event": "model_call",
+            "step": self._step,
+            "latency_ms": latency_ms,
+            "tokens": turn_tokens,
+            "tokens_total": self._tokens,
+            "error": redact_text(error) if error else None,
+        }
+        # Observe-only model-identity fields (safe labels, never credentials).
+        # ``requested_model`` is the bound model reference; ``actual_model`` is
+        # only ever the provider-reported label. Absent stays absent — the UI
+        # renders "未上报" instead of inheriting the requested label.
+        if requested_model:
+            event["requested_model"] = requested_model
+        actual_model = _actual_model(message) if message is not None else None
+        if actual_model:
+            event["actual_model"] = actual_model
+        self._emit(event)
 
     def wrap_model_call(self, request, handler):  # noqa: ANN001
+        requested_model = _requested_model(request)
+        self._emit(
+            {
+                "event": "model_request",
+                "step": self._step + 1,
+                "phase": "start",
+                "requested_model": requested_model,
+            }
+        )
+        request = self._streamed_request(request)
         started = time.perf_counter()
         try:
             response = handler(request)
@@ -206,12 +315,28 @@ class WebEventMiddleware(AgentMiddleware):
                 None,
                 int((time.perf_counter() - started) * 1000),
                 f"{type(exc).__name__}: {exc}",
+                requested_model=requested_model,
             )
             raise
-        self._record_model(response, int((time.perf_counter() - started) * 1000), None)
+        self._record_model(
+            response,
+            int((time.perf_counter() - started) * 1000),
+            None,
+            requested_model=requested_model,
+        )
         return response
 
     async def awrap_model_call(self, request, handler):  # noqa: ANN001
+        requested_model = _requested_model(request)
+        self._emit(
+            {
+                "event": "model_request",
+                "step": self._step + 1,
+                "phase": "start",
+                "requested_model": requested_model,
+            }
+        )
+        request = self._streamed_request(request)
         started = time.perf_counter()
         try:
             response = await handler(request)
@@ -220,9 +345,15 @@ class WebEventMiddleware(AgentMiddleware):
                 None,
                 int((time.perf_counter() - started) * 1000),
                 f"{type(exc).__name__}: {exc}",
+                requested_model=requested_model,
             )
             raise
-        self._record_model(response, int((time.perf_counter() - started) * 1000), None)
+        self._record_model(
+            response,
+            int((time.perf_counter() - started) * 1000),
+            None,
+            requested_model=requested_model,
+        )
         return response
 
     def _record_tool_result(
@@ -230,7 +361,12 @@ class WebEventMiddleware(AgentMiddleware):
     ) -> None:
         content = getattr(result, "content", None) if result is not None else None
         text = _safe_result_text(content) if content is not None else ""
-        ok = _result_ok(result, text, error)
+        from phone_agent.v2.experience import classify_tool_result
+
+        result_class = classify_tool_result(
+            result, RuntimeError(error) if error is not None else None
+        )
+        ok = result_class == "ok"
         self._emit(
             {
                 "event": "tool_result",
@@ -264,8 +400,18 @@ class WebEventMiddleware(AgentMiddleware):
             url = _image_url(block)
             if not url:
                 continue
-            screen_seq = block.get("screen_seq", parsed_seq)
-            screen_key = (url, screen_seq)
+            # An unverified reference frame (a failed observation still showing
+            # its last valid capture) commits no screen_seq/epoch and carries
+            # ``reference``/``screen_ref`` instead. It has its own identity so a
+            # run's many seq=None reference frames never collapse into one key,
+            # and the UI can label it "未验证" without mistaking it for a fresh
+            # observation.
+            is_reference = bool(block.get("reference")) or (
+                block.get("screen_ref") is not None
+            )
+            screen_ref = block.get("screen_ref") if is_reference else None
+            screen_seq = None if is_reference else block.get("screen_seq", parsed_seq)
+            screen_key = (url, screen_seq, screen_ref)
             if screen_key == self._last_screen_key:
                 return True
             self._last_screen_key = screen_key
@@ -276,6 +422,8 @@ class WebEventMiddleware(AgentMiddleware):
                     "image": url,
                     "current_app": current_app,
                     "screen_seq": screen_seq,
+                    "reference": is_reference,
+                    "screen_ref": (str(screen_ref) if screen_ref is not None else None),
                 }
             )
             return True

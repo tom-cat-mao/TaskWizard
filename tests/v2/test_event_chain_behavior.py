@@ -253,6 +253,110 @@ def test_blocked_call_is_traced_as_a_pair(wary_agent):
     assert agent._safety_warning.warning_count == 1
 
 
+def test_blocked_call_is_visible_as_web_pair_and_warning(wary_agent):
+    from queue import Queue
+
+    from langchain.agents.middleware import AgentMiddleware
+
+    from phone_agent.v2.run_events import WebEventMiddleware
+
+    original, session = wary_agent
+    sink = Queue()
+    observer = WebEventMiddleware(sink)
+    from phone_agent.v2.agent import ThinPhoneAgent
+
+    extra = [
+        type(f"ExtraObserver{index}", (AgentMiddleware,), {})()
+        for index in range(11)
+    ]
+    agent = ThinPhoneAgent(
+        original.config,
+        extra_middleware=[observer, *extra],
+        run_id="web-wary",
+    )
+    agent.run("支付", hitl_handler=lambda prompt: "approve")
+    events = []
+    while not sink.empty():
+        events.append(sink.get_nowait())
+
+    tap_events = [event for event in events if event.get("tool") == "tap"]
+    assert [event["event"] for event in tap_events] == [
+        "tool_call",
+        "tool_result",
+        "safety_warning",
+    ]
+    assert tap_events[1]["ok"] is False
+    traced_taps = [
+        event
+        for event in _trace_events(agent)
+        if event.get("tool") == "tap"
+        and event.get("event") in {"tool_call", "tool_result"}
+    ]
+    assert [event["event"] for event in traced_taps] == [
+        "tool_call",
+        "tool_result",
+    ]
+    assert session.taps == []
+
+
+def test_web_observer_does_not_change_hard_mode_hitl_approval(monkeypatch):
+    from queue import Queue
+    from types import SimpleNamespace
+
+    from langchain_core.messages import ToolMessage
+
+    from phone_agent.v2.agent import _ToolExecuteBridgeMiddleware
+    from phone_agent.v2.capabilities import (
+        CapabilityAssemblyContext,
+        assemble_capabilities,
+        build_capability_registry,
+    )
+    from phone_agent.v2.events import TOOL_EXECUTE, EventBus
+    from phone_agent.v2.middleware.safety import build_control_hitl_middleware
+    from phone_agent.v2.run_events import WebEventMiddleware
+
+    bus = EventBus()
+    bus.on(TOOL_EXECUTE, build_control_hitl_middleware())
+    config = SimpleNamespace(safety_mode="hard", memory_rag="off")
+    assemble_capabilities(
+        build_capability_registry(config),
+        CapabilityAssemblyContext(
+            {"event_bus": bus, "session": None, "config": config}
+        ),
+    )
+    monkeypatch.setattr(
+        "langgraph.types.interrupt",
+        lambda _request: {"decisions": [{"type": "approve"}]},
+    )
+    sink = Queue()
+    observer = WebEventMiddleware(sink)
+    bridge = _ToolExecuteBridgeMiddleware(bus)
+    request = SimpleNamespace(
+        tool_call={
+            "name": "tap",
+            "args": {"target_description": "确认支付"},
+            "id": "hard-1",
+        }
+    )
+    executed: list[str] = []
+
+    result = observer.wrap_tool_call(
+        request,
+        lambda current: bridge.wrap_tool_call(
+            current,
+            lambda _request: executed.append("tap")
+            or ToolMessage(content="OK", tool_call_id="hard-1", name="tap"),
+        ),
+    )
+
+    assert result.content == "OK"
+    assert executed == ["tap"]
+    assert [sink.get_nowait()["event"], sink.get_nowait()["event"]] == [
+        "tool_call",
+        "tool_result",
+    ]
+
+
 # --------------------------------------------------------------------------
 # (b) model/pre_request: compact -> taskdoc on a T2 fold
 # --------------------------------------------------------------------------

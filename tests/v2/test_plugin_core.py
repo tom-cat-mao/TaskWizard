@@ -180,6 +180,7 @@ def _real_registry_and_ctx(monkeypatch, tmp_path, *, memory_rag="shadow"):
     config.app_kb_enabled = True
     config.memory_rag = memory_rag
     config.memory_dir = str(tmp_path / "memory")
+    config.vec_db = str(tmp_path / "memory" / "vec.db")
     return config
 
 

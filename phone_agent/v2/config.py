@@ -388,6 +388,9 @@ class V2Config:
     # safety-reviewer model (S2 §3.3); falls back to verifier_model then the main
     # model when unset.
     safety_reviewer_model: str | None = None
+    # Optional single actor fallback target (env PHONE_AGENT_FALLBACK_MODEL);
+    # see .env.example for the availability-fallback contract.
+    fallback_model: str | None = None
     # S4 provider layer: extra models.json file (highest-priority candidate on
     # top of the user/project level files). Absent/blank disables it.
     models_file: str | None = None
@@ -395,6 +398,8 @@ class V2Config:
     # thinking param. Translated per provider via thinking_level_map +
     # thinking_format; unsupported endpoints omit the param silently.
     thinking: str = ""
+    # Model streaming: off|on (PHONE_AGENT_STREAMING); tiers: role > model > env.
+    streaming: str = "off"
     # External capability plugins (WP-PLUGIN-C). ``plugins_enabled`` is the master
     # switch (env ``PHONE_AGENT_PLUGINS``, default on); an empty manifest is a
     # no-op with zero behavior change. ``plugin_manifest`` overrides the
@@ -627,12 +632,14 @@ class V2Config:
             memory_model=_env_opt_str("PHONE_AGENT_MEMORY_MODEL"),
             verifier_model=_env_opt_str("PHONE_AGENT_VERIFIER_MODEL"),
             safety_reviewer_model=_env_opt_str("PHONE_AGENT_SAFETY_REVIEWER_MODEL"),
+            fallback_model=_env_opt_str("PHONE_AGENT_FALLBACK_MODEL"),
             models_file=_env_opt_str("PHONE_AGENT_MODELS_FILE"),
             thinking=_env_choice(
                 "PHONE_AGENT_THINKING",
                 "",
                 ("", "off", "minimal", "low", "medium", "high"),
             ),
+            streaming=_env_choice("PHONE_AGENT_STREAMING", "off", ("off", "on")),
             plugins_enabled=_env_bool_default_true("PHONE_AGENT_PLUGINS", True),
             plugin_manifest=_env_opt_str("PHONE_AGENT_PLUGIN_MANIFEST"),
             plugin_index=_env_str("PHONE_AGENT_PLUGIN_INDEX", "plugins/index.json"),

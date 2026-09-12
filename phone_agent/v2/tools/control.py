@@ -27,7 +27,16 @@ lands the finish anyway (the L1 two-step already gated it).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from langchain_core.tools import StructuredTool
+
+
+@dataclass(frozen=True)
+class _SkippedVerifier:
+    approve: bool = True
+    reason: str = "验收器不可用，已放行（fail-open）"
+    status: str = "skipped"
 
 
 def _maybe_verify_finish(session, config):
@@ -43,13 +52,13 @@ def _maybe_verify_finish(session, config):
     try:
         from phone_agent.v2.verify import should_verify_finish, verify_finish
     except Exception:  # noqa: BLE001 - verifier optional; L1 already gated
-        return None
+        return _SkippedVerifier()
     try:
         if not should_verify_finish(session, config):
             return None
         return verify_finish(session, config)
     except Exception:  # noqa: BLE001 - verifier failure is fail-open (§4.5)
-        return None
+        return _SkippedVerifier()
 
 
 def _handle_reject(session, verdict):
@@ -161,7 +170,9 @@ def build_control_tools(session, config) -> list[StructuredTool]:
             verdict = _maybe_verify_finish(session, config)
             if verdict is not None:
                 try:
-                    session.finish_verifier = "pass" if verdict.approve else "fail"
+                    session.finish_verifier = getattr(verdict, "status", None) or (
+                        "pass" if verdict.approve else "fail"
+                    )
                 except Exception:  # noqa: BLE001 - outcome mirror cannot affect finish
                     pass
             if verdict is not None and not verdict.approve:

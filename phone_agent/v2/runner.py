@@ -124,6 +124,7 @@ def _summary(
     *,
     finished_at: float,
     usage: dict[str, int],
+    snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from dataclasses import asdict
 
@@ -133,7 +134,7 @@ def _summary(
         "status": status,
         "result": asdict(result),
         "usage": usage,
-        "snapshot": spec.snapshot,
+        "snapshot": dict(spec.snapshot if snapshot is None else snapshot),
         "finished_at": finished_at,
     }
 
@@ -164,6 +165,7 @@ def run_spec(
     status = "error"
     exit_code = 0
     usage: dict[str, int] = {}
+    actual_snapshot = dict(spec.snapshot)
     terminal_written = False
     try:
         with JsonlWriter(events_path) as sink:
@@ -182,16 +184,52 @@ def run_spec(
                 )
                 if actual_fingerprint != expected_fingerprint:
                     raise ValueError("run spec config fingerprint mismatch")
-                if app_kb_generation(config) != spec.snapshot.get(
-                    "memory_generation"
-                ):
-                    raise ValueError("run spec memory generation mismatch")
+                actual_generation = app_kb_generation(config)
+                captured_generation = spec.snapshot.get("memory_generation")
+                if actual_generation != captured_generation:
+                    middleware.emit(
+                        {
+                            "event": "memory_generation_drift",
+                            "captured": captured_generation,
+                            "actual": actual_generation,
+                        }
+                    )
                 if capability_snapshot(config) != spec.snapshot.get("capabilities"):
                     raise ValueError("run spec capability snapshot mismatch")
-                agent = agent_factory(
-                    config, extra_middleware=[middleware], run_id=spec.run_id
+                from phone_agent.v2.plugins import discover_external_specs
+
+                external_capabilities = discover_external_specs(config)
+                agent_kwargs = {
+                    "extra_middleware": [middleware],
+                    "run_id": spec.run_id,
+                }
+                if external_capabilities:
+                    agent_kwargs["extra_capabilities"] = external_capabilities
+                agent = agent_factory(config, **agent_kwargs)
+                registry = getattr(agent, "capability_registry", None)
+                status_rows = getattr(registry, "status", None)
+                if callable(status_rows):
+                    actual_capabilities = {
+                        str(row["cap_id"]): dict(row) for row in status_rows()
+                    }
+                else:
+                    actual_capabilities = capability_snapshot(
+                        config, external_capabilities
+                    )
+                actual_snapshot["capabilities"] = actual_capabilities
+                middleware.emit(
+                    {
+                        "event": "capability_snapshot",
+                        "capabilities": actual_capabilities,
+                    }
                 )
                 middleware.attach_session(getattr(agent, "session", None))
+                middleware.set_streaming(
+                    bool(getattr(agent, "streaming_enabled", False)),
+                    inactive_models=tuple(
+                        getattr(agent, "streaming_inactive_models", ()) or ()
+                    ),
+                )
                 controls.set_revoke_lesson_callback(
                     getattr(agent, "revoke_lesson", None)
                 )
@@ -232,7 +270,14 @@ def run_spec(
             # reconnecting console can also read terminal usage and metadata.
             atomic_write_json(
                 summary_path,
-                _summary(spec, result, status, finished_at=time.time(), usage=usage),
+                _summary(
+                    spec,
+                    result,
+                    status,
+                    finished_at=time.time(),
+                    usage=usage,
+                    snapshot=actual_snapshot,
+                ),
             )
             middleware.emit_run_end(result, status=status)
             terminal_written = True

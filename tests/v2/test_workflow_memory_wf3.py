@@ -314,6 +314,33 @@ def test_run_start_general_card_injects_in_on_mode(tmp_path):
     assert stats["latest_procedure"]["app_scope"] == "general"
 
 
+def test_run_start_card_revoked_after_selection_is_not_emitted(tmp_path):
+    general_id = "les_0123456789ab"
+    lessons_dir = tmp_path / "lessons"
+    _materialize_card(
+        lessons_dir, general_id, title=GENERAL_TITLE, app_scope="general"
+    )
+    agent = _bare_agent(
+        tmp_path,
+        selector=lambda *_args, **_kwargs: _selection(
+            general_id,
+            title=GENERAL_TITLE,
+            steps=GENERAL_STEPS,
+            app_scope="general",
+        ),
+    )
+    agent._prepare_procedure_injection(GOAL)
+    payload = json.loads((lessons_dir / "lessons.json").read_text(encoding="utf-8"))
+    payload[0]["status"] = "revoked"
+    (lessons_dir / "lessons.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+    assert agent._procedure_prompt_block() is None
+    assert agent._procedure_injector.injected_ids == []
+    assert not any(event == "procedure_injection" for event, _ in agent.trace_events)
+
+
 def test_run_start_shadow_and_off_do_not_inject(tmp_path):
     calls: list[dict] = []
 
@@ -489,6 +516,7 @@ def test_revoked_card_never_reaches_a_later_injection_point(tmp_path):
 
     injector._selector = selector
     injector.run_start(GOAL)
+    assert agent._procedure_prompt_block() is not None
     injector.on_app_launched({"package": FOOD, "device_id": "serial-1"})
     assert injector.pending_lesson_id == "les_f00d00000001"
 
@@ -510,6 +538,7 @@ def test_post_launch_card_missing_for_that_app_injects_nothing(tmp_path):
     agent = _bare_agent(tmp_path)
     injector = agent._procedure_injector
     injector.run_start(GOAL)
+    assert agent._procedure_prompt_block() is not None
 
     before = injector.injected_ids
     injector.on_app_launched({"package": "com.example.rides", "device_id": "serial-1"})
@@ -797,7 +826,8 @@ def test_run_audits_both_injection_points_in_trace_and_episode(tmp_path, monkeyp
     # The never-launched app's card is not in the run's audit trail.
     assert ids[FOOD] not in outcomes[0]["injected_procedures"]
 
-    # The model sees the post-launch card from the next call on, exactly once.
+    # The model sees the post-launch card from the next call on. A successful
+    # finish is terminal, so there is no redundant third model call.
     per_call = [
         sum(
             1
@@ -806,7 +836,7 @@ def test_run_audits_both_injection_points_in_trace_and_episode(tmp_path, monkeyp
         )
         for messages in seen
     ]
-    assert per_call == [0, 1, 1]
+    assert per_call == [0, 1]
     card = next(
         message
         for messages in seen[1:]
@@ -902,6 +932,7 @@ def test_card_revoked_in_store_still_selected_but_never_delivered(tmp_path):
     agent = _bare_agent(tmp_path)
     injector = agent._procedure_injector
     injector.run_start(GOAL)
+    assert agent._procedure_prompt_block() is not None
 
     # The stale index still selects the revoked card for the launched app...
     with VecIndex(tmp_path / "vec.db", embedder=HashEmbedder(64)) as index:
@@ -965,4 +996,78 @@ def test_missing_lesson_view_suppresses_delivery_quietly(tmp_path):
 
     assert injector.pending_lesson_id is None
     stats = _stats(tmp_path)
-    assert stats["latest_procedure_suppressed"]["reason"] == "snapshot_unreadable"
+    assert stats["latest_procedure_suppressed"]["reason"] == "snapshot_missing"
+
+
+def test_corrupt_lesson_view_reports_snapshot_corrupt(tmp_path):
+    """A damaged view is reported distinctly from a missing view."""
+
+    lessons = tmp_path / "lessons"
+    _index_cards(tmp_path, lessons)
+    (lessons / "lessons.json").write_text("{not json", encoding="utf-8")
+
+    agent = _bare_agent(tmp_path)
+    injector = agent._procedure_injector
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": WEATHER, "device_id": "serial-1"})
+
+    assert injector.pending_lesson_id is None
+    stats = _stats(tmp_path)
+    assert stats["latest_procedure_suppressed"]["reason"] == "snapshot_corrupt"
+
+
+def test_non_utf8_lesson_view_reports_snapshot_corrupt_and_keeps_running(tmp_path):
+    """Real non-UTF-8 bytes must not break pre_request or the run."""
+
+    lessons = tmp_path / "lessons"
+    _index_cards(tmp_path, lessons)
+    (lessons / "lessons.json").write_bytes(b"\xff\xfeinvalid-json")
+
+    agent = _bare_agent(tmp_path)
+    injector = agent._procedure_injector
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": WEATHER, "device_id": "serial-1"})
+
+    assert injector.pending_lesson_id is None
+    stats = _stats(tmp_path)
+    assert stats["latest_procedure_suppressed"]["reason"] == "snapshot_corrupt"
+
+    sentinel = [SystemMessage(content="SYSTEM")]
+    messages = injector.on_pre_request(sentinel, next=lambda payload: payload)
+
+    assert messages == sentinel
+    assert injector.injected_ids == []
+
+
+def test_permission_error_on_lesson_view_does_not_break_pre_request(
+    tmp_path, monkeypatch
+):
+    """A PermissionError reading the authoritative view is corrupt, not fatal."""
+
+    from phone_agent.v2.evolution import lessons_view_path
+
+    lessons = tmp_path / "lessons"
+    _index_cards(tmp_path, lessons)
+    agent = _bare_agent(tmp_path)
+    injector = agent._procedure_injector
+    injector.run_start(GOAL)
+    injector.on_app_launched({"package": WEATHER, "device_id": "serial-1"})
+
+    view_path = lessons_view_path(lessons)
+    real_stat = Path.stat
+
+    def guarded_stat(self, *args, **kwargs):
+        if self == view_path:
+            raise PermissionError(13, "Permission denied")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", guarded_stat)
+
+    messages = injector.on_pre_request(
+        [SystemMessage(content="SYSTEM")], next=lambda payload: payload
+    )
+
+    assert messages == [SystemMessage(content="SYSTEM")]
+    assert injector.injected_ids == []
+    stats = _stats(tmp_path)
+    assert stats["latest_procedure_suppressed"]["reason"] == "snapshot_corrupt"

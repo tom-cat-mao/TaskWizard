@@ -1,6 +1,8 @@
 # 记忆与自进化
 
-TaskWizard 的记忆分三层，全部本地存储（`memory/`），不依赖外部服务。
+TaskWizard 的记忆分三层，全部本地存储，不依赖外部服务。默认根目录是 `memory/`，其中档案、lesson、
+向量索引与 runner 运行目录可分别用 `PHONE_AGENT_EXPERIENCE_DIR`、`PHONE_AGENT_LESSONS_DIR`、
+`PHONE_AGENT_VEC_DB`、`PHONE_AGENT_RUNS_DIR` 独立覆盖（见[配置参考](configuration.md)）。
 
 ## 总览
 
@@ -60,7 +62,8 @@ flowchart LR
 - 嵌入模型：本地 MLX 运行 Qwen3-Embedding-0.6B（`PHONE_AGENT_EMBED_MODEL` 可换）；
 - 索引：run 结束自动增量更新（质量闸门：空转档案不进索引）；`--rebuild-vec` 可全量重建；
 - 别名嵌入文本含中文名（learned/user 别名 → 静态 registry → 包名）；纯包名条目只供精确匹配；
-- 统计口径：Hit@1、命中率、污染率（contaminated run rate）、包级 P/R，控制台「记忆」页展示；达标前不开启注入。
+- 统计口径：Hit@1、命中率、污染率（contaminated run rate）、包级 P/R，控制台「记忆」页展示；`on` 档注入的是
+  下面的 lesson，**不是**这里召回的 episode（召回结果无论哪个档位都不进 actor 上下文）。
 
 ## 提炼、晋升与回注（已实现）
 
@@ -69,6 +72,7 @@ flowchart LR
 - **维护**：dream 对账——证据档案被折叠后不再够格的 approved 经验自动降回草案（`lesson_demoted`，停止注入，需重新批准）；并按"注入组 vs 未注入组"成功率统计每条经验的实际效果，更差的列入建议撤销清单（只提醒，不自动撤）；
 - **回注**（`PHONE_AGENT_MEMORY_RAG=on`）：已批准的经验在 run 开局以"参考提示"身份注入（上限 3 条 / 800 token，设备 scope 过滤，run 内钉死该代）；注入的 lesson id 写入 trace 与 episode 档案，用于事后度量"注入是否有帮助"；
 - **约束**：只有 approved / auto_approved 可被注入；proposed/needs_review/revoked 永不注入；shadow/off 档完全不注入。召回侧加固：embedder 在 capability 挂载时后台线程预热（on/shadow 且配置了索引才触发）；选择器异常留痕（trace `recall_selection_error` + stats 错误计数），fail-open 语义不变。
+- **加载诊断（不打断任务）**：快照缺失（`snapshot_missing`）与损坏（`snapshot_corrupt`，含非 UTF-8 字节、权限等 OS 错误）分别记录；lesson 已撤销、版本不符、条目缺失也各有独立 reason。rule 抑制与 card 抑制计数独立（`rule_suppressed` / `latest_rule_suppressed` vs `procedure_suppressed` / `latest_procedure_suppressed`），只记 lesson id、原因与类型，不记经验正文。缺经验、坏快照或诊断写失败都 fail-open：下一次模型调用照常进行。
 
 原则：先记录、再影子验证、晋升靠蒸馏自判分级（auto_approved 两类均可注入）、人类 CLI 是纠正通道，注入有上限可撤销；每一步可回退。
 

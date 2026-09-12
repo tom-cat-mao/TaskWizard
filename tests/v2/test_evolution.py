@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import multiprocessing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -122,6 +123,15 @@ class _FakeModel:
         )
 
 
+def _mutate_stale_lesson_store(lessons_dir: str, candidate: dict, ready, proceed) -> None:
+    """Open before a peer revokes, then mutate after it (spawn-safe helper)."""
+
+    store = LessonStore(lessons_dir)
+    ready.put(True)
+    proceed.get(timeout=10)
+    store.propose(LessonCandidate.from_dict(candidate))
+
+
 def test_schema_roundtrip_is_exact_and_rejects_extra_fields():
     candidate = _candidate()
     assert LessonCandidate.from_dict(candidate.to_dict()) == candidate
@@ -158,6 +168,93 @@ def test_event_log_rebuilds_view_and_records_review_version_chain(tmp_path):
     assert json.loads(rebuilt.lessons_path.read_text(encoding="utf-8"))[0][
         "status"
     ] == "revoked"
+
+
+def test_two_store_instances_refresh_before_unrelated_mutation(tmp_path):
+    first = LessonStore(tmp_path)
+    original = first.propose(_candidate())
+    first.approve(original.lesson_id)
+    stale = LessonStore(tmp_path)
+
+    first.revoke(original.lesson_id, "撤销旧规则")
+    stale.propose(
+        replace(
+            _candidate(
+                text="另一条互不相关的规则",
+                task_keys=["change_setting"],
+            ),
+            lesson_id="les_abcdef123456",
+        )
+    )
+
+    view = {
+        item["lesson_id"]: item
+        for item in json.loads((tmp_path / "lessons.json").read_text(encoding="utf-8"))
+    }
+    assert view[original.lesson_id]["status"] == "revoked"
+    assert len(view) == 2
+    event_types = [
+        json.loads(line)["type"]
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert event_types.count("lesson_revoked") == 1
+    assert event_types.count("lesson_proposed") == 2
+
+
+def test_separate_process_stale_store_cannot_overwrite_revocation(tmp_path):
+    lessons_dir = tmp_path / "lessons"
+    owner = LessonStore(lessons_dir)
+    original = owner.propose(_candidate())
+    owner.approve(original.lesson_id)
+    unrelated = replace(
+        _candidate(
+            text="跨进程写入的另一条规则",
+            task_keys=["change_setting"],
+        ),
+        lesson_id="les_abcdef123456",
+    )
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    proceed = context.Queue()
+    process = context.Process(
+        target=_mutate_stale_lesson_store,
+        args=(str(lessons_dir), unrelated.to_dict(), ready, proceed),
+    )
+    process.start()
+    assert ready.get(timeout=10) is True
+    owner.revoke(original.lesson_id, "跨进程撤销")
+    proceed.put(True)
+    process.join(timeout=15)
+    assert process.exitcode == 0
+
+    view = {
+        item["lesson_id"]: item
+        for item in json.loads(
+            (lessons_dir / "lessons.json").read_text(encoding="utf-8")
+        )
+    }
+    assert view[original.lesson_id]["status"] == "revoked"
+    assert len(view) == 2
+    event_types = [
+        json.loads(line)["type"]
+        for line in (lessons_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert event_types.count("lesson_revoked") == 1
+    assert event_types.count("lesson_proposed") == 2
+
+
+def test_malformed_event_log_is_replayed_safely_inside_temp_store(tmp_path):
+    lessons_dir = tmp_path / "lessons"
+    lessons_dir.mkdir()
+    (lessons_dir / "events.jsonl").write_text(
+        "{malformed\n", encoding="utf-8"
+    )
+
+    saved = LessonStore(lessons_dir).propose(_candidate())
+
+    assert saved.status == "proposed"
+    assert LessonStore(lessons_dir).get(saved.lesson_id) == saved
 
 
 def test_event_replay_skips_proposal_with_non_proposed_payload(tmp_path):
@@ -1321,8 +1418,6 @@ def test_app_rule_selection_goal_relevance_beats_version_order(tmp_path):
 def test_read_lessons_snapshot_is_read_only_and_fail_open(tmp_path):
     """The public helper mirrors the private snapshot: view-only, no rebuild."""
 
-    import json
-
     from phone_agent.v2.evolution import lessons_view_path, read_lessons_snapshot
 
     lessons_dir = tmp_path / "lessons"
@@ -1342,3 +1437,87 @@ def test_read_lessons_snapshot_is_read_only_and_fail_open(tmp_path):
     lessons_view_path(lessons_dir).write_text("{not json", encoding="utf-8")
     assert read_lessons_snapshot(lessons_dir) == []
     assert lessons_view_path(lessons_dir).name == "lessons.json"
+
+
+def test_read_lessons_snapshot_status_distinguishes_missing_and_corrupt(tmp_path):
+    """The status helper separates ok, missing, and corrupt snapshots."""
+
+    from phone_agent.v2.evolution import (
+        lessons_view_path,
+        read_lessons_snapshot_status,
+    )
+
+    lessons_dir = tmp_path / "lessons"
+    store = LessonStore(lessons_dir)
+    saved = store.propose(_candidate(text="有状态快照"))
+    store.approve(saved.lesson_id)
+
+    status, lessons = read_lessons_snapshot_status(lessons_dir)
+    assert status == "ok"
+    assert [lesson.lesson_id for lesson in lessons] == [saved.lesson_id]
+
+    status, lessons = read_lessons_snapshot_status(tmp_path / "absent")
+    assert status == "missing"
+    assert lessons == []
+
+    lessons_view_path(lessons_dir).write_text("{not json", encoding="utf-8")
+    status, lessons = read_lessons_snapshot_status(lessons_dir)
+    assert status == "corrupt"
+    assert lessons == []
+
+    # A non-list top-level object is also corrupt, not ok.
+    lessons_view_path(lessons_dir).write_text('"string"', encoding="utf-8")
+    status, lessons = read_lessons_snapshot_status(lessons_dir)
+    assert status == "corrupt"
+    assert lessons == []
+
+
+def test_read_lessons_snapshot_status_treats_permission_error_as_corrupt(
+    tmp_path, monkeypatch
+):
+    from phone_agent.v2.evolution import (
+        lessons_view_path,
+        read_lessons_snapshot,
+        read_lessons_snapshot_status,
+    )
+
+    lessons_dir = tmp_path / "lessons"
+    store = LessonStore(lessons_dir)
+    saved = store.propose(_candidate(text="不可读的快照"))
+    store.approve(saved.lesson_id)
+    view_path = lessons_view_path(lessons_dir)
+
+    real_read_text = Path.read_text
+
+    def guarded_read_text(self, *args, **kwargs):
+        if self == view_path:
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+    status, lessons = read_lessons_snapshot_status(lessons_dir)
+    assert status == "corrupt"
+    assert lessons == []
+    assert read_lessons_snapshot(lessons_dir) == []
+
+
+def test_read_lessons_snapshot_status_treats_non_utf8_bytes_as_corrupt(tmp_path):
+    """A real non-UTF-8 file fails open, never raising UnicodeDecodeError."""
+
+    from phone_agent.v2.evolution import (
+        lessons_view_path,
+        read_lessons_snapshot,
+        read_lessons_snapshot_status,
+    )
+
+    lessons_dir = tmp_path / "lessons"
+    store = LessonStore(lessons_dir)
+    saved = store.propose(_candidate(text="非法字节快照"))
+    store.approve(saved.lesson_id)
+    lessons_view_path(lessons_dir).write_bytes(b"\xff\xfeinvalid-json")
+
+    status, lessons = read_lessons_snapshot_status(lessons_dir)
+    assert status == "corrupt"
+    assert lessons == []
+    assert read_lessons_snapshot(lessons_dir) == []

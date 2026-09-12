@@ -21,13 +21,18 @@ file at equal specificity):
 Each resolved value is a model *reference*: a bare model name (default
 provider) or ``provider:model`` addressing.  ``registry=None`` (or a registry
 without attached roles) reproduces the pre-P2 env/chain behavior exactly.
+
+The same resolution feeds the optional streaming decision
+(:func:`resolve_streaming_enabled`): a role's effective *model* is looked up in
+the registry so a models.json streaming declaration applies to the endpoint
+that will actually be called.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from phone_agent.v2.providers.types import RoleSpec
+from phone_agent.v2.providers.types import RoleSpec, STREAMING_MODES
 
 ROLES = ("actor", "memory", "verifier", "safety_reviewer", "distill")
 
@@ -73,3 +78,72 @@ def resolve_role_ref(config: Any, role: str, registry: Any = None) -> str:
     else:
         raise ValueError(f"unknown role: {role!r} (expected one of {ROLES})")
     return str(ref or "")
+
+
+def _clean_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in STREAMING_MODES else ""
+
+
+def streaming_mode_from_tiers(
+    *, global_mode: Any, model_mode: Any, role_mode: Any
+) -> str:
+    """Combine the three streaming tiers (``off``/``on``)."""
+
+    return (
+        _clean_mode(role_mode)
+        or _clean_mode(model_mode)
+        or _clean_mode(global_mode)
+        or "off"
+    )
+
+
+def resolve_streaming_mode(
+    config: Any,
+    role: str,
+    registry: Any = None,
+    *,
+    resolved: Any = None,
+) -> str:
+    """Resolve one role's effective streaming mode (``off``/``on``).
+
+    Precedence (most specific wins):
+
+    1. ``roles.<role>.streaming`` — the per-role call decision;
+    2. the resolved model entry's ``streaming`` — an endpoint capability fact
+       that outranks the deployment-wide switch;
+    3. ``config.streaming`` (``PHONE_AGENT_STREAMING``, default off).
+
+    ``resolved`` may carry an already-resolved :class:`ResolvedModel` (the
+    build path passes the model it actually built, including a degraded
+    fallback); otherwise the role reference is resolved through the registry.
+    An unresolvable reference (missing registry / unknown provider) simply
+    contributes no model tier — the decision never raises during assembly.
+    """
+
+    model_mode = ""
+    try:
+        target = resolved
+        if target is None and registry is not None:
+            target = registry.resolve(resolve_role_ref(config, role, registry=registry))
+        model_mode = getattr(getattr(target, "model", None), "streaming", None)
+    except Exception:  # noqa: BLE001 - an unresolvable ref contributes no tier
+        model_mode = ""
+    spec = get_role_specs(registry).get(role)
+    return streaming_mode_from_tiers(
+        global_mode=getattr(config, "streaming", ""),
+        model_mode=model_mode,
+        role_mode=getattr(spec, "streaming", None) if spec else None,
+    )
+
+
+def resolve_streaming_enabled(
+    config: Any,
+    role: str,
+    registry: Any = None,
+    *,
+    resolved: Any = None,
+) -> bool:
+    """Boolean view of :func:`resolve_streaming_mode` (default ``False``)."""
+
+    return resolve_streaming_mode(config, role, registry, resolved=resolved) == "on"

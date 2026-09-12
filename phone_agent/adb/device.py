@@ -14,6 +14,7 @@ from phone_agent.config.app_registry import (
 )
 from phone_agent.config.apps import DEFAULT_APP_REGISTRY, DEFAULT_LAUNCH_TARGET_RESOLVER
 from phone_agent.config.timing import TIMING_CONFIG
+from phone_agent.adb.errors import adb_command_failed, require_adb_success
 
 
 @dataclass(frozen=True)
@@ -272,9 +273,10 @@ def tap(
 
     adb_prefix = _get_adb_prefix(device_id)
 
-    subprocess.run(
+    result = subprocess.run(
         adb_prefix + ["shell", "input", "tap", str(x), str(y)], capture_output=True
     )
+    require_adb_success(result, "tap")
     time.sleep(delay)
 
 
@@ -327,11 +329,12 @@ def long_press(
 
     adb_prefix = _get_adb_prefix(device_id)
 
-    subprocess.run(
+    result = subprocess.run(
         adb_prefix
         + ["shell", "input", "swipe", str(x), str(y), str(x), str(y), str(duration_ms)],
         capture_output=True,
     )
+    require_adb_success(result, "long press")
     time.sleep(delay)
 
 
@@ -367,7 +370,7 @@ def swipe(
         duration_ms = int(dist_sq / 1000)
         duration_ms = max(1000, min(duration_ms, 2000))  # Clamp between 1000-2000ms
 
-    subprocess.run(
+    result = subprocess.run(
         adb_prefix
         + [
             "shell",
@@ -381,6 +384,7 @@ def swipe(
         ],
         capture_output=True,
     )
+    require_adb_success(result, "swipe")
     time.sleep(delay)
 
 
@@ -397,9 +401,10 @@ def back(device_id: str | None = None, delay: float | None = None) -> None:
 
     adb_prefix = _get_adb_prefix(device_id)
 
-    subprocess.run(
+    result = subprocess.run(
         adb_prefix + ["shell", "input", "keyevent", "4"], capture_output=True
     )
+    require_adb_success(result, "back")
     time.sleep(delay)
 
 
@@ -419,8 +424,8 @@ def home(device_id: str | None = None, delay: float | None = None) -> None:
     result = subprocess.run(
         adb_prefix + ["shell", "input", "keyevent", "KEYCODE_HOME"], capture_output=True
     )
-    if result.returncode != 0 or _has_inject_events_error(result):
-        subprocess.run(
+    if adb_command_failed(result):
+        fallback = subprocess.run(
             adb_prefix
             + [
                 "shell",
@@ -434,6 +439,7 @@ def home(device_id: str | None = None, delay: float | None = None) -> None:
             capture_output=True,
             text=True,
         )
+        require_adb_success(fallback, "home fallback")
     time.sleep(delay)
 
 
@@ -639,18 +645,6 @@ def _resolve_launcher_component(adb_prefix: list[str], package: str) -> str | No
         if "/" in component:
             return component
     return None
-
-
-def _has_inject_events_error(result: subprocess.CompletedProcess) -> bool:
-    """Return True if an adb command failed due to INJECT_EVENTS restrictions."""
-    output = b""
-    for stream in (result.stdout, result.stderr):
-        if isinstance(stream, bytes):
-            output += stream
-        elif isinstance(stream, str):
-            output += stream.encode("utf-8", errors="ignore")
-    normalized = output.lower()
-    return b"inject_events" in normalized or b"inject events" in normalized
 
 
 def _run_adb_shell_text(

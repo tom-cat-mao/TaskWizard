@@ -16,8 +16,9 @@ stream is **full fidelity**: sensitive substrings are kept UNREDACTED and text i
 UNTRUNCATED. The two structural guarantees still hold unconditionally:
 
 * the JSONL never carries screenshot ``base64`` — image blocks are reduced to
-  ``{present, screen_seq, bytes, path}`` and the pixels are written to
-  ``<run_dir>/screenshots/screen-<seq>.png`` instead;
+  ``{present, screen_seq, bytes, path}`` (an unverified reference frame instead
+  carries ``reference`` and is saved as ``screen-<ref>.png``) and the pixels are
+  written to ``<run_dir>/screenshots/screen-<seq>.png``;
 * multimodal ``[text + image]`` content is always *split* (text → a field, image
   → the summary above).
 
@@ -127,21 +128,51 @@ def _block_image_url(block: Any) -> str:
     return ""
 
 
+def _reference_id(block: Any) -> str | None:
+    """Return the reference-frame id carried on an image block, if any.
+
+    Unverified reference images (B-package: a failed observation still shows its
+    last valid frame) carry ``reference``/``screen_ref`` instead of a committed
+    ``screen_seq``, so they can be saved under their own file name and never
+    overwrite a real ``screen-<seq>.png``.
+    """
+
+    if isinstance(block, dict):
+        ref = block.get("screen_ref")
+        if isinstance(ref, str) and ref:
+            return ref
+    return None
+
+
+def _image_file_key(block: Any) -> int | str | None:
+    """Screenshot file key for an image block: real ``screen_seq`` or ref id."""
+
+    if not isinstance(block, dict):
+        return None
+    seq = block.get("screen_seq")
+    if isinstance(seq, int):
+        return seq
+    return _reference_id(block)
+
+
 def _split_multimodal(content: Any) -> tuple[str, dict[str, Any], str]:
     """Split a tool return into (joined text, image summary, first image url).
 
     Multimodal content (``[text block + image block]``, produced by the visual
     reflow) is *split*: text blocks are joined into ``result_text``; image blocks
     are reduced to ``{present, screen_seq, bytes}`` — the base64 payload is never
-    carried into the returned summary. The **third** element is the first image
-    block's raw url, returned *only* so the caller can decode it to a screenshot
-    file on disk; it is never written to the JSONL. A plain string return yields
-    no image and an empty url.
+    carried into the returned summary. An unverified reference image (no
+    committed ``screen_seq``) adds its ``reference`` id to the summary so the
+    caller can save it under a file name that cannot collide with a real frame.
+    The **third** element is the first image block's raw url, returned *only* so
+    the caller can decode it to a screenshot file on disk; it is never written to
+    the JSONL. A plain string return yields no image and an empty url.
     """
 
     text = "\n".join(_iter_text_blocks(content)).strip()
     image: dict[str, Any] = {"present": False, "screen_seq": None, "bytes": 0}
     first_url = ""
+    reference: str | None = None
     if isinstance(content, list):
         total_bytes = 0
         screen_seq: Any = None
@@ -153,11 +184,14 @@ def _split_multimodal(content: Any) -> tuple[str, dict[str, Any], str]:
             url = _block_image_url(block)
             if not first_url and url:
                 first_url = url
+                reference = _reference_id(block)
             total_bytes += estimate_image_bytes(url)
             if screen_seq is None:
                 screen_seq = block.get("screen_seq")
         if present:
             image = {"present": True, "screen_seq": screen_seq, "bytes": total_bytes}
+            if reference:
+                image["reference"] = reference
     return text, image, first_url
 
 
@@ -305,10 +339,13 @@ class DiagnosticEvidenceWriter:
     def _write_screenshot(self, seq: Any, url: str) -> str | None:
         """Decode a data-url screenshot to ``screenshots/screen-<seq>.png``.
 
-        Idempotent: the same ``screen_seq`` overwrites its file. Returns the path
-        relative to the run dir (so the report can ``<img src="...">`` it), or
-        ``None`` when there is nothing decodable. Best-effort — never crashes the
-        loop. The base64 itself is never written to the JSONL.
+        Idempotent: the same ``screen_seq`` overwrites its file. A reference
+        frame passes its own ``ref`` id instead, so its file name
+        (``screen-ref<N>.png``) can never overwrite a committed frame's
+        ``screen-<seq>.png``. Returns the path relative to the run dir (so the
+        report can ``<img src="...">`` it), or ``None`` when there is nothing
+        decodable. Best-effort — never crashes the loop. The base64 itself is
+        never written to the JSONL.
         """
 
         if not self.enabled or seq is None:
@@ -352,7 +389,9 @@ class DiagnosticEvidenceWriter:
                 continue
             for block in content:
                 if _is_image_block(block):
-                    self._write_screenshot(block.get("screen_seq"), _block_image_url(block))
+                    self._write_screenshot(
+                        _image_file_key(block), _block_image_url(block)
+                    )
 
     # -- io ----------------------------------------------------------------
     def _write(self, event: dict[str, Any]) -> None:
@@ -585,7 +624,10 @@ class DiagnosticEvidenceWriter:
         else:
             text, image, url = "", {"present": False, "screen_seq": None, "bytes": 0}, ""
         if image.get("present") and url:
-            rel = self._write_screenshot(image.get("screen_seq"), url)
+            key = image.get("screen_seq")
+            if key is None:
+                key = image.get("reference")
+            rel = self._write_screenshot(key, url)
             if rel:
                 image["path"] = rel
         obs = _parse_obs_block(text)

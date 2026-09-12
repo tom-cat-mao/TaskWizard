@@ -14,9 +14,6 @@ from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from phone_agent.v2.capabilities import build_capability_registry
-
-
 @dataclass(frozen=True)
 class RunPaths:
     run_dir: Path
@@ -115,26 +112,49 @@ def config_fingerprint(config_values: dict[str, Any]) -> str:
 
 
 def app_kb_generation(config: Any) -> dict[str, Any] | None:
+    """Identify the materialized App-KB snapshot by content, never by mtime.
+
+    An explicit ``generation``/``version`` key is kept for compatibility; the
+    fallback is a digest of the canonical snapshot content, so a pure rewrite,
+    touch, or read of identical bytes can never change the identity.
+    """
+
     path = Path(getattr(config, "memory_dir", "memory")) / "app_kb/kb.json"
     try:
-        mtime_ns = path.stat().st_mtime_ns
+        raw = path.read_bytes()
     except OSError:
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
+        payload: Any = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
         payload = None
     if isinstance(payload, dict):
         for key in ("generation", "version"):
             if key in payload:
                 return {"source": f"kb.json.{key}", "value": payload[key]}
-    return {"source": "kb.json.mtime_ns", "value": mtime_ns}
+    if payload is None:
+        material = b"raw\x00" + raw
+    else:
+        material = b"json\x00" + json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    return {
+        "source": "kb.json.digest",
+        "value": "sha256:" + hashlib.sha256(material).hexdigest(),
+    }
 
 
-def capability_snapshot(config: Any) -> dict[str, dict[str, Any]]:
+def capability_snapshot(
+    config: Any, external_capabilities: list[Any] | tuple[Any, ...] | None = None
+) -> dict[str, dict[str, Any]]:
+    from phone_agent.v2.capabilities import build_capability_registry
+
+    registry = build_capability_registry(config)
+    for spec in external_capabilities or ():
+        registry.register(spec)
     return {
         str(row["cap_id"]): dict(row)
-        for row in build_capability_registry(config).status()
+        for row in registry.status()
     }
 
 

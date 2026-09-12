@@ -25,6 +25,7 @@ from phone_agent.adb.device import (
     swipe,
     tap,
 )
+from phone_agent.adb.errors import KeyboardPreparationError
 from phone_agent.adb.input import (
     clear_text,
     detect_and_set_adb_keyboard,
@@ -41,6 +42,7 @@ __all__ = [
     "clear_text",
     "detect_and_set_adb_keyboard",
     "restore_keyboard",
+    "KeyboardPreparationError",
     # Device control
     "get_current_app",
     "get_foreground_app",

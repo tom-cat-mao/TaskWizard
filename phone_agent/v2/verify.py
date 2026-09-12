@@ -52,23 +52,25 @@ _VERIFIER_SYSTEM = (
 
 @dataclass(frozen=True)
 class Verdict:
-    """One acceptance decision from the finish verifier (S2 §4.3)."""
+    """One verifier decision; ``status=skipped`` marks fail-open outage."""
 
     approve: bool
     reason: str
+    status: str | None = None
 
 
 def _goal_texts(session: Any) -> list[str]:
     """Return the authoritative goal texts: ``goal_base`` + amendments."""
 
-    doc = getattr(session, "task_doc", None)
-    if doc is None:
-        return []
     texts: list[str] = []
-    base = getattr(doc, "goal_base", "") or ""
+    doc = getattr(session, "task_doc", None)
+    base = (getattr(doc, "goal_base", "") or "") if doc is not None else ""
+    if not str(base).strip():
+        base = getattr(session, "run_goal", "") or ""
     if base.strip():
         texts.append(base)
-    for amendment in getattr(doc, "amendments", []) or []:
+    amendments = (getattr(doc, "amendments", []) or []) if doc is not None else []
+    for amendment in amendments:
         if str(amendment).strip():
             texts.append(str(amendment))
     return texts
@@ -213,16 +215,17 @@ def _parse_verdict(text: str) -> Verdict:
         or "未完成" in text
     )
     if rejected and "approve" not in lowered:
-        return Verdict(False, reason)
-    return Verdict(True, reason)
+        return Verdict(False, reason, status="fail")
+    return Verdict(True, reason, status="pass")
 
 
 def verify_finish(session: Any, config: Any, *, model: Any | None = None) -> Verdict:
     """Run the independent-context verifier for a finish confirm (S2 §4).
 
     Returns a :class:`Verdict`. Any setup or call failure is **fail-open**
-    (``approve=True``) with a warning-shaped reason and a ``logger.warning`` — a
-    flaky verifier must never block a completion the L1 two-step already cleared.
+    (``approve=True``, ``status="skipped"``) with a warning-shaped reason and a
+    ``logger.warning`` — a flaky verifier must never block a completion the L1
+    two-step already cleared.
     ``model`` may be injected (tests / reuse); otherwise it is built from config.
     """
 
@@ -230,14 +233,18 @@ def verify_finish(session: Any, config: Any, *, model: Any | None = None) -> Ver
         messages = _build_verifier_messages(session, config)
     except Exception as exc:  # noqa: BLE001 - setup failure -> fail-open
         logger.warning("finish verifier setup failed, fail-open: %s", exc)
-        return Verdict(True, f"验收器构建失败，已放行（fail-open）：{exc}")
+        return Verdict(
+            True, f"验收器构建失败，已放行（fail-open）：{exc}", status="skipped"
+        )
 
     try:
         chat = model if model is not None else _build_verifier_model(config)
         resp = chat.invoke(messages)
     except Exception as exc:  # noqa: BLE001 - call failure -> fail-open
         logger.warning("finish verifier call failed, fail-open: %s", exc)
-        return Verdict(True, f"验收器调用失败，已放行（fail-open）：{exc}")
+        return Verdict(
+            True, f"验收器调用失败，已放行（fail-open）：{exc}", status="skipped"
+        )
 
     ledger = getattr(session, "usage_ledger", None)
     if ledger is not None:

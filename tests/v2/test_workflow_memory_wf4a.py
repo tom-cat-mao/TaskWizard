@@ -96,6 +96,7 @@ def _fake_config(**overrides) -> SimpleNamespace:
     fields = dict(
         device_id="serial-1",
         app_kb_enabled=True,
+        resolver_embed=False,
         observe_settle_ms=0,
         black_screen_detect=False,
         marks_windowed="off",

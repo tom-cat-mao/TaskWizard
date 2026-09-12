@@ -155,11 +155,11 @@ def test_create_agent_middleware_is_bridges_only(captured_agent):
     )
 
     core_types = [
-        _ToolExecuteBridgeMiddleware,
         _ModelPreRequestBridgeMiddleware,
         _WrapModelBridgeMiddleware,
         _PostRequestBridgeMiddleware,
         _AgentAfterBridgeMiddleware,
+        _ToolExecuteBridgeMiddleware,
     ]
     assert len(middleware) == len(core_types)
     for expected, actual in zip(core_types, middleware):
@@ -176,7 +176,7 @@ def test_create_agent_middleware_is_bridges_only(captured_agent):
 # ---------------------------------------------------------------------------
 
 
-def test_extra_middleware_appended_after_bridges(tmp_path, monkeypatch):
+def test_extra_middleware_wraps_tool_execute_bridge(tmp_path, monkeypatch):
     from langchain.agents import create_agent as _orig_create_agent
 
     captured: dict[str, Any] = {"middleware": None}
@@ -216,11 +216,14 @@ def test_extra_middleware_appended_after_bridges(tmp_path, monkeypatch):
         pass
 
     config = _FakeConfig(trace_dir=str(tmp_path))
-    extra = [_ExtraObserver()]
-    agent = ThinPhoneAgent(config, extra_middleware=extra)
+    extra = [
+        type(f"ExtraObserver{index}", (_ExtraObserver,), {})()
+        for index in range(12)
+    ]
+    ThinPhoneAgent(config, extra_middleware=extra)
     middleware = captured["middleware"]
 
-    from phone_agent.v2.agent import _AgentAfterBridgeMiddleware
+    from phone_agent.v2.agent import _ToolExecuteBridgeMiddleware
 
-    assert isinstance(middleware[-1], _ExtraObserver)
-    assert isinstance(middleware[-2], _AgentAfterBridgeMiddleware)
+    assert middleware[-13:-1] == extra
+    assert isinstance(middleware[-1], _ToolExecuteBridgeMiddleware)

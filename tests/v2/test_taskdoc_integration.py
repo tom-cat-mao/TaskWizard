@@ -153,7 +153,6 @@ def test_render_refreshes_pinned_block_removing_stale_copy():
     first_id = first["messages"][-1].id
 
     second = mw.before_model({"messages": []}, runtime=None)
-    ids = [getattr(m, "id", None) for m in second["messages"]]
     # Second turn removes the prior pinned copy and appends a fresh one at tail.
     removes = [m for m in second["messages"] if isinstance(m, RemoveMessage)]
     assert len(removes) == 1

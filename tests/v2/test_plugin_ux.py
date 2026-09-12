@@ -393,6 +393,23 @@ def test_cmd_list_reports_load_error(tmp_path):
     assert "reason" in row
 
 
+def test_cmd_list_keeps_good_plugin_state_when_another_is_broken(tmp_path):
+    directory = _write_plugin_dir(tmp_path, "good", cap_id="cap_good")
+    config = _config(tmp_path)
+    plugins.write_manifest(
+        config.plugin_manifest,
+        [
+            plugins.PluginEntry(name="good", path=str(directory)),
+            plugins.PluginEntry(name="broken", path=str(tmp_path / "missing")),
+        ],
+    )
+
+    rows = {row["name"]: row for row in plugins.cmd_list(config)}
+
+    assert rows["good"]["state"] == "active"
+    assert rows["broken"]["state"] == "error"
+
+
 # ---------------------------------------------------------------------------
 # pip base command preference
 # ---------------------------------------------------------------------------
@@ -452,6 +469,38 @@ def test_external_capabilities_fail_visible(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as excinfo:
         main_v2._external_capabilities(config)
     assert excinfo.value.code == 1
+
+
+def test_main_task_loads_authorized_local_plugin(tmp_path, monkeypatch):
+    import main_v2
+    from phone_agent.v2 import agent as agent_module
+
+    plugin_dir = _write_plugin_dir(tmp_path, "cli_plugin", cap_id="cli_plugin")
+    config = _config(tmp_path)
+    config.app_kb_enabled = False
+    config.dream_mode = "manual"
+    plugins.write_manifest(
+        config.plugin_manifest,
+        [plugins.PluginEntry(name="cli_plugin", path=str(plugin_dir))],
+    )
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, config, *, extra_capabilities):
+            captured["capabilities"] = extra_capabilities
+            self.session = SimpleNamespace()
+
+        def run(self, task):
+            return SimpleNamespace(
+                success=True, reason="done", steps=0, trace_path=None
+            )
+
+    monkeypatch.setattr(main_v2, "load_project_env", lambda: None)
+    monkeypatch.setattr(main_v2.V2Config, "from_env", lambda overrides: config)
+    monkeypatch.setattr(agent_module, "ThinPhoneAgent", FakeAgent)
+
+    assert main_v2.main(["test task"]) == 0
+    assert [spec.cap_id for spec in captured["capabilities"]] == ["cli_plugin"]
 
 
 def test_agent_registers_extra_capabilities():

@@ -413,7 +413,7 @@ def test_grading_prompt_states_the_asymmetric_risk_of_auto_approval():
 
 
 def test_fact_sheet_reports_outcomes_appkb_and_prior_proposals():
-    from phone_agent.v2.evolution import _procedure_fact_sheet, _verified_appkb_packages
+    from phone_agent.v2.evolution import _procedure_fact_sheet
 
     candidate = LessonCandidate.from_dict(
         _procedure_payload(["run-0", "run-1"], ["search_flight", "search_hotel"])
