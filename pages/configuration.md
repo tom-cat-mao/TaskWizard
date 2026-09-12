@@ -40,6 +40,40 @@
 
 models.json 条目字段：`api`（`openai-completions`/`anthropic-messages`/`google-generative-ai`）、`baseUrl`、`apiKey`（支持 `"$ENV_VAR"` 引用）、`headers`、`compat`（如 `thinkingFormat`、`supportsUsageInStreaming`）、`models[]`（`id`、`contextWindow`、`maxTokens`、`samplingParams`、`thinkingLevelMap`、`streaming`）、`modelOverrides`、可选顶层 `roles` 段（见下）。采样参数合并顺序：模型条目 < 环境变量 < 角色覆盖。`--list-models` 打印生效注册表。
 
+#### 请求协议与可选缓存
+
+`compat` 可写在 provider 或模型条目上。模型只覆盖明确设置的字段；`null`/省略表示继承，显式
+`auto`/`off` 可以撤销 provider 层的对应选择。
+
+| compat 字段 | 默认 | 语义 |
+|---|---|---|
+| `requestApi` | `auto` | OpenAI family 的 `auto` / `chat` / `responses`。`auto` 保留 SDK 选择，模型名含 `codex` 或 Responses-only 特性可能选择 Responses；`chat` / `responses` 分别锁定对应请求格式，不做跨协议探测重试 |
+| `cachePolicy` | `off` | `off` 不主动装饰缓存；`stable-prefix` 是显式启用并声明网关支持原生缓存标记。OpenAI 必须同时明确选择 Responses；原生 Anthropic 使用 ephemeral 标记；Google 的显式缓存资源尚未实现，启用会报错 |
+
+例如，下面是已确认支持 Responses 显式缓存端点的 compat 片段；不能仅凭兼容网关或模型名字推断支持：
+
+```json
+{"requestApi": "responses", "cachePolicy": "stable-prefix"}
+```
+
+原生 Anthropic 使用 `{"cachePolicy": "stable-prefix"}`，不要设置 OpenAI 的 `requestApi`。
+显式协议与 `samplingParams.use_responses_api` 矛盾、强制 Chat 却配置 Responses-only 特性、缓存策略与
+显式原生缓存配置冲突都会可见失败。未使用 typed 选择的旧 `use_responses_api` 布尔配置仍兼容；新配置应
+使用 `requestApi`。缓存准备要求 harness 持有完整历史，不同时启用 `use_previous_response_id` 链。
+
+`stable-prefix` 在本次调用副本上标记稳定文本，最多选择固定前缀、上一兼容请求的端点和新稳定端点；
+遇到仍含图片、完整 marks、当前任务板或不能识别的原生内容即停止。原生 Anthropic 会提升尾部 system，
+有这种动态块时只装饰前部稳定 system。不会保留额外旧图、修改工具参数、持久写入协议标记或建立
+Gemini 缓存资源；压缩/内容变化使旧端点失效。未知网关保持默认 `off`，上游自身的隐式缓存仍可正常工作。
+这些行为经过离线 SDK 序列化验证，尚未验证真实网关命中收益。
+
+新字段值拼写错误也会写入 `declaration_warnings`，并阻止选择受影响的 provider/model，避免错误选择被
+跳过后静默按 `auto` 执行；无关的坏声明仍按原规则跳过。高优先级的有效声明可修正该选择。
+
+Provider 的 context 支持对象跟随实际模型。内建输入估算仍是启发式，工具 schema 有实物时计入并声明覆盖，
+未提供工具时保留额外 reserve；不会声称精确 tokenizer 计数或远程计数已实现。`contextWindow` 与真实构造的
+输出上限分别报告，不能因 cache hit 把输入从逻辑窗口扣除。
+
 `streaming`（`off`/`on`，可写在模型条目、`modelOverrides` 与 `roles.<role>`）控制该模型/角色的流式调用，优先级为 **角色 > 模型条目 > `PHONE_AGENT_STREAMING`**：模型条目的声明视为端点能力事实（某模型端点不能流式时，即使全局开也可保持 `off`），角色声明是最具体的调用级覆盖。有效决策被翻译为各协议正式参数（OpenAI/Anthropic/Google 的传输层 `streaming`），由 SDK 流式接收并聚合出完整消息；`off`/未声明不下发该参数，默认构建不变。非法取值由严格解析函数（显式校验路径）fail-closed 报错；运行时装配逐项跳过并计入 `declaration_warnings`。
 
 `compat.supportsUsageInStreaming` 是 **usage 上报能力声明，不是 streaming 开关**：显式声明时，openai 路径翻译为传输层 `stream_usage`（流式请求携带 `stream_options.include_usage`），anthropic 路径翻译为是否从流式事件采集 usage；**未声明时不下发任何参数**，保持 SDK/legacy 默认（零配置构建与旧客户端逐字段一致）。Google 协议没有等价的请求侧开关（SDK 始终从流读取 `usageMetadata`），因此该声明在 Google 路径没有 wire 效果——如实界定，不做假装翻译。

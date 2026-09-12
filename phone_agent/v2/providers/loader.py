@@ -63,6 +63,7 @@ class DeclarationWarning:
     scope: str
     name: str
     error: str
+    blocks_selection: bool = False
 
 
 def _make_warning(source: Any, scope: str, name: Any, exc: BaseException) -> DeclarationWarning:
@@ -74,6 +75,7 @@ def _make_warning(source: Any, scope: str, name: Any, exc: BaseException) -> Dec
         scope=scope,
         name=str(name),
         error=f"{type(exc).__name__}: {text}",
+        blocks_selection=isinstance(exc, ContextDeclarationError),
     )
 
 
@@ -105,11 +107,17 @@ _CAMEL_TO_SNAKE = {
     "thinkingFormat": "thinking_format",
     "supportsParallelToolCalls": "supports_parallel_tool_calls",
     "extraBody": "extra_body",
+    "requestApi": "request_api",
+    "cachePolicy": "cache_policy",
 }
 
 
 class ModelsFileError(Exception):
     """A models.json file is malformed or references undefined env vars."""
+
+
+class ContextDeclarationError(ModelsFileError):
+    """An explicit protocol/cache choice must not silently become a default."""
 
 
 def candidate_paths(config: Any = None) -> list[Path]:
@@ -145,10 +153,15 @@ def _parse_compat(data: Any) -> ProviderCompat:
             "max_tokens_field",
             "thinking_format",
             "supports_parallel_tool_calls",
+            "request_api",
+            "cache_policy",
         }:
             kwargs[field] = value
         # Unknown compat keys are ignored (forward compatibility).
-    return ProviderCompat(**kwargs)
+    try:
+        return ProviderCompat(**kwargs)
+    except ValueError as exc:
+        raise ContextDeclarationError(str(exc)) from exc
 
 
 def _parse_thinking_map(value: Any) -> Any:
@@ -215,7 +228,11 @@ def _parse_model(data: Any, *, env: dict[str, str]) -> tuple[str, ModelSpec]:
         kwargs["headers"] = resolve_headers(headers, env=env)
     compat = data.get("compat")
     if compat is not None:
-        kwargs["compat"] = _parse_compat(compat)
+        try:
+            kwargs["compat"] = _parse_compat(compat)
+        except ContextDeclarationError as exc:
+            exc.model_id = model_id
+            raise
     return model_id, ModelSpec(**kwargs)
 
 
@@ -285,7 +302,12 @@ def _parse_provider(
         except Exception as exc:  # noqa: BLE001 - strict mode re-raises below
             if warnings is None:
                 raise
-            warnings.append(_make_warning(source, "model", provider_id, exc))
+            name = (
+                f"{provider_id}:{exc.model_id}"
+                if isinstance(exc, ContextDeclarationError) and getattr(exc, "model_id", None)
+                else provider_id
+            )
+            warnings.append(_make_warning(source, "model", name, exc))
             continue
         models[model_id] = spec
     overrides = data.get("modelOverrides") or {}
@@ -579,6 +601,7 @@ def apply_provider_declarations(registry: Any, config: Any = None) -> None:
     explicit = getattr(config, "models_file", None)
     declarations: list[DeclarationWarning] = []
     roles: dict[str, RoleSpec] = {}
+    context_errors: dict[tuple[str, str | None], str] = {}
     for path in candidate_paths(config):
         try:
             path.stat()
@@ -599,7 +622,20 @@ def apply_provider_declarations(registry: Any, config: Any = None) -> None:
             except Exception as exc:  # noqa: BLE001 - one bad merge never disables the rest
                 declarations.append(_make_warning(path, "provider", provider_id, exc))
                 continue
+            if spec.compat is not None:
+                context_errors.pop((provider_id, None), None)
+            for model_id in spec.models:
+                context_errors.pop((provider_id, model_id), None)
+        for warning in warnings:
+            if not warning.blocks_selection:
+                continue
+            if warning.scope == "model" and ":" in warning.name:
+                provider_id, model_id = warning.name.split(":", 1)
+                context_errors[(provider_id, model_id)] = warning.error
+            elif warning.scope == "provider":
+                context_errors[(warning.name, None)] = warning.error
         roles.update(file_roles)
     registry.roles = roles  # loader-side attach (see docstring)
     registry.declaration_warnings = declarations
+    registry.context_selection_errors = context_errors
     _log_warnings(declarations)
