@@ -865,6 +865,7 @@ class ThinPhoneAgent:
                 memory_state_provider=self._compact_memory_state,
                 pruner=pruner,
                 tools_provider=lambda: list(getattr(self, "tools", None) or []),
+                trace_recorder=getattr(self._trace, "record_event", None),
             )
 
         def budget_middleware_factory():
