@@ -19,6 +19,8 @@ _CACHED_TOKEN_PATHS: tuple[tuple[str, ...], ...] = (
     ("input_token_details", "cached_tokens"),
     ("input_tokens_details", "cached_tokens"),
     ("input_token_details", "cache_read"),
+    ("input_token_details", "priority_cache_read"),
+    ("input_token_details", "flex_cache_read"),
     ("input_token_details", "cache_read_input_tokens"),
     ("cached_tokens",),
     ("cached_input_tokens",),
@@ -30,6 +32,89 @@ _CACHED_TOKEN_PATHS: tuple[tuple[str, ...], ...] = (
     ("cachedContentTokenCount",),
 )
 
+_CACHE_WRITE_PATHS: tuple[tuple[str, ...], ...] = (
+    ("input_token_details", "cache_creation"),
+    ("input_token_details", "priority_cache_creation"),
+    ("input_token_details", "flex_cache_creation"),
+    ("input_tokens_details", "cache_write_tokens"),
+    ("prompt_tokens_details", "cache_write_tokens"),
+    ("cache_creation_input_tokens",),
+    ("cache_write_tokens",),
+)
+
+
+def _reported_count(value: Any) -> int | None:
+    """Keep absent/invalid counts unknown rather than manufacturing a zero."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if count < 0 or isinstance(value, float) and count != value:
+        return None
+    return count
+
+
+def _count_at_paths(metadata: Mapping, paths: tuple[tuple[str, ...], ...]) -> int | None:
+    found: list[int] = []
+    for path in paths:
+        value: Any = metadata
+        for key in path:
+            if not isinstance(value, Mapping) or key not in value:
+                break
+            value = value[key]
+        else:
+            count = _reported_count(value)
+            if count is not None:
+                found.append(count)
+    # Aliases describe the same quantity; never add raw and normalized copies.
+    return max(found, default=None)
+
+
+def usage_details(response: Any, *, model: Any = None) -> dict[str, int | None]:
+    """Read optional numeric telemetry without making it a call failure."""
+    try:
+        return _usage_details(response, model=model)
+    except Exception:  # noqa: BLE001 - custom telemetry must fail open
+        return dict.fromkeys(("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"))
+
+
+def _usage_details(response: Any, *, model: Any = None) -> dict[str, int | None]:
+    """Safe, optional input/cache counts for observability, without repricing.
+
+    Accept an AIMessage or LangChain ModelResponse. Input/output come only from
+    normalized usage: raw provider totals can have different inclusion rules.
+    Cached tokens remain part of input; the legacy budget still counts I + O.
+    Missing cache-write data is unknown, not evidence of a free cache write.
+    """
+
+    result = getattr(response, "result", None)
+    if isinstance(result, (list, tuple)):
+        response = next(
+            (item for item in reversed(result) if getattr(item, "type", None) == "ai"),
+            result[-1] if result else None,
+        )
+    if model is not None:
+        from phone_agent.v2.providers.context import normalize_model_usage
+
+        normalized = normalize_model_usage(model, response)
+        if isinstance(normalized, Mapping):
+            return {
+                name: _reported_count(normalized.get(name))
+                for name in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+            }
+    metadata = getattr(response, "usage_metadata", None)
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    return {
+        "input_tokens": _reported_count(metadata.get("input_tokens")),
+        "output_tokens": _reported_count(metadata.get("output_tokens")),
+        "cache_read_tokens": _count_at_paths(metadata, _CACHED_TOKEN_PATHS),
+        "cache_write_tokens": _count_at_paths(metadata, _CACHE_WRITE_PATHS),
+    }
+
 
 def _cached_tokens(message: Any) -> int:
     """Return provider-reported cached input tokens, or zero if absent."""
@@ -37,19 +122,7 @@ def _cached_tokens(message: Any) -> int:
     metadata = getattr(message, "usage_metadata", None)
     if not isinstance(metadata, Mapping):
         return 0
-    found: list[int] = []
-    for path in _CACHED_TOKEN_PATHS:
-        value: Any = metadata
-        for key in path:
-            if not isinstance(value, Mapping) or key not in value:
-                break
-            value = value[key]
-        else:
-            try:
-                found.append(max(0, int(value or 0)))
-            except (TypeError, ValueError):
-                continue
-    return max(found, default=0)
+    return _count_at_paths(metadata, _CACHED_TOKEN_PATHS) or 0
 
 
 class UsageLedger:
@@ -138,4 +211,4 @@ class UsageLedger:
             self._cached_by_role.clear()
 
 
-__all__ = ["UsageLedger", "USAGE_ROLES"]
+__all__ = ["UsageLedger", "USAGE_ROLES", "usage_details"]

@@ -63,6 +63,7 @@ cp .env.example .env
 | 产出物 | `write_document` / `update_document` 写成本 run 的单页 HTML | [Web 控制台](https://tom-cat-mao.github.io/TaskWizard/console/) |
 | 模型提供方 | 默认零配置走 `.env` 网关；多提供方用单层 `models.json` + 角色 `provider:model` 路由；可选 `PHONE_AGENT_FALLBACK_MODEL` 在首选构建/调用失败时降级一次并写审计；可选 `PHONE_AGENT_STREAMING` 让模型流式接收并聚合完整消息（headless/各角色/控制台一致，控制台另可增量观察正文） | [配置参考](https://tom-cat-mao.github.io/TaskWizard/configuration/) |
 | 插件系统 | 策略层全事件化；插件经 entry points 或 `plugin add` 挂入同一装配层 | [插件开发](https://tom-cat-mao.github.io/TaskWizard/plugins/) |
+| 上下文观测 | 每个实际模型尝试独立准备与容量检查；trace 记录有序客户端差异与可空 input/output/cache read/write，缓存命中不抵扣原 token 预算 | [架构](https://tom-cat-mao.github.io/TaskWizard/architecture/) |
 | 本地控制台 | 固定顶栏 + 设备栏 + 任务工作区（步骤/任务板/应用库/记忆/产出页签，人工确认置顶）；runner 子进程执行、可重连回放；可选模型流式增量面板 | [Web 控制台](https://tom-cat-mao.github.io/TaskWizard/console/) |
 
 ## 文档

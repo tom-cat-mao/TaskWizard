@@ -98,7 +98,7 @@ class BudgetMiddleware(AgentMiddleware):
         self._exhausted = False
         self._used_tokens = 0
         self._counted_id: str | None = None
-        self._previous_input_blocks: tuple[str, str, tuple[str, ...]] | None = None
+        self._previous_input_blocks: tuple[str, tuple[tuple[str, str], ...]] | None = None
 
     def reset(self) -> None:
         """Clear per-run state so a reused agent budgets the next run from zero."""
@@ -278,47 +278,42 @@ class BudgetMiddleware(AgentMiddleware):
         self.after_model(payload, payload.get("runtime"))
 
 
-def _input_block_hashes(request: Any) -> tuple[str, str, tuple[str, ...]]:
-    """Hash system / pinned TaskDoc / remaining message blocks separately."""
+def _input_block_hashes(request: Any) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Hash the canonical message order without promoting a dynamic TaskDoc.
+
+    This is a local message-level diagnostic, not server token-prefix length.
+    Only a separate/leading system prompt is accounted before the transcript.
+    Message ids remain excluded because reducer identity is not prompt content.
+    """
 
     messages = list(getattr(request, "messages", None) or [])
     system_message = getattr(request, "system_message", None)
     system_index: int | None = None
-    if system_message is None:
-        for index, message in enumerate(messages):
-            if isinstance(message, SystemMessage) and not _is_taskdoc(message):
-                system_message = message
-                system_index = index
-                break
+    if system_message is None and messages:
+        if isinstance(messages[0], SystemMessage) and not _is_taskdoc(messages[0]):
+            system_message = messages[0]
+            system_index = 0
 
-    taskdoc_messages: list[Any] = []
-    tail: list[Any] = []
+    blocks: list[tuple[str, str]] = []
     for index, message in enumerate(messages):
         if index == system_index:
             continue
-        if _is_taskdoc(message):
-            taskdoc_messages.append(message)
-        else:
-            tail.append(message)
-
-    return (
-        _block_hash(system_message),
-        _block_hash(taskdoc_messages),
-        tuple(_block_hash(message) for message in tail),
-    )
+        label = "taskdoc" if _is_taskdoc(message) else f"messages[{len(blocks)}]"
+        blocks.append((label, _block_hash(message)))
+    return _block_hash(system_message), tuple(blocks)
 
 
 def _first_diff_block(
-    previous: tuple[str, str, tuple[str, ...]],
-    current: tuple[str, str, tuple[str, ...]],
+    previous: tuple[str, tuple[tuple[str, str], ...]],
+    current: tuple[str, tuple[tuple[str, str], ...]],
 ) -> str | None:
     if previous[0] != current[0]:
         return "system"
-    if previous[1] != current[1]:
-        return "taskdoc"
-    old_messages, new_messages = previous[2], current[2]
+    old_messages, new_messages = previous[1], current[1]
     for index, (old, new) in enumerate(zip(old_messages, new_messages)):
         if old != new:
+            if old[0] == new[0] == "taskdoc":
+                return "taskdoc"
             return f"messages[{index}]"
     if len(old_messages) != len(new_messages):
         return f"messages[{min(len(old_messages), len(new_messages))}]"

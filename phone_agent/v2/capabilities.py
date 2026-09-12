@@ -631,6 +631,9 @@ def _apply_budget(ctx: CapabilityAssemblyContext) -> None:
     ctx.on(MODEL_PRE_REQUEST, budget.on_pre_request)
     ctx.on(MODEL_REQUEST, budget.on_model_request)
     ctx.on(MODEL_POST_REQUEST, budget.on_post_request)
+    tool_guard = getattr(budget, "on_tool_execute", None)
+    if callable(tool_guard):
+        ctx.on(TOOL_EXECUTE, tool_guard, prepend=True)
     ctx.register_service("budget_instance", budget)
 
 
