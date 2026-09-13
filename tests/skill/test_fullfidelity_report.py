@@ -38,6 +38,15 @@ _PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 )
 _PNG_B64 = base64.b64encode(_PNG_BYTES).decode()
+
+
+@pytest.fixture(autouse=True)
+def _no_project_models(monkeypatch):
+    """Keep the offline run independent of any local ``.taskwizard.models.json``."""
+
+    from phone_agent.v2.providers import loader
+
+    monkeypatch.setattr(loader, "candidate_paths", lambda config=None: [])
 _PNG_URL = f"data:image/png;base64,{_PNG_B64}"
 
 FAKE_PHONE = "13800138000"
@@ -190,8 +199,13 @@ def _run_scripted(
     model_mod.build_chat_model = lambda cfg, *args, **kwargs: model
     session_mod = types.ModuleType("phone_agent.v2.session")
     session_mod.PhoneSession = lambda cfg: session
+    # Keep the real package ``__path__`` so runtime submodule imports still
+    # resolve while ``build_tools`` is stubbed (see test_evidence_schema).
+    import phone_agent.v2.tools as _real_tools
+
     tools_mod = types.ModuleType("phone_agent.v2.tools")
     tools_mod.build_tools = lambda sess, cfg: _build_tools(sess)
+    tools_mod.__path__ = list(getattr(_real_tools, "__path__", []))
     prompts_mod = types.ModuleType("phone_agent.v2.prompts")
     prompts_mod.get_system_prompt = lambda lang="cn": "你是手机智能体。"
 
@@ -350,74 +364,10 @@ def test_analyzer_builds_step_replay_with_image_path(run):
     )
     replay = summary["replay"]
     assert replay, "analyzer produced no replay"
-    # step 1 carries the model thinking + a tool call whose observation has an
-    # on-disk screenshot path.
+    # step 1 carries the model-visible text + a tool call whose observation has
+    # an on-disk screenshot path.
     step1 = next(s for s in replay if s["step"] == 1)
-    assert step1["thinking"] == LONG_THINK
+    assert step1["model_text"] == LONG_THINK
     tc = step1["tool_calls"][0]
     assert tc["tool"] == "read_screen"
     assert tc["image"]["path"].startswith("screenshots/screen-")
-
-
-# --------------------------------------------------------------------------
-# --share redacted, screenshot-free copy
-# --------------------------------------------------------------------------
-def test_share_copy_is_redacted_and_screenshot_free(tmp_path):
-    import run_diagnosis
-
-    rc = run_diagnosis.main(
-        ["run", "--dry-run", "--output-dir", str(tmp_path), "--quiet", "--share", "分享冒烟"]
-    )
-    assert rc == 0
-    run_dir = next(p for p in tmp_path.iterdir() if p.is_dir())
-
-    share = run_dir / "report-share.html"
-    full = run_dir / "report.html"
-    assert share.exists() and full.exists()
-    # share copy carries no screenshot file reference (only the static template
-    # placeholder ``screen-<seq>.png`` may appear, never a concrete screen-N.png).
-    share_html = share.read_text(encoding="utf-8")
-    assert 'src="screenshots/' not in share_html
-    assert "screenshots/screen-1.png" not in share_html
-    # a redacted share summary is written alongside.
-    assert (run_dir / "summary-share.json").exists()
-    # both reports are base64-free and 0600.
-    assert "data:image" not in share_html
-    assert stat.S_IMODE(share.stat().st_mode) == 0o600
-
-
-def test_share_copy_redacts_sensitive_text(tmp_path):
-    # Build a summary that contains a sensitive value, write it, then run the
-    # ``report --share`` path and assert the value is gone from the share HTML.
-    import run_diagnosis
-    from report import render_html
-
-    summary = {
-        "run_id": "t1", "created_at": "t", "target": f"给 {FAKE_PHONE} 发消息",
-        "verdict": "success", "run_dir": str(tmp_path), "command": [], "duration_sec": 1,
-        "steps": 1, "evidence_stream": None, "trace": None, "artifacts": {},
-        "terminal": {"finished": True, "finish_summary": f"token {FAKE_KEY}", "takeover_reason": None,
-                     "reason": None, "returncode": 0},
-        "finish_gate": {"attempted": True, "accepted": True, "blocked_by_open_items": False,
-                        "open_items_at_finish": [], "rejections": []},
-        "taskdoc_final": {"goal_base": f"给 {FAKE_PHONE} 发消息", "amendments": [], "items": [],
-                          "facts": [], "counts": {"total": 0, "completed": 0, "in_progress": 0, "pending": 0, "blocked": 0},
-                          "open_item_count": 0, "terminal_state": "no_board"},
-        "stagnation": {}, "context": {}, "hitl": {"decisions": []}, "tool_health": {"by_tool": {}},
-        "grounding": {}, "visual": {}, "model": {}, "replay": [], "findings": [], "recommendations": [],
-    }
-    summary_path = tmp_path / "summary.json"
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
-
-    # sanity: the full report DOES carry the sensitive text (local-first fidelity).
-    assert FAKE_PHONE in render_html(summary, [])
-
-    out = tmp_path / "report-share.html"
-    rc = run_diagnosis.main(["report", str(summary_path), "--share", "--output", str(out)])
-    assert rc == 0
-    share_html = out.read_text(encoding="utf-8")
-    assert FAKE_PHONE not in share_html
-    assert FAKE_KEY not in share_html
-    # the redaction marker survives (angle brackets are \u-escaped in the JSON
-    # island, so match the escaped form / the bare word).
-    assert "redacted" in share_html

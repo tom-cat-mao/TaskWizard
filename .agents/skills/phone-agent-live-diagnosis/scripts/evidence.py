@@ -25,7 +25,9 @@ _WINDOW_MARKER = "windowed/"
 _OP_LEVELS = ("confirmed", "likely", "blocked", "unknown")
 _WINDOW_HEAD_RE = re.compile(r"^(W\d+)\b(.*)$")
 
-# Event discriminants (mirror the middleware schema, §1).
+# Event discriminants (mirror the middleware schema). ``stagnation_nudge`` was
+# removed from the runtime (U3 replaced it with the transcript-derived flow
+# line), so it is no longer a recognized diagnostic event.
 EVENTS = (
     "run_start",
     "model_request",
@@ -34,7 +36,6 @@ EVENTS = (
     "tool_invoke",
     "tool_observation",
     "hitl_decision",
-    "stagnation_nudge",
     "run_end",
 )
 
@@ -46,21 +47,44 @@ def read_evidence(path: str | Path) -> list[dict[str, Any]]:
     partially-flushed stream from an interrupted run still analyzes.
     """
 
+    rows, _ = read_evidence_with_issues(path)
+    return rows
+
+
+def read_evidence_with_issues(
+    path: str | Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Like :func:`read_evidence` but also returns bounded parse issues.
+
+    Diagnostic-stream malformed lines must be reported (not silently dropped) so
+    the report can distinguish "no evidence" from "evidence we could not parse".
+    """
+
     p = Path(path)
+    issues: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     if not p.exists():
-        return events
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+        return events, issues
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return events, [{"source": p.name, "line": None, "reason": f"read_error:{type(exc).__name__}"}]
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
         if not line:
             continue
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
+            if len(issues) < 20:
+                issues.append({"source": p.name, "line": lineno, "reason": "invalid_json"})
             continue
-        if isinstance(obj, dict):
-            events.append(obj)
-    return events
+        if not isinstance(obj, dict):
+            if len(issues) < 20:
+                issues.append({"source": p.name, "line": lineno, "reason": "not_an_object"})
+            continue
+        events.append(obj)
+    return events, issues
 
 
 def parse_obs_block(text: str) -> dict[str, Any] | None:
@@ -318,7 +342,6 @@ class EvidenceView:
     invocations: list[dict[str, Any]] = field(default_factory=list)
     observations: list[dict[str, Any]] = field(default_factory=list)
     hitl_decisions: list[dict[str, Any]] = field(default_factory=list)
-    stagnation_nudges: list[dict[str, Any]] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -357,8 +380,6 @@ class EvidenceView:
                 pending_invoke = None
             elif kind == "hitl_decision":
                 view.hitl_decisions.append(ev)
-            elif kind == "stagnation_nudge":
-                view.stagnation_nudges.append(ev)
         return view
 
     def latest_taskdoc(self) -> dict[str, Any] | None:
@@ -416,6 +437,7 @@ class EvidenceView:
 __all__ = [
     "EVENTS",
     "read_evidence",
+    "read_evidence_with_issues",
     "parse_obs_block",
     "parse_obs_windows",
     "result_text_of",

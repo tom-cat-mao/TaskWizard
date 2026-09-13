@@ -26,6 +26,9 @@ python3 -m venv .venv
 ```
 
 真机诊断从 `.agents/skills/phone-agent-live-diagnosis/SKILL.md` 开始；运行或监控设备任务前先读该 skill。
+诊断使用 Case + 正式 runner/IPC，报告分开呈现终局事实、检查点证据与诊断推断；`dry-run` 仅验证合成管线，
+不等于真机验收。该目录是唯一权威源，`.claude/skills/phone-agent-live-diagnosis` 与
+`.codebuddy/skills/phone-agent-live-diagnosis` 是随仓库维护的相对符号链接，勿另行复制成独立版本。
 
 ## P0 Contracts (Must Never Violate)
 

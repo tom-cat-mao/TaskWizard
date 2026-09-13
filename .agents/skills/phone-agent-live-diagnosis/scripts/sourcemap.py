@@ -1,11 +1,16 @@
-"""v2 source map: report category -> v2 source files + on-disk line anchors.
+"""v2 source map: report category -> *candidate* v2 source files + anchors.
 
-Per ``outputs/design-council/ROUND2-D1.md`` §5. Replaces the v1 ``SOURCE_RULES``
-(which pointed at the deleted ``phone_agent/graph/*``). Each category maps to the
-v2 file(s) that own that behavior so a finding can render a clickable
-``path:line`` anchor. ``add_line_numbers`` / ``find_anchors`` resolve real
-def/class line numbers from the working tree (kept from the v1 helper — still
-correct against any tree).
+Replaces the v1 ``SOURCE_RULES`` (which pointed at the deleted
+``phone_agent/graph/*``). Each category maps to the v2 file(s) that **own** the
+behavior, so a finding can render a clickable ``path:line`` anchor.
+
+**The map is a candidate list, not a proven root cause.** A category firing
+tells the reviewer which files are worth reading first; a ``path:line`` anchor
+marks *where a symbol lives*, not *where a bug was proven*. The report labels
+findings as inference and requires the reviewer to confirm against the cited
+step evidence. ``add_line_numbers`` / ``find_anchors`` resolve real def/class
+line numbers from the working tree (kept from the v1 helper — still correct
+against any tree).
 """
 
 from __future__ import annotations
@@ -109,16 +114,49 @@ V2_SOURCE_RULES: dict[str, dict[str, Any]] = {
     "finish_gate": {
         "layer": "finish",
         "severity": "P0",
-        "title": "完成门（finish gate）：证据缺失 / 路线未闭合",
+        "title": "完成门（finish gate）：证据缺失 / 路线未闭合 / 复核包",
         "files": [
             "phone_agent/v2/tools/control.py",
+            "phone_agent/v2/review.py",
             "phone_agent/v2/taskdoc.py",
         ],
         "suggestion": (
-            "finish 要求非空 evidence 且 TaskDoc 无 open 项。被 open items 拦截说明路线未闭合——"
-            "先完成、标 blocked（带 reason）或用 update_task_doc 修正路线，绝不放宽 gate。"
+            "finish 是两段式：首次调用返回 [FINISH 复核包]（一次 observe），"
+            "模型读镜像后调用 finish(confirm=true) 才落定；confirm 只有在"
+            " screen_seq 未变（复核件仍新鲜）时才被接受。证据缺失或 TaskDoc 有 open 项"
+            "会 fail-closed 拒绝。先完成/标 blocked（带 reason）或修正路线，绝不放宽 gate。"
         ),
-        "verify": "构造空 evidence 与仍有 pending 项的 finish，确认均被拒并回到路线。",
+        "verify": "构造空 evidence、仍有 pending 项、以及复核包后发生新观测的三条路径，确认均被拒并回到路线。",
+    },
+    "finish_verifier": {
+        "layer": "finish",
+        "severity": "P1",
+        "title": "独立验收器（finish verifier）：驳回 / 反复驳回转接管",
+        "files": [
+            "phone_agent/v2/verify.py",
+            "phone_agent/v2/tools/control.py",
+        ],
+        "suggestion": (
+            "验收器只看目标 + 证据路线 + 尾部截图，绝不看 actor transcript。"
+            "它故障是 fail-open（status=skipped 放行并记审计），不是失败；被驳回是"
+            "证据不足的世界事实。连续 2 次驳回才转人工接管。"
+        ),
+        "verify": "构造高风险目标（触发 auto 验收）与被驳回后补充证据的两条路径，确认 skipped/fail-open 与 dispute→takeover 语义。",
+    },
+    "safety": {
+        "layer": "safety",
+        "severity": "P0",
+        "title": "安全预警流（wary 默认）：风险执行被拦截待确认",
+        "files": [
+            "phone_agent/v2/middleware/safety.py",
+            "phone_agent/config/policy.py",
+        ],
+        "suggestion": (
+            "默认 wary：分类为风险的可逆/不可逆执行调用不执行、不叫人工，只回预警"
+            "（世界事实 + 选项）；模型带 confirm_irreversible=true 重发才执行。"
+            "ask_user/take_over 在任何模式都 interrupt。误触发核对分类级联（recall→可选 reviewer→hard）。"
+        ),
+        "verify": "运行不可逆提交、密码框、凭据输入、敏感 app 启动四类 case，确认预警、确认放行与 hard 模式 HITL 路径正确。",
     },
     "taskdoc": {
         "layer": "taskdoc",
@@ -183,8 +221,12 @@ V2_SOURCE_RULES: dict[str, dict[str, Any]] = {
             "phone_agent/v2/middleware/images.py",
             "phone_agent/v2/middleware/taskdoc.py",
         ],
-        "suggestion": "历史截图逐轮剪裁（只留最新一张带图消息）；TaskDoc 每轮重钉，压缩免疫。峰值图像消息数应恒为 1。",
-        "verify": "多步任务后检查 evidence 的 image_message_count 是否稳定为 1、taskdoc_present 是否每步为真。",
+        "suggestion": (
+            "历史图像逐轮剪裁（默认保留最新 2 条带图消息，PHONE_AGENT_IMAGE_KEEP）；"
+            "TaskDoc 每轮重钉，压缩免疫。原生签名块无法安全投影时 micro 预检 fail-closed"
+            "（native_context_pruning_conflict），不搬签名也不多留旧图。"
+        ),
+        "verify": "多步任务后检查 evidence 的 image_message_count 是否稳定 ≤ image_keep、taskdoc_present 是否每步为真。",
     },
     "visual": {
         "layer": "visual",

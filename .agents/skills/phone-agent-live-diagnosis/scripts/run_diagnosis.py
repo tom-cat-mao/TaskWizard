@@ -1,25 +1,41 @@
 #!/usr/bin/env python3
-"""Live-diagnosis CLI orchestration for the TaskWizard thin-loop (v2) agent.
+"""Runner-backed live diagnosis for the TaskWizard thin-loop (v2) agent.
 
-Per ``outputs/design-council/ROUND2-D1.md`` §5. This is the driver that ties the
-diagnostic evidence stream to the analysis + report package:
+This driver **reuses the formal runtime** instead of reimplementing it:
 
-* ``run`` (default): build a :class:`~phone_agent.v2.config.V2Config` with the
-  diagnostic evidence stream enabled, run :class:`~phone_agent.v2.agent.ThinPhoneAgent`
-  **in process** (no subprocess — the v1 eval harness is gone), then analyze the
-  emitted ``<run_id>.evidence.jsonl`` into ``summary.json`` + ``report.html``.
-* ``run --dry-run``: no device / no network. A scripted fake model + fake session
-  are injected via ``sys.modules`` (mirroring ``tests/v2/test_agent_loop.py``) and
-  the **real** middleware stack runs (safety / images / trace / taskdoc /
-  diagnostic), so a real evidence stream + summary + report are produced offline.
-* ``analyze <evidence.jsonl>`` / ``report <summary.json>``: re-derive the summary
-  or re-render the report from existing artifacts without re-running the agent.
-* ``status <dir>``: print a run directory's ``status.json``.
+* a real run is launched as ``python -m phone_agent.runner <spec.json>`` built
+  from :mod:`phone_agent.v2.run_ipc` — the same assembly, safety policy,
+  ``V2Config`` precedence, ``models.json``/roles and plugin authorization the
+  console uses;
+* ``V2Config.from_env`` applies the normal precedence (CLI flag > shell env >
+  project ``.env`` > default), and the fully resolved values go into the spec;
+* the diagnostic evidence stream is enabled only through the spec overrides
+  (``diagnostic_evidence`` / ``diagnostic_evidence_dir`` / ``diagnostic_unredacted``),
+  never by editing the runtime;
+* human interaction and stop reuse the runner control channel
+  (``control.jsonl``): ``hitl`` answers a *currently pending* prompt, ``stop``
+  requests a soft stop. **A requested stop is not an ended run**, and a control
+  answer is not execution fact — only the runner's clearing event proves
+  consumption.
 
-The heavy lifting lives in the sibling modules: :mod:`evidence` (read the JSONL),
-:mod:`taxonomy` (classify tool returns), :mod:`analyze` (build ``summary.json``),
-:mod:`sourcemap` (v2 source map), :mod:`report` (render HTML). This file only
-orchestrates + preflights + drives the agent.
+Subcommands::
+
+    start <case.json> [run flags]    # detached: return immediately, do not wait
+    wait  <run_dir> [--timeout S]    # poll to a real run_end, then finalize
+    case  <case.json> [run flags]    # start + wait + finalize (foreground)
+    run   "<target>" [run flags]     # ad-hoc Case from a bare target
+    dry-run [--output-dir D]         # offline synthetic smoke (unique new dir)
+    monitor <run_dir> [--follow]     # live state from real events
+    hitl <run_dir> <answer>          # answer the current pending HITL prompt
+    stop <run_dir>                   # append a stop request
+    analyze <run_dir>                # re-derive summary.json from artifacts
+    report  <run_dir|summary.json>   # re-render report.html from a saved summary
+    status  <run_dir>                # print status.json
+
+Deleted from the previous skill: ``--share`` (regex redaction is not a security
+boundary), ``--reset-app`` (destructive ``pm clear``), ``--nudge-steps`` (the
+runtime nudge was removed), and the v1 flags. The runner's process exit code is
+**never** treated as Case or harness success.
 """
 
 from __future__ import annotations
@@ -27,404 +43,83 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-# The skill ships under <repo>/.agents/skills/phone-agent-live-diagnosis/scripts.
-# Put the scripts dir first (sibling module imports) and the repo root next
-# (``phone_agent`` package) on sys.path so this runs as a bare script *and*
-# imports cleanly as a module in tests.
+# Sibling modules import by bare name (as the tests do).
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from sourcemap import resolve_repo_root  # noqa: E402  (after sys.path setup)
+from sourcemap import resolve_repo_root  # noqa: E402
 
 ROOT = resolve_repo_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from analyze import build_summary  # noqa: E402
-from evidence import EvidenceView, read_evidence  # noqa: E402
+from case import Case, case_from_target, load_case, synthetic_case  # noqa: E402
+from evidence import EvidenceView, read_evidence, read_evidence_with_issues  # noqa: E402
+from events import RunnerEventsView, read_json_object  # noqa: E402
 from report import render_html  # noqa: E402
+from synthetic import write_synthetic_run  # noqa: E402
 
 DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "live-diagnosis"
-_APPROVE_TOKENS = {"approve", "yes", "y", "同意", "确认", "ok", "允许", "批准"}
-_REJECT_TOKENS = {"reject", "no", "n", "拒绝", "取消", "deny", "否"}
-_MLX_PROVIDERS = {
-    "hybrid",
-    "accessibility_locateanything",
-    "uiautomator_locateanything",
-    "locateanything",
-    "locateanything_mlx",
-    "mlx",
+
+_ARTIFACT_GLOBS = ("summary.json", "report.html", "evidence.jsonl", "status.json", "case.json", "launch.json", "*.evidence.jsonl")
+
+# Terminal harness states that mean "the run ended" (real run_end event).
+_TERMINAL_STATES = {
+    "succeeded",
+    "takeover",
+    "stopped",
+    "token_budget_exhausted",
+    "loop_fuse",
+    "error",
+    "failed",
 }
 
 
 # ---------------------------------------------------------------------------
-# small helpers (kept from v1; still valid against the v2 tree)
+# small helpers
 # ---------------------------------------------------------------------------
-def load_project_env() -> None:
-    """Load ``PHONE_AGENT_*`` defaults from the project .env (shell env wins)."""
-
-    env_path = ROOT / ".env"
-    if not env_path.exists():
-        return
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :].strip()
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if not key.startswith("PHONE_AGENT_") or key in os.environ:
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
-        os.environ[key] = value
-
-
 def slugify(value: str) -> str:
     import re
 
     text = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "-", (value or "").strip()).strip("-")
-    if not text:
-        return uuid.uuid4().hex[:8]
-    return text[:80]
+    return text[:60] or uuid.uuid4().hex[:8]
 
 
 def build_run_id(target: str) -> str:
-    return time.strftime("%Y%m%d-%H%M%S") + "-" + slugify(target)[:36]
+    return time.strftime("%Y%m%d-%H%M%S") + "-" + slugify(target)[:30] + "-" + uuid.uuid4().hex[:6]
 
 
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    _chmod_600(path)
 
 
-def parse_bool(value: str | None, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def trim(value: str, limit: int) -> str:
-    text = value or ""
-    return text if len(text) <= limit else text[:limit] + "\n...<truncated>"
-
-
-def safe_cmd(cmd: list[str], timeout: int = 8) -> dict[str, Any]:
-    started = time.perf_counter()
+def _chmod(path: Path, mode: int) -> None:
     try:
-        result = subprocess.run(
-            cmd, cwd=ROOT, capture_output=True, text=True, timeout=timeout
-        )
-        return {
-            "ok": result.returncode == 0,
-            "returncode": result.returncode,
-            "stdout": trim(result.stdout, 4000),
-            "stderr": trim(result.stderr, 4000),
-            "duration_ms": int((time.perf_counter() - started) * 1000),
-        }
-    except Exception as exc:  # noqa: BLE001 - preflight is best-effort
-        return {
-            "ok": False,
-            "returncode": None,
-            "stdout": "",
-            "stderr": type(exc).__name__,
-            "duration_ms": int((time.perf_counter() - started) * 1000),
-        }
-
-
-def check_mlx_metal(python_path: str) -> dict[str, Any]:
-    """Probe MLX + Metal so hybrid/LocateAnything runs fail fast, not mid-run."""
-
-    script = "\n".join(
-        [
-            "import platform, json",
-            "payload={'platform': platform.system(), 'machine': platform.machine()}",
-            "try:",
-            "    import mlx.core as mx",
-            "    payload['import_ok']=True",
-            "    payload['default_device']=str(mx.default_device())",
-            "    payload['sum']=int(mx.sum(mx.array([1,2,3])).item())",
-            "    payload['metal_ok']=payload['sum']==6",
-            "except Exception as exc:",
-            "    payload['import_ok']=False",
-            "    payload['metal_ok']=False",
-            "    payload['error_type']=type(exc).__name__",
-            "    payload['error']=str(exc)[:500]",
-            "print(json.dumps(payload, ensure_ascii=False))",
-        ]
-    )
-    result = safe_cmd([python_path, "-c", script], timeout=12)
-    payload: dict[str, Any] = {}
-    if result.get("stdout"):
-        try:
-            payload = json.loads(str(result["stdout"]).splitlines()[0])
-        except (json.JSONDecodeError, IndexError):
-            payload = {}
-    return {**result, "parsed": payload}
-
-
-def collect_preflight(args: argparse.Namespace) -> dict[str, Any]:
-    """v2 preflight: python/.venv, adb + ``wm size``, MLX-Metal, config digest.
-
-    Dropped the v1 ``output-mode`` / ``context-mode`` / ``thinking`` probes (no
-    v2 equivalent). Records the grounding provider + taskdoc switch so the report
-    header reflects how the run was configured.
-    """
-
-    venv_python = ROOT / ".venv" / "bin" / "python"
-    python_path = str(venv_python) if venv_python.exists() else sys.executable
-    adb_path = shutil.which("adb")
-    provider = str(getattr(args, "grounding_provider", None) or "hybrid")
-    data: dict[str, Any] = {
-        "repo": str(ROOT),
-        "python": python_path,
-        "adb_path": adb_path,
-        "dry_run": bool(getattr(args, "dry_run", False)),
-        "device_id": getattr(args, "device_id", None),
-        "grounding_provider": provider,
-        "taskdoc_enabled": not bool(getattr(args, "no_taskdoc", False)),
-        "checks": {},
-    }
-    data["checks"]["python_version"] = safe_cmd([python_path, "--version"])
-    if provider.lower() in _MLX_PROVIDERS:
-        data["checks"]["mlx_metal"] = check_mlx_metal(python_path)
-    if adb_path and not data["dry_run"]:
-        data["checks"]["adb_version"] = safe_cmd([adb_path, "version"])
-        data["checks"]["adb_devices"] = safe_cmd([adb_path, "devices", "-l"])
-        prefix = [adb_path, "-s", args.device_id] if args.device_id else [adb_path]
-        data["checks"]["wm_size"] = safe_cmd(prefix + ["shell", "wm", "size"])
-    return data
-
-
-def resolve_reset_app(args: argparse.Namespace) -> str | None:
-    """Package to ``pm clear`` before the run (explicit ``--reset-app`` only)."""
-
-    if getattr(args, "reset_app", None):
-        return str(args.reset_app).strip() or None
-    return None
-
-
-def reset_app_on_device(args: argparse.Namespace) -> dict[str, Any]:
-    """Best-effort ``adb shell pm clear <package>``; never gates the run."""
-
-    package = resolve_reset_app(args)
-    if not package:
-        return {"reset_app": None, "performed": False}
-    adb_path = shutil.which("adb")
-    if not adb_path:
-        return {"reset_app": package, "performed": False, "error": "adb_not_found"}
-    cmd = [adb_path]
-    if args.device_id:
-        cmd += ["-s", args.device_id]
-    cmd += ["shell", "pm", "clear", package]
-    result = safe_cmd(cmd, timeout=30)
-    return {
-        "reset_app": package,
-        "performed": result.get("returncode") == 0,
-        "returncode": result.get("returncode"),
-        "stdout": trim(str(result.get("stdout") or ""), 500),
-        "stderr": trim(str(result.get("stderr") or ""), 500),
-    }
-
-
-def read_status(path: Path) -> dict[str, Any]:
-    """Read a run directory's (or explicit) ``status.json``."""
-
-    target = path / "status.json" if path.is_dir() else path
-    if target.exists():
-        try:
-            return json.loads(target.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return {"state": "invalid_status_json", "path": str(target)}
-    return {"state": "status_missing", "path": str(target)}
-
-
-# ---------------------------------------------------------------------------
-# redaction (shares the production primitive so report parity holds)
-# ---------------------------------------------------------------------------
-def _redact(text: str | None) -> str:
-    """Sensitive-substring redaction via the production shared primitive."""
-
-    if not text:
-        return ""
-    try:
-        from phone_agent.v2.middleware._redact import redact_text
-
-        return redact_text(text)
-    except Exception:  # noqa: BLE001 - degrade to identity only if import fails
-        return str(text)
-
-
-# Image keys whose values are screenshot file references; stripped for --share so
-# the shared copy carries no on-disk screenshot pointer.
-_SCREENSHOT_REF_KEYS = {"path"}
-
-
-def _redact_deep(value: Any) -> Any:
-    """Recursively redact strings and strip screenshot references (for --share).
-
-    The default report is full-fidelity (local-first): unredacted text +
-    ``<img src="screenshots/...">`` references. The ``--share`` copy must not
-    leak either, so this pass (a) redacts every string via :func:`_redact` and
-    (b) drops any ``image.path`` screenshot reference so the shared HTML renders
-    no screenshot. Base64 never exists in the summary/evidence to begin with.
-    """
-
-    if isinstance(value, str):
-        return _redact(value)
-    if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for key, item in value.items():
-            if key in _SCREENSHOT_REF_KEYS and isinstance(item, str):
-                # drop the screenshot file pointer entirely.
-                continue
-            out[str(key)] = _redact_deep(item)
-        return out
-    if isinstance(value, (list, tuple)):
-        return [_redact_deep(item) for item in value]
-    return value
-
-
-def _chmod_600(path: Path) -> None:
-    """Best-effort ``chmod 600`` on a produced artifact (local-first privacy)."""
-
-    try:
-        if path.exists():
-            path.chmod(0o600)
+        os.chmod(path, mode)
     except OSError:
         pass
 
 
-# ---------------------------------------------------------------------------
-# HITL logging handler (writes hitl_decision events into the evidence stream)
-# ---------------------------------------------------------------------------
-def _decision_from_answer(answer: str) -> str:
-    low = (answer or "").strip().lower()
-    if low in _APPROVE_TOKENS:
-        return "approve"
-    if not low or low in _REJECT_TOKENS:
-        return "reject"
-    return "respond"
-
-
-def logging_hitl_handler(
-    evidence_path: str | None,
-    base_handler: Callable[[str], str] = input,
-    unredacted: bool = True,
-) -> Callable[[str], str]:
-    """Wrap a HITL handler so each human verdict is appended to the evidence.
-
-    A HITL interrupt unwinds the graph, so the diagnostic middleware's
-    ``wrap_tool_call`` never sees the human decision (§1). The driver records it
-    here instead: the requested action + the decision + the reply are appended as
-    a ``hitl_decision`` event to the same ``<run_id>.evidence.jsonl``.
-
-    Local-first full-fidelity (A5): by default (``unredacted``) the prompt/reply
-    are kept verbatim to match the rest of the diagnosis stream; ``--share``
-    deep-redacts the whole summary later. Pass ``unredacted=False`` to redact
-    inline (parity with the pre-A5 behavior).
-    """
-
-    text = (lambda s: s) if unredacted else _redact
-
-    def handler(prompt: str) -> str:
-        answer = str(base_handler(prompt))
-        if evidence_path:
-            event = {
-                "event": "hitl_decision",
-                "ts": time.time(),
-                "tool": None,
-                "requested_action": text(prompt),
-                "decision": _decision_from_answer(answer),
-                "response_text": text(answer),
-            }
-            try:
-                with open(evidence_path, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(event, ensure_ascii=False) + "\n")
-            except Exception:  # noqa: BLE001 - observability must never crash the run
-                pass
-        return answer
-
-    return handler
+def _chmod_600(path: Path) -> None:
+    _chmod(path, 0o600)
 
 
 # ---------------------------------------------------------------------------
-# outcome assembly
-# ---------------------------------------------------------------------------
-def _returncode_for(success: bool, reason: str, takeover: str | None) -> int:
-    if success:
-        return 0
-    if takeover:
-        return 2
-    if reason in {"token_budget_exhausted", "loop_fuse", "max_model_calls"}:
-        return 3
-    return 1
-
-
-def _outcome_from_run(session: Any, result: Any) -> dict[str, Any]:
-    """Build the analyzer ``outcome`` dict from a live/ dry run result.
-
-    Local-first full-fidelity (A5): ``finish_summary`` / ``takeover_reason`` are
-    kept verbatim here so the default ``report.html`` shows the real terminal
-    text. The ``--share`` export deep-redacts the whole summary separately; the
-    P0 #6 production trace stays redacted regardless.
-    """
-
-    finished = bool(getattr(session, "finished", False))
-    takeover = getattr(session, "takeover_reason", None) or None
-    reason = str(getattr(result, "reason", "") or "")
-    success = bool(getattr(result, "success", False))
-    return {
-        "finished": finished,
-        "finish_summary": getattr(session, "finish_summary", None) or None,
-        "takeover_reason": takeover,
-        "reason": reason,
-        "returncode": _returncode_for(success, reason, takeover),
-        "steps": getattr(result, "steps", None),
-    }
-
-
-def _outcome_from_evidence(view: EvidenceView) -> dict[str, Any]:
-    """Rebuild an ``outcome`` dict from an evidence stream (analyze subcommand).
-
-    The evidence ``run_end.terminal`` is already redacted by the middleware, so
-    nothing here re-introduces secrets.
-    """
-
-    terminal = (view.run_end or {}).get("terminal", {}) if view.run_end else {}
-    finished = bool(terminal.get("finished"))
-    takeover = terminal.get("takeover_reason")
-    return {
-        "finished": finished,
-        "finish_summary": terminal.get("finish_summary"),
-        "takeover_reason": takeover,
-        "reason": None,
-        "returncode": _returncode_for(finished, "", takeover),
-        "steps": (view.run_end or {}).get("steps") if view.run_end else None,
-    }
-
-
-# ---------------------------------------------------------------------------
-# run drivers
+# config + spec (reuse the formal IPC/config stack)
 # ---------------------------------------------------------------------------
 def _overrides_from_args(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
-    """Map ``run`` CLI flags to V2Config field names.
-
-    Unset flags default to ``None`` and are dropped by ``V2Config.from_env`` so
-    they never clobber env-derived values. The diagnostic evidence stream + trace
-    dir are forced on so the skill always captures a stream to analyze.
-    """
+    """Map run flags to V2Config fields; unset flags are dropped (None)."""
 
     overrides: dict[str, Any] = {
         "device_id": args.device_id,
@@ -440,608 +135,922 @@ def _overrides_from_args(args: argparse.Namespace, run_dir: Path) -> dict[str, A
         "locateanything_model": args.locateanything_model,
         "locateanything_max_size": args.locateanything_max_size,
         "lang": args.lang,
-        "taskdoc_nudge_steps": args.nudge_steps,
-        # forced on for diagnosis:
+        "token_budget": args.token_budget,
+        # Diagnosis evidence is enabled through the resolved config (spec
+        # overrides only) — the production default stays OFF.
         "diagnostic_evidence": True,
         "diagnostic_evidence_dir": str(run_dir),
-        "trace_dir": str(run_dir / "traces"),
-        # local-first full-fidelity (A5): the diagnosis reader is the device owner
-        # on their own machine, so the evidence stream is UNREDACTED by default.
-        # ``--share`` never touches this — it re-derives a redacted copy from the
-        # full-fidelity artifacts. The P0 #6 production trace stays redacted.
         "diagnostic_unredacted": True,
+        "trace_dir": str(run_dir / "traces"),
     }
     if args.no_taskdoc:
         overrides["taskdoc_enabled"] = False
-    return overrides
-
-
-def run_agent(args: argparse.Namespace, run_dir: Path) -> tuple[Any, Any]:
-    """Run the real :class:`ThinPhoneAgent` in-process with diagnosis enabled."""
-
-    from phone_agent.v2.agent import ThinPhoneAgent
-    from phone_agent.v2.config import V2Config
-
-    config = V2Config.from_env(_overrides_from_args(args, run_dir))
-    agent = ThinPhoneAgent(config)
-    handler = logging_hitl_handler(agent.evidence_path)
-    result = agent.run(args.target, hitl_handler=handler)
-    return agent, result
-
-
-def run_dry(args: argparse.Namespace, run_dir: Path) -> tuple[Any, Any]:
-    """Offline pipeline: scripted model + fake session, real middleware stack.
-
-    Injects fake ``phone_agent.v2.{model,session,tools,prompts}`` modules via
-    ``sys.modules`` (mirrors ``tests/v2/test_agent_loop.py``) so the real
-    ThinPhoneAgent assembly + middleware run without a device or network, and a
-    real ``evidence.jsonl`` / ``summary.json`` / ``report.html`` are produced.
-
-    This validates the pipeline end-to-end; it does **not** exercise real
-    grounding / finish semantics (that is stated in the report, per §5).
-    """
-
-    import types
-
-    from langchain_core.language_models.chat_models import BaseChatModel
-    from langchain_core.messages import AIMessage
-    from langchain_core.outputs import ChatGeneration, ChatResult
-    from langchain_core.tools import tool
-
-    from phone_agent.v2.config import V2Config
-
-    class ScriptedToolModel(BaseChatModel):
-        responses: list[AIMessage]
-        i: int = 0
-
-        def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # noqa: ANN001
-            response = self.responses[min(self.i, len(self.responses) - 1)]
-            self.i += 1
-            return ChatResult(generations=[ChatGeneration(message=response)])
-
-        def bind_tools(self, tools, **kwargs):  # noqa: ANN001
-            return self
-
-        @property
-        def _llm_type(self) -> str:
-            return "scripted-tool-model"
-
-    def _tool_call(name: str, tool_args: dict, call_id: str) -> AIMessage:
-        return AIMessage(
-            content="",
-            tool_calls=[
-                {"name": name, "args": tool_args, "id": call_id, "type": "tool_call"}
-            ],
-        )
-
-    class DryConfig:
-        """Minimal config the fake session exposes to the middleware digest."""
-
-        def __init__(self, base: Any) -> None:
-            self.model_name = getattr(base, "model_name", "dry-run")
-            self.grounding_provider = getattr(base, "grounding_provider", "none")
-            self.max_model_calls = getattr(base, "max_model_calls", 20)
-            self.lang = getattr(base, "lang", "cn")
-            self.taskdoc_enabled = getattr(base, "taskdoc_enabled", True)
-            self.device_id = None
-
-    class DryObservation:
-        def __init__(self, seq: int) -> None:
-            self.screenshot_b64 = "QUJD"  # "ABC"; never logged (base64-drop)
-            self.width = 1080
-            self.height = 2400
-            self.current_app = "com.android.settings"
-            self.screen_seq = seq
-            self.marks: dict = {}
-
-    class DrySession:
-        def __init__(self, base_config: Any) -> None:
-            self.config = DryConfig(base_config)
-            self.screen_seq = 0
-            self.finished = False
-            self.finish_summary: str | None = None
-            self.takeover_reason: str | None = None
-            self.task_doc = None
-            self.seen_states: set = set()
-            self.nudged = False
-
-        def observe(self) -> DryObservation:
-            self.screen_seq += 1
-            self.seen_states.add(("com.android.settings", f"screen_{self.screen_seq}"))
-            return DryObservation(self.screen_seq)
-
-    def _build_dry_tools(session: DrySession):
-        from phone_agent.v2.taskdoc import TaskDoc, TaskItem
-
-        @tool
-        def read_screen() -> str:
-            """Re-observe the current screen and return an observation digest."""
-            obs = session.observe()
-            return f"[OBS] app={obs.current_app} screen#{obs.screen_seq}\nmarks (0): "
-
-        @tool
-        def update_task_doc(
-            items: list[dict] | None = None,
-            add_amendments: list[str] | None = None,
-            facts: list[str] | None = None,
-        ) -> str:
-            """Maintain the task board (goal / route / key facts)."""
-            current = session.task_doc or TaskDoc()
-            candidate = TaskDoc(
-                goal_base=current.goal_base,
-                amendments=list(current.amendments),
-                items=list(current.items),
-                facts=list(current.facts),
-            )
-            if items is not None:
-                candidate.items = [
-                    TaskItem(
-                        id=str(it.get("id", "")),
-                        content=str(it.get("content", "")),
-                        status=str(it.get("status", "pending")),
-                        reason=it.get("reason"),
-                        evidence_note=it.get("evidence_note"),
-                    )
-                    for it in items
-                ]
-            if add_amendments:
-                candidate.amendments.extend(str(a) for a in add_amendments)
-            if facts is not None:
-                candidate.facts = [str(f) for f in facts]
-            # A4 contract alignment: validate against the pre-write board so the
-            # transition discipline (no pending→completed jump / batch back-fill)
-            # matches the real ``update_task_doc`` tool.
-            error = candidate.validate(previous=current)
-            if error is not None:
-                return f"未写入（校验失败）：{error}"
-            session.task_doc = candidate
-            return "已更新任务板。"
-
-        @tool
-        def tap(
-            target_mark_id: str | None = None, target_description: str | None = None
-        ) -> str:
-            """Tap a UI element by mark id or natural-language description."""
-            return "OK. tapped"
-
-        @tool
-        def finish(summary: str, evidence: list[str]) -> str:
-            """Declare the task finished. evidence must be non-empty."""
-            if not [e for e in (evidence or []) if str(e).strip()]:
-                return "error: finish requires non-empty evidence"
-            doc = session.task_doc
-            if doc is not None and doc.has_open_items():
-                return f"路线仍有未完成项：{doc.open_items_summary()}。"
-            session.finished = True
-            session.finish_summary = summary
-            return "已记录完成声明"
-
-        return [read_screen, update_task_doc, tap, finish]
-
-    config = V2Config.from_env(_overrides_from_args(args, run_dir))
-    session = DrySession(config)
-    responses = [
-        _tool_call("read_screen", {}, "c1"),
-        # A4/S3 transition discipline: a route item enters as in_progress and
-        # only then completes (with evidence) — never created already-completed.
-        _tool_call(
-            "update_task_doc",
-            {"items": [{"id": "s1", "content": "打开设置页", "status": "in_progress"}]},
-            "c2",
-        ),
-        _tool_call(
-            "update_task_doc",
-            {"items": [{"id": "s1", "content": "打开设置页", "status": "completed", "evidence_note": "screen#1 设置页可见"}]},
-            "c2b",
-        ),
-        _tool_call("tap", {"target_mark_id": "ax_1"}, "c3"),
-        _tool_call(
-            "finish",
-            {"summary": "已打开设置", "evidence": ["屏幕显示设置页"]},
-            "c4",
-        ),
-        AIMessage(content="任务完成"),
-    ]
-    model = ScriptedToolModel(responses=responses)
-
-    model_mod = types.ModuleType("phone_agent.v2.model")
-    model_mod.build_chat_model = lambda cfg, *args, **kwargs: model
-    session_mod = types.ModuleType("phone_agent.v2.session")
-    session_mod.PhoneSession = lambda cfg: session
-    tools_mod = types.ModuleType("phone_agent.v2.tools")
-    tools_mod.build_tools = lambda sess, cfg: _build_dry_tools(sess)
-    prompts_mod = types.ModuleType("phone_agent.v2.prompts")
-    prompts_mod.get_system_prompt = lambda lang="cn": "你是手机智能体。"
-
-    saved: dict[str, Any] = {}
-    injected = {
-        "phone_agent.v2.model": model_mod,
-        "phone_agent.v2.session": session_mod,
-        "phone_agent.v2.tools": tools_mod,
-        "phone_agent.v2.prompts": prompts_mod,
+    return {
+        key: value
+        for key, value in overrides.items()
+        if value is not None or key.startswith("diagnostic_") or key == "trace_dir"
     }
-    for name, mod in injected.items():
-        saved[name] = sys.modules.get(name)
-        sys.modules[name] = mod
-    try:
-        from phone_agent.v2.agent import ThinPhoneAgent
-
-        agent = ThinPhoneAgent(config)
-        handler = logging_hitl_handler(
-            agent.evidence_path, base_handler=lambda p: "approve"
-        )
-        result = agent.run(args.target, hitl_handler=handler)
-    finally:
-        for name, prev in saved.items():
-            if prev is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
-    return agent, result
 
 
-# ---------------------------------------------------------------------------
-# post-run finalization (shared by run / dry-run)
-# ---------------------------------------------------------------------------
-_ARTIFACT_NAMES = ("summary.json", "report.html", "evidence.jsonl", "status.json")
+def _load_project_env() -> None:
+    """Load project ``.env`` defaults (shell env wins). Real runs only.
 
-
-def _lock_down_artifacts(run_dir: Path) -> None:
-    """chmod 600 every produced artifact + screenshot (local-first privacy).
-
-    The default report is full-fidelity (unredacted text + on-disk screenshots),
-    so the run dir carries private data. Tighten file perms to the owner. The
-    screenshots the middleware writes are already 600; re-assert here for any
-    that predate this pass and for the top-level artifacts.
+    ``V2Config.from_env`` itself does not call this; the formal CLI loads the
+    project env first. We keep the call behind a small wrapper so offline
+    commands never touch local config and tests can patch it.
     """
 
-    for name in _ARTIFACT_NAMES:
-        _chmod_600(run_dir / name)
-    for pattern in ("*.evidence.jsonl", "preflight.json"):
-        for path in run_dir.glob(pattern):
-            _chmod_600(path)
-    shots = run_dir / "screenshots"
-    if shots.is_dir():
-        for png in shots.glob("*.png"):
-            _chmod_600(png)
+    from phone_agent.v2.config import load_project_env
+
+    load_project_env()
 
 
-def _write_share_copy(
-    run_dir: Path, summary: dict[str, Any], events: list[dict[str, Any]]
-) -> Path:
-    """Produce the redacted, screenshot-free ``report-share.html`` (A5 §4).
+def _resolve_config(args: argparse.Namespace, run_dir: Path) -> Any:
+    """Real-run config resolution: project ``.env`` -> env -> CLI overrides.
 
-    The default artifacts are local-first full-fidelity. ``--share`` derives a
-    copy safe to hand to someone else: every string is redacted via the
-    production primitive and every ``image.path`` screenshot pointer is dropped,
-    so the shared HTML references no screenshot and leaks no sensitive text. A
-    ``summary-share.json`` is written alongside for parity.
+    This is only used on the real launch path. Offline commands (`dry-run`,
+    `analyze`, `report`, `monitor`) never call it.
     """
 
-    share_summary = _redact_deep(summary)
-    share_events = _redact_deep(events)
-    share_summary.setdefault("notes", []).append(
-        "share 副本：全文脱敏、无截图引用；本机全保真产物见 report.html。"
+    from phone_agent.v2.config import V2Config
+
+    _load_project_env()
+    config = V2Config.from_env(_overrides_from_args(args, run_dir))
+    if getattr(args, "device_id", None) is not None and not str(args.device_id).strip():
+        config.device_id = None
+    return config
+
+
+def _build_spec(config: Any, run_id: str, task: str, run_dir: Path) -> dict[str, Any]:
+    """Build a RunSpec through the formal IPC helpers (fingerprint-safe)."""
+
+    from phone_agent.v2.run_ipc import (
+        RunPaths,
+        RunSpec,
+        app_kb_generation,
+        capability_snapshot,
+        config_fingerprint,
+        resolved_config_dict,
+        write_run_spec,
     )
-    share_report = run_dir / "report-share.html"
-    share_report.write_text(render_html(share_summary, share_events), encoding="utf-8")
-    write_json(run_dir / "summary-share.json", share_summary)
-    _chmod_600(share_report)
-    _chmod_600(run_dir / "summary-share.json")
-    return share_report
+
+    paths = RunPaths.for_run(run_dir.parent, run_id)
+    config_values = resolved_config_dict(config)
+    snapshot = {
+        "config_fingerprint": config_fingerprint(config_values),
+        "memory_generation": app_kb_generation(config),
+        "capabilities": capability_snapshot(config),
+        "ts": time.time(),
+    }
+    spec = RunSpec(
+        run_id=run_id,
+        task=task,
+        overrides=config_values,
+        snapshot=snapshot,
+        events_path=str(paths.events.resolve()),
+        control_path=str(paths.control.resolve()),
+    )
+    write_run_spec(paths.spec, spec)
+    return {"spec_path": str(paths.spec), "paths": paths}
 
 
-def _finalize(
+# ---------------------------------------------------------------------------
+# launching (detached worker; monkeypatchable in tests)
+# ---------------------------------------------------------------------------
+def _runner_command(spec_path: Path) -> list[str]:
+    """The formal runner command. Overridable for an offline fake worker."""
+
+    return [sys.executable, "-m", "phone_agent.runner", str(spec_path)]
+
+
+def _spawn_runner(spec_path: Path, run_dir: Path) -> dict[str, Any]:
+    """Launch the formal runner as a detached process; return its pid.
+
+    The runtime owns ``runner.pid`` (it writes it at start and removes it on
+    terminal), so the launcher does **not** write it — that avoids a stale-PID
+    race when a very fast runner already exited. Kept narrow so tests can
+    replace it with a fake.
+    """
+
+    log_path = run_dir / "runner.log"
+    log = log_path.open("a", encoding="utf-8")
+    try:
+        process = subprocess.Popen(
+            _runner_command(spec_path),
+            cwd=str(ROOT),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    finally:
+        log.close()
+    _chmod_600(log_path)
+    return {"pid": process.pid, "process": process}
+
+
+# ---------------------------------------------------------------------------
+# outcome + finalization
+# ---------------------------------------------------------------------------
+class EvidenceAmbiguity(RuntimeError):
+    """Multiple producer evidence streams exist and none was named explicitly."""
+
+
+def _find_evidence(
+    run_dir: Path, run_id: str | None = None, explicit: Path | None = None
+) -> Path | None:
+    """Resolve the diagnostic stream to read.
+
+    An explicitly supplied path wins exactly. Otherwise the producer
+    ``<run_id>.evidence.jsonl`` is preferred; if several producers exist and no
+    ``run_id`` disambiguates them, that is an error (never a blind first pick).
+    ``evidence.jsonl`` is only a derived copy and is used only when no producer
+    exists.
+    """
+
+    if explicit is not None:
+        return explicit
+    if run_id:
+        producer = run_dir / f"{run_id}.evidence.jsonl"
+        if producer.exists():
+            return producer
+    producers = sorted(run_dir.glob("*.evidence.jsonl"))
+    if len(producers) > 1:
+        names = ", ".join(p.name for p in producers)
+        raise EvidenceAmbiguity(f"multiple producer evidence streams: {names}")
+    if len(producers) == 1:
+        return producers[0]
+    stable = run_dir / "evidence.jsonl"
+    if stable.exists():
+        return stable
+    return None
+
+
+def _pid_alive(run_dir: Path) -> bool | None:
+    """Process liveness, falling back to the launcher PID during startup.
+
+    The runtime owns ``runner.pid`` but writes it a moment after exec; if the
+    child dies before that, the persisted ``launch.json`` pid is the only
+    liveness anchor. Returns ``None`` only when neither pid is available.
+    """
+
+    try:
+        from phone_agent.v2.run_ipc import pid_is_alive, read_pid
+
+        pid = read_pid(run_dir / "runner.pid")
+        if pid is None:
+            launch = read_json_object(run_dir / "launch.json") or {}
+            try:
+                pid = int(launch.get("pid"))
+            except (TypeError, ValueError):
+                pid = None
+        if pid is None:
+            return None
+        return pid_is_alive(pid)
+    except Exception:  # noqa: BLE001 - liveness unknown -> None (never faked)
+        return None
+
+
+def _load_case_for_run(run_dir: Path) -> Case | None:
+    payload = read_json_object(run_dir / "case.json")
+    if not payload:
+        return None
+    try:
+        return Case.from_dict(payload)
+    except Exception:  # noqa: BLE001 - a corrupt case.json must not gate the report
+        return None
+
+
+def _duration_from_events(events: RunnerEventsView) -> float | None:
+    start, end = events.event_time_span()
+    if start is None or end is None:
+        return None
+    return round(max(0.0, end - start), 2)
+
+
+def _status_from_harness(summary: dict[str, Any]) -> dict[str, Any]:
+    """Honest status: derived from the harness terminal, not a process exit code."""
+
+    harness = summary.get("harness_terminal") or {}
+    state = str(harness.get("state") or "unknown")
+    if state == "succeeded":
+        state_class = "completed"
+    elif state in _TERMINAL_STATES:
+        state_class = "failed"
+    elif state == "stopping":
+        state_class = "stopping"
+    elif state == "running":
+        state_class = "running"
+    else:
+        state_class = "incomplete"
+    return {
+        "state": state_class,
+        "harness_state": state,
+        "run_end_seen": bool(harness.get("run_end_seen")),
+        "run_summary_present": bool(harness.get("run_summary_present")),
+        "stop_requested": bool(harness.get("stop_requested")),
+        "process_alive": harness.get("process_alive"),
+        "status_source": "derived_cache",
+    }
+
+
+def live_status(run_dir: Path) -> dict[str, Any]:
+    """Re-derive status from the current IPC files (not the cached status.json).
+
+    Shared by ``status`` and ``monitor`` so an ended run never keeps reporting
+    ``running`` from a stale startup snapshot.
+    """
+
+    events = RunnerEventsView.load(run_dir)
+    alive = _pid_alive(run_dir)
+    terminal = events.harness_terminal()
+    state = terminal["state"]
+    if alive is False and state in {"running", "stopping"}:
+        state = "unknown_terminated"
+    harness = {**terminal, "state": state, "process_alive": alive}
+    status = _status_from_harness({"harness_terminal": harness})
+    status["status_source"] = "live_events"
+    status["run_id"] = (events.run_json or {}).get("run_id") or run_dir.name
+    status["pid"] = _read_pid_safe(run_dir)
+    status["steps"] = terminal.get("steps")
+    status["last_event"] = events.events[-1].get("event") if events.events else None
+    hitl = events.hitl_state()
+    status["unresolved_hitl"] = hitl["unresolved_prompts"]
+    status["hitl_submitted"] = hitl["submitted_count"]
+    status["hitl_consumed"] = hitl["consumed_count"]
+    return status
+
+
+def _read_pid_safe(run_dir: Path) -> int | None:
+    try:
+        from phone_agent.v2.run_ipc import read_pid
+
+        return read_pid(run_dir / "runner.pid")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _exit_code_from_summary(summary: dict[str, Any]) -> int:
+    """Command exit-code convention (never conflates process exit 0 with success).
+
+    * 0 harness succeeded
+    * 2 harness ended non-success (failed / takeover / stopped / budget / fuse / error)
+    * 4 process died without a run_end (unknown_terminated)
+    * 5 still running / stopping (no terminal)
+    """
+
+    state = str((summary.get("harness_terminal") or {}).get("state") or "unknown")
+    if state == "succeeded":
+        return 0
+    if state in _TERMINAL_STATES:
+        return 2
+    if state == "unknown_terminated":
+        return 4
+    return 5
+
+
+def finalize(
     *,
     run_dir: Path,
     run_id: str,
+    case: Case | None,
     target: str,
-    command: list[str],
-    evidence_path: str | None,
-    outcome: dict[str, Any],
-    duration_sec: float,
-    dry_run: bool,
-    share: bool = False,
+    command: list[str] | None = None,
+    duration_sec: float | None = None,
+    notes: list[str] | None = None,
+    evidence_path_override: Path | None = None,
+    process_alive: bool | None = None,
 ) -> dict[str, Any]:
-    """Analyze the emitted evidence into summary.json + report.html + status.json.
+    """Analyze the run's two evidence planes into summary + report + status.
 
-    Local-first full-fidelity: ``report.html`` is the unredacted primary
-    deliverable and references screenshots on disk. When ``share`` is set an
-    additional redacted, screenshot-free ``report-share.html`` is written.
+    Re-analysis preserves previously saved run metadata (``created_at``,
+    ``command``) and recomputes ``duration_sec`` from event timestamps whenever
+    they exist, so an intermediate analyze does not freeze the final duration.
     """
 
-    events = read_evidence(evidence_path) if evidence_path else []
-    view = EvidenceView.from_events(events)
-    # Copy the evidence into the run dir under a stable name if it lives elsewhere.
-    local_evidence = run_dir / "evidence.jsonl"
-    if evidence_path and Path(evidence_path).exists():
-        try:
-            shutil.copy2(evidence_path, local_evidence)
-        except Exception:  # noqa: BLE001 - copy is a convenience, not required
-            local_evidence = Path(evidence_path)
+    events = RunnerEventsView.load(run_dir)
+    if case is not None:
+        write_json(run_dir / "case.json", case.to_dict())
+    else:
+        case = _load_case_for_run(run_dir)
+    target = target or (case.goal if case else "")
+
+    evidence_path = _find_evidence(run_dir, run_id, explicit=evidence_path_override)
+    evidence_events: list[dict[str, Any]] = []
+    diagnostic_issues: list[dict[str, Any]] = []
+    if evidence_path is not None:
+        evidence_events, diagnostic_issues = read_evidence_with_issues(evidence_path)
+        # Maintain the stable copy as a derived artifact (never the source).
+        if evidence_path.name != "evidence.jsonl":
+            try:
+                (run_dir / "evidence.jsonl").write_text(
+                    evidence_path.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+                _chmod_600(run_dir / "evidence.jsonl")
+            except OSError:
+                pass
+    view = EvidenceView.from_events(evidence_events)
+
+    previous = read_json_object(run_dir / "summary.json") or {}
+    launch = read_json_object(run_dir / "launch.json") or {}
+    created_at = previous.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%S")
+    # Recompute duration from events whenever a span exists (an earlier analyze
+    # must not freeze a shorter duration).
+    event_duration = _duration_from_events(events)
+    if event_duration is not None:
+        duration_sec = event_duration
+    elif duration_sec is None:
+        duration_sec = previous.get("duration_sec")
+    # The persisted launch descriptor is the real startup command; never let a
+    # re-analysis ('wait'/'analyze') command overwrite it.
+    effective_command = (
+        launch.get("command")
+        or previous.get("command")
+        or command
+        or []
+    )
+    if process_alive is None:
+        process_alive = _pid_alive(run_dir)
 
     summary = build_summary(
-        outcome,
+        {},
         view,
         run_id=run_id,
-        created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        created_at=created_at,
         target=target,
+        case=case,
+        events=events,
         run_dir=str(run_dir),
-        command=command,
-        duration_sec=round(duration_sec, 2),
-        evidence_stream=str(local_evidence),
+        command=effective_command,
+        duration_sec=duration_sec,
+        evidence_stream=str(run_dir / "evidence.jsonl"),
         trace=str(run_dir / "traces"),
         artifacts={
             "summary": str(run_dir / "summary.json"),
             "report": str(run_dir / "report.html"),
-            "evidence": str(local_evidence),
+            "evidence": str(run_dir / "evidence.jsonl"),
         },
+        process_alive=process_alive,
+        extra_data_issues=diagnostic_issues,
     )
-    if dry_run:
-        summary.setdefault("notes", []).append(
-            "dry-run：脚本化模型 + 假会话，仅验证管线完整；不代表真实 grounding/finish 语义。"
-        )
-
+    for note in previous.get("notes", []) or []:
+        summary.setdefault("notes", []).append(note)
+    for note in notes or []:
+        summary.setdefault("notes", []).append(note)
     write_json(run_dir / "summary.json", summary)
     (run_dir / "report.html").write_text(
-        render_html(summary, events), encoding="utf-8"
+        render_html(summary, evidence_events), encoding="utf-8"
     )
-    share_report: Path | None = None
-    if share:
-        share_report = _write_share_copy(run_dir, summary, events)
-    status = {
-        "state": "completed" if outcome.get("returncode") == 0 else "failed",
-        "run_id": run_id,
-        "verdict": summary["verdict"],
-        "steps": summary.get("steps"),
-        "dry_run": dry_run,
-        "report_path": str(run_dir / "report.html"),
-        "summary_path": str(run_dir / "summary.json"),
-        "evidence_path": str(local_evidence),
-    }
-    if share_report is not None:
-        status["share_report_path"] = str(share_report)
+    _chmod_600(run_dir / "report.html")
+
+    status = _status_from_harness(summary)
+    status.update(
+        {
+            "run_id": run_id,
+            "verdict": summary["verdict"],
+            "case_acceptance": (summary.get("case_acceptance") or {}).get("overall"),
+            "finished": (summary.get("harness_terminal") or {}).get("finished"),
+            "steps": summary.get("steps"),
+            "derived_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "report_path": str(run_dir / "report.html"),
+            "summary_path": str(run_dir / "summary.json"),
+            "evidence_path": str(run_dir / "evidence.jsonl"),
+        }
+    )
     write_json(run_dir / "status.json", status)
-    _lock_down_artifacts(run_dir)
+    _lock_down(run_dir)
     return summary
 
 
-# ---------------------------------------------------------------------------
-# subcommands
-# ---------------------------------------------------------------------------
-def cmd_run(args: argparse.Namespace) -> int:
-    load_project_env()
-    if getattr(args, "status", None):  # backward-compat: --status flag
-        print(json.dumps(read_status(Path(args.status)), ensure_ascii=False, indent=2))
-        return 0
-    if not args.target:
-        print("error: a target is required (or use --status / the status subcommand)", file=sys.stderr)
-        return 2
-
-    run_id = build_run_id(args.target)
-    run_dir = Path(args.output_dir).resolve() / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    preflight = collect_preflight(args)
-    preflight["reset_app"] = reset_app_on_device(args)
-    write_json(run_dir / "preflight.json", preflight)
-
-    # Local-first: the command line is recorded verbatim (the run dir is
-    # owner-private + 600). ``--share`` deep-redacts the whole summary later.
-    command = ["run_diagnosis.py", "dry-run" if args.dry_run else "run", args.target]
-    started = time.perf_counter()
-    try:
-        agent, result = run_dry(args, run_dir) if args.dry_run else run_agent(args, run_dir)
-    except Exception as exc:  # noqa: BLE001 - surface bring-up failures cleanly
-        duration = time.perf_counter() - started
-        error = {
-            "state": "error",
-            "run_id": run_id,
-            "error_type": type(exc).__name__,
-            "error": str(exc)[:500],
-            "duration_sec": round(duration, 2),
-        }
-        write_json(run_dir / "status.json", error)
-        _chmod_600(run_dir / "status.json")
-        print(json.dumps(error, ensure_ascii=False, indent=2), file=sys.stderr)
-        return 1
-    duration = time.perf_counter() - started
-
-    outcome = _outcome_from_run(agent.session, result)
-    summary = _finalize(
-        run_dir=run_dir,
-        run_id=run_id,
-        target=args.target,
-        command=command,
-        evidence_path=getattr(agent, "evidence_path", None),
-        outcome=outcome,
-        duration_sec=duration,
-        dry_run=args.dry_run,
-        share=bool(getattr(args, "share", False)),
-    )
-    if not args.quiet:
-        payload = {
-            "run_id": run_id,
-            "verdict": summary["verdict"],
-            "steps": summary.get("steps"),
-            "run_dir": str(run_dir),
-            "report_path": str(run_dir / "report.html"),
-            "summary_path": str(run_dir / "summary.json"),
-            "top_recommendations": [
-                r.get("title") for r in summary.get("recommendations", [])[:3]
-            ],
-        }
-        if getattr(args, "share", False):
-            payload["share_report_path"] = str(run_dir / "report-share.html")
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return int(outcome.get("returncode") or 0)
-
-
-def _resolve_evidence_path(raw: str) -> Path:
-    """Accept a run directory or an explicit ``*.evidence.jsonl`` / ``evidence.jsonl``."""
-
-    p = Path(raw)
-    if p.is_dir():
-        canonical = p / "evidence.jsonl"
-        if canonical.exists():
-            return canonical
-        matches = sorted(p.glob("*.evidence.jsonl"))
-        if matches:
-            return matches[0]
-        return canonical
-    return p
-
-
-def cmd_analyze(args: argparse.Namespace) -> int:
-    """Re-derive summary.json from an existing evidence stream (no re-run)."""
-
-    evidence_path = _resolve_evidence_path(args.evidence)
-    events = read_evidence(evidence_path)
-    if not events:
-        print(f"error: no evidence events read from {evidence_path}", file=sys.stderr)
-        return 1
-    view = EvidenceView.from_events(events)
-    run_start = view.run_start or {}
-    outcome = _outcome_from_evidence(view)
-    run_id = run_start.get("run_id") or evidence_path.stem
-    summary = build_summary(
-        outcome,
-        view,
-        run_id=run_id,
-        created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-        target=run_start.get("task_goal_base", ""),
-        evidence_stream=str(evidence_path),
-    )
-    out = Path(args.output) if args.output else evidence_path.with_name("summary.json")
-    write_json(out, summary)
-    if args.report:
-        report_out = Path(args.report)
-        report_out.write_text(render_html(summary, events), encoding="utf-8")
-    print(json.dumps({"summary_path": str(out), "verdict": summary["verdict"]}, ensure_ascii=False, indent=2))
-    return 0
-
-
-def cmd_report(args: argparse.Namespace) -> int:
-    """Re-render report.html from an existing summary.json (no re-run).
-
-    ``--share`` re-derives the redacted, screenshot-free share copy instead of
-    (or alongside) the full-fidelity report, mirroring the ``run --share`` path.
-    """
-
-    summary_arg = Path(args.summary)
-    summary_path = summary_arg / "summary.json" if summary_arg.is_dir() else summary_arg
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    events: list[dict[str, Any]] = []
-    evidence_ref = args.evidence or summary.get("evidence_stream")
-    if evidence_ref:
-        events = read_evidence(_resolve_evidence_path(evidence_ref))
-    if getattr(args, "share", False):
-        share_summary = _redact_deep(summary)
-        share_events = _redact_deep(events)
-        share_summary.setdefault("notes", []).append(
-            "share 副本：全文脱敏、无截图引用；本机全保真产物见 report.html。"
-        )
-        out = Path(args.output) if args.output else summary_path.with_name("report-share.html")
-        out.write_text(render_html(share_summary, share_events), encoding="utf-8")
-        _chmod_600(out)
-        print(json.dumps({"share_report_path": str(out)}, ensure_ascii=False, indent=2))
-        return 0
-    out = Path(args.output) if args.output else summary_path.with_name("report.html")
-    out.write_text(render_html(summary, events), encoding="utf-8")
-    print(json.dumps({"report_path": str(out)}, ensure_ascii=False, indent=2))
-    return 0
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    print(json.dumps(read_status(Path(args.path)), ensure_ascii=False, indent=2))
-    return 0
+def _lock_down(run_dir: Path) -> None:
+    _chmod(run_dir, 0o700)
+    for pattern in _ARTIFACT_GLOBS:
+        for path in run_dir.glob(pattern):
+            if path.is_file():
+                _chmod_600(path)
+    for sub in ("screenshots", "traces"):
+        directory = run_dir / sub
+        if directory.is_dir():
+            for path in directory.glob("*"):
+                if path.is_file():
+                    _chmod_600(path)
+    for name in ("runner.log", "runner.pid"):
+        if (run_dir / name).exists():
+            _chmod_600(run_dir / name)
 
 
 # ---------------------------------------------------------------------------
-# argument parsing
+# run commands
 # ---------------------------------------------------------------------------
-def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("target", nargs="?", help="natural-language phone-agent test target")
-    parser.add_argument("--status", help="read a run dir / status.json and print runtime status")
-    parser.add_argument("--dry-run", action="store_true", help="offline pipeline check (no device/network)")
-    parser.add_argument("--device-id", default=None, help="ADB device serial")
-    parser.add_argument("--max-steps", type=int, default=None, help="max model calls (loop budget)")
-    parser.add_argument("--base-url", default=None, help="OpenAI-compatible base URL")
-    parser.add_argument("--model", default=None, help="model id")
-    parser.add_argument("--apikey", default=None, help="API key")
+def _run_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--device-id", default=None, help="ADB device serial (blank = auto)")
+    parser.add_argument("--max-steps", type=int, default=None, help="max model calls (loop fuse)")
+    parser.add_argument("--token-budget", type=int, default=None, help="token cost ceiling")
+    parser.add_argument("--base-url", default=None)
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--apikey", default=None)
     parser.add_argument("--model-timeout", type=float, default=None)
     parser.add_argument("--model-max-retries", type=int, default=None)
-    parser.add_argument("--grounding-provider", default=None, help="grounding provider name")
+    parser.add_argument("--grounding-provider", default=None)
     parser.add_argument("--accessibility-timeout", type=float, default=None)
     parser.add_argument("--accessibility-max-marks", type=int, default=None)
     parser.add_argument("--locateanything-model", default=None)
     parser.add_argument("--locateanything-max-size", type=int, default=None)
     parser.add_argument("--lang", choices=["cn", "en"], default=None)
-    parser.add_argument("--evidence-dir", default=None, help="(reserved) evidence output dir; defaults to the run dir")
-    parser.add_argument("--no-taskdoc", action="store_true", help="disable the TaskDoc board (maps PHONE_AGENT_TASKDOC=false)")
-    parser.add_argument("--nudge-steps", type=int, default=None, help="stagnation nudge threshold")
+    parser.add_argument("--no-taskdoc", action="store_true", help="disable the TaskDoc board")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--reset-app", default=None, help="package to pm-clear before the run")
-    parser.add_argument(
-        "--share",
-        action="store_true",
-        help="also emit a redacted, screenshot-free report-share.html for sharing "
-        "(the default report.html stays local-first full-fidelity)",
+
+
+def _prepare_case(args: argparse.Namespace) -> Case:
+    if getattr(args, "case", None):
+        return load_case(args.case)
+    target = getattr(args, "target", None)
+    if not target:
+        raise ValueError("provide a case file or a target")
+    return case_from_target(target)
+
+
+def _launch_case(args: argparse.Namespace, *, command: list[str]) -> dict[str, Any]:
+    """Persist case+spec+launch metadata and spawn the runner detached."""
+
+    case = _prepare_case(args)
+    run_id = build_run_id(case.id or case.goal)
+    run_dir = Path(args.output_dir).resolve() / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    _chmod(run_dir, 0o700)
+    # Persist the Case, spec and launch metadata BEFORE launching, so an
+    # interruption still leaves an analyzable run dir with its real command.
+    write_json(run_dir / "case.json", case.to_dict())
+    write_json(
+        run_dir / "launch.json",
+        {"run_id": run_id, "task": case.goal, "case_id": case.id, "command": command},
     )
 
+    config = _resolve_config(args, run_dir)
+    built = _build_spec(config, run_id, case.task_text(), run_dir)
+    try:
+        spawned = _spawn_runner(Path(built["spec_path"]), run_dir)
+    except Exception as exc:  # noqa: BLE001 - preserve case/spec + record the failure
+        write_json(
+            run_dir / "status.json",
+            {
+                "state": "error",
+                "run_id": run_id,
+                "phase": "spawn",
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:500],
+                "status_source": "derived_cache",
+            },
+        )
+        raise
+    launch = read_json_object(run_dir / "launch.json") or {}
+    launch["pid"] = spawned.get("pid")
+    write_json(run_dir / "launch.json", launch)
+    events = RunnerEventsView.load(run_dir)
+    terminal = events.harness_terminal()
+    write_json(
+        run_dir / "status.json",
+        {
+            **_status_from_harness({"harness_terminal": terminal}),
+            "run_id": run_id,
+            "pid": spawned.get("pid"),
+            "report_path": str(run_dir / "report.html"),
+            "summary_path": str(run_dir / "summary.json"),
+        },
+    )
+    return {
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "pid": spawned.get("pid"),
+        "task": case.goal,
+        "case_id": case.id,
+        "initial_state": terminal.get("state"),
+        "report_finalize": "run `wait`/`analyze` after run_end to produce summary.json + report.html",
+        # Internal handle for the foreground caller to poll/reap; never JSON'd.
+        "_process": spawned.get("process"),
+    }
 
+
+def _launch_command(args: argparse.Namespace, sub: str) -> list[str]:
+    """The real startup descriptor (no keys/headers, not full sensitive argv).
+
+    ``sub`` is the actual subcommand used (``start`` / ``case`` / ``run``), so a
+    ``start`` invocation is never mislabelled as ``case``.
+    """
+
+    case_arg = getattr(args, "case", None) or getattr(args, "target", "")
+    return ["run_diagnosis.py", sub, case_arg]
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    try:
+        info = _launch_case(args, command=_launch_command(args, "start"))
+    except Exception as exc:  # noqa: BLE001 - clean, no side-effect error
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    process = info.pop("_process", None)
+    if process is not None:
+        # Detached path: reap the child when it exits so it never lingers as a
+        # zombie whose pid still answers os.kill(pid, 0). The daemon thread does
+        # not block the CLI from returning.
+        import threading
+
+        threading.Thread(target=process.wait, daemon=True).start()
+    if not args.quiet:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _wait_loop(run_dir: Path, timeout: float, interval: float, process: Any | None = None) -> str:
+    """Poll to a real run_end. Returns ``done`` / ``timeout`` / ``dead``.
+
+    A foreground caller passes its ``Popen`` handle so a child that exited
+    before writing ``runner.pid`` is detected immediately (and reaped) rather
+    than leaving a zombie that ``os.kill(pid, 0)`` still reports as alive.
+    """
+
+    def _exited() -> bool:
+        if process is not None and process.poll() is not None:
+            return True
+        return _pid_alive(run_dir) is False
+
+    deadline = time.monotonic() + float(timeout)
+    if _exited() and not RunnerEventsView.load(run_dir).has_run_end:
+        return "dead"
+    while True:
+        events = RunnerEventsView.load(run_dir)
+        if events.has_run_end:
+            return "done"
+        if _exited():
+            return "dead"
+        if time.monotonic() >= deadline:
+            return "timeout"
+        time.sleep(interval)
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    run_dir = Path(args.path)
+    if not run_dir.is_dir():
+        print(json.dumps({"error": f"run dir not found: {run_dir}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    outcome = _wait_loop(run_dir, args.timeout, args.interval)
+    # No command descriptor: finalize must keep the persisted launch.command.
+    summary = _finalize_dir(run_dir, quiet=args.quiet)
+    if outcome == "timeout":
+        print(json.dumps({"run_id": run_dir.name, "state": "timeout", "run_end_seen": False}, ensure_ascii=False))
+        return 3
+    if outcome == "dead":
+        print(json.dumps({"run_id": run_dir.name, "state": "unknown_terminated", "run_end_seen": False}, ensure_ascii=False))
+        return 4
+    return _exit_code_from_summary(summary)
+
+
+def cmd_case(args: argparse.Namespace) -> int:
+    """start + wait + finalize (foreground)."""
+    sub = "run" if getattr(args, "target", None) else "case"
+    try:
+        info = _launch_case(args, command=_launch_command(args, sub))
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    run_dir = Path(info["run_dir"])
+    process = info.get("_process")
+    if not getattr(args, "quiet", False):
+        # Flush launch info immediately so another terminal can answer HITL.
+        print(json.dumps({k: v for k, v in info.items() if k != "_process"}, ensure_ascii=False), flush=True)
+    outcome = _wait_loop(run_dir, getattr(args, "timeout", 1800.0), 0.5, process=process)
+    if process is not None:
+        try:
+            process.poll()  # reap if already exited (avoid a zombie)
+        except Exception:  # noqa: BLE001
+            pass
+    summary = _finalize_dir(run_dir, quiet=True)
+    if not getattr(args, "quiet", False):
+        print(json.dumps(_payload(info["run_id"], run_dir, summary), ensure_ascii=False, indent=2))
+    if outcome == "timeout":
+        return 3
+    if outcome == "dead":
+        return 4
+    return _exit_code_from_summary(summary)
+
+
+def _finalize_dir(
+    run_dir: Path,
+    *,
+    quiet: bool,
+    command: list[str] | None = None,
+    evidence_path_override: Path | None = None,
+) -> dict[str, Any]:
+    events = RunnerEventsView.load(run_dir)
+    case = _load_case_for_run(run_dir)
+    launch = read_json_object(run_dir / "launch.json") or {}
+    target = launch.get("task") or ((events.spec or {}).get("task") if isinstance(events.spec, dict) else None)
+    if not target and case:
+        target = case.goal
+    summary = finalize(
+        run_dir=run_dir,
+        run_id=(launch.get("run_id") or run_dir.name),
+        case=case,
+        target=target or "",
+        command=command,
+        evidence_path_override=evidence_path_override,
+    )
+    if not quiet:
+        print(json.dumps(_payload(summary["run_id"], run_dir, summary), ensure_ascii=False, indent=2))
+    return summary
+
+
+def cmd_dry_run(args: argparse.Namespace) -> int:
+    """Offline synthetic smoke: real analyze + report over synthetic IPC files.
+
+    Always uses the built-in synthetic Case and a **unique new** run directory;
+    it never deletes existing data and never reads local config or global memory.
+    """
+
+    case = synthetic_case()
+    run_id = "synthetic-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    run_dir = Path(args.output_dir).resolve() / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    _chmod(run_dir, 0o700)
+    write_json(run_dir / "case.json", case.to_dict())
+    write_synthetic_run(run_dir, run_id=run_id)
+    summary = finalize(
+        run_dir=run_dir,
+        run_id=run_id,
+        case=case,
+        target=case.goal,
+        command=["run_diagnosis.py", "dry-run"],
+        duration_sec=0.0,
+        notes=["dry-run：合成事件 + 合成截图，仅验证 analyze→report 管线；不代表真机能力。"],
+    )
+    if not args.quiet:
+        print(json.dumps(_payload(run_id, run_dir, summary), ensure_ascii=False, indent=2))
+    return 0
+
+
+def _payload(run_id: str, run_dir: Path, summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_id": run_id,
+        "verdict": summary.get("verdict"),
+        "harness_state": (summary.get("harness_terminal") or {}).get("state"),
+        "case_acceptance": (summary.get("case_acceptance") or {}).get("overall"),
+        "steps": summary.get("steps"),
+        "run_dir": str(run_dir),
+        "report_path": str(run_dir / "report.html"),
+        "summary_path": str(run_dir / "summary.json"),
+        "top_recommendations": [r.get("title") for r in (summary.get("recommendations") or [])[:3]],
+    }
+
+
+# ---------------------------------------------------------------------------
+# re-analysis / report / status / monitor / control
+# ---------------------------------------------------------------------------
+def cmd_analyze(args: argparse.Namespace) -> int:
+    raw = Path(args.path)
+    explicit: Path | None = None
+    if raw.is_file():
+        run_dir = raw.parent
+        # An explicitly named evidence file is used exactly; do not let
+        # _find_evidence pick a different stream.
+        if raw.name == "evidence.jsonl" or raw.name.endswith(".evidence.jsonl"):
+            explicit = raw
+    elif raw.is_dir():
+        run_dir = raw
+    else:
+        print(json.dumps({"error": f"path not found: {raw}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    try:
+        _finalize_dir(run_dir, quiet=args.quiet, evidence_path_override=explicit)
+    except EvidenceAmbiguity as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """Render-only: re-render report.html from a saved summary without re-analyzing."""
+
+    raw = Path(args.path)
+    if raw.is_dir():
+        summary_path = raw / "summary.json"
+        run_dir = raw
+    elif raw.is_file():
+        summary_path = raw
+        run_dir = raw.parent
+    else:
+        print(json.dumps({"error": f"path not found: {raw}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    summary = read_json_object(summary_path)
+    if summary is None:
+        print(json.dumps({"error": f"summary.json not found or invalid: {summary_path}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    evidence_path = None
+    if args.evidence:
+        evidence_path = Path(args.evidence)
+        if not evidence_path.exists():
+            print(json.dumps({"error": f"evidence file not found: {evidence_path}"}, ensure_ascii=False), file=sys.stderr)
+            return 1
+    else:
+        run_id = str(summary.get("run_id") or run_dir.name)
+        try:
+            evidence_path = _find_evidence(run_dir, run_id)
+        except EvidenceAmbiguity as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 1
+    events = read_evidence(evidence_path) if evidence_path else []
+    out = Path(args.output) if args.output else run_dir / "report.html"
+    out.write_text(render_html(summary, events), encoding="utf-8")
+    _chmod_600(out)
+    print(json.dumps({"report_path": str(out), "summary_path": str(summary_path)}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Print live status re-derived from IPC (not the cached startup snapshot)."""
+
+    run_dir = Path(args.path)
+    if not run_dir.is_dir():
+        print(json.dumps({"error": f"run dir not found: {run_dir}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    print(json.dumps(live_status(run_dir), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    """Print live state derived from real events (never from intent)."""
+
+    run_dir = Path(args.path)
+    if not run_dir.is_dir():
+        print(json.dumps({"error": f"run dir not found: {run_dir}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    try:
+        while True:
+            payload = live_status(run_dir)
+            print(json.dumps(payload, ensure_ascii=False))
+            if not args.follow or payload["run_end_seen"]:
+                return 0
+            if payload.get("process_alive") is False:
+                # Dead process without a terminal event: stop polling.
+                return 4
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_hitl(args: argparse.Namespace) -> int:
+    from phone_agent.v2.run_ipc import append_control
+
+    run_dir = Path(args.path)
+    if not run_dir.is_dir():
+        print(json.dumps({"error": f"run dir not found: {run_dir}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    answer = str(args.answer or "").strip()
+    if not answer:
+        print(json.dumps({"error": "empty answer refused"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    events = RunnerEventsView.load(run_dir)
+    if events.has_run_end:
+        print(json.dumps({"error": "run already terminal; refusing to queue a HITL answer"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    if _pid_alive(run_dir) is not True:
+        print(json.dumps({"error": "runner process is not confirmed alive; refusing to queue a HITL answer"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    if events.has_run_summary and not events.has_run_end:
+        print(json.dumps({"error": "run has a summary but no terminal event (unknown_terminated); refusing to queue a HITL answer"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    if events.stop_requested:
+        print(json.dumps({"error": "a stop was requested; refusing to queue a HITL answer"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    hitl = events.hitl_state()
+    if hitl["unconsumed_count"] > 0:
+        print(json.dumps({"error": "a previous HITL answer is submitted but not yet consumed; wait for the runner to clear it"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    if not hitl["unresolved_prompts"]:
+        print(json.dumps({"error": "no pending HITL prompt; refusing to pre-queue an answer"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    append_control(run_dir / "control.jsonl", {"type": "hitl", "answer": answer})
+    print(json.dumps({"appended": "hitl", "run_dir": str(run_dir), "prompt": hitl["unresolved_prompts"][-1]}))
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    from phone_agent.v2.run_ipc import append_control
+
+    run_dir = Path(args.path)
+    if not run_dir.is_dir():
+        print(json.dumps({"error": f"run dir not found: {run_dir}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    events = RunnerEventsView.load(run_dir)
+    if events.has_run_end:
+        print(json.dumps({"error": "run already terminal; nothing to stop"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    if _pid_alive(run_dir) is False:
+        print(json.dumps({"error": "runner process is not alive; nothing to stop"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    append_control(run_dir / "control.jsonl", {"type": "stop"})
+    print(json.dumps({"appended": "stop", "note": "请求停止 ≠ 已结束；用 monitor 观察 run_end。"}))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# parser
+# ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run_diagnosis.py",
-        description="TaskWizard thin-loop (v2) live diagnosis: run + analyze + report",
+        description="TaskWizard thin-loop (v2) runner-backed live diagnosis",
+        epilog="Subcommands: start, wait, case, run, dry-run, monitor, hitl, stop, analyze, report, status",
     )
-    sub = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    run_p = sub.add_parser("run", help="run a live diagnosis (default)")
-    _add_run_arguments(run_p)
+    start_p = sub.add_parser("start", help="run a Case detached; return immediately")
+    start_p.add_argument("case", help="path to a Case JSON file")
+    _run_flags(start_p)
 
-    analyze_p = sub.add_parser("analyze", help="re-derive summary.json from an evidence stream")
-    analyze_p.add_argument("evidence", help="path to <run_id>.evidence.jsonl")
-    analyze_p.add_argument("--output", default=None, help="summary.json output path")
-    analyze_p.add_argument("--report", default=None, help="also render report.html to this path")
+    wait_p = sub.add_parser("wait", help="poll a run to a real run_end, then finalize")
+    wait_p.add_argument("path")
+    wait_p.add_argument("--timeout", type=float, default=1800.0)
+    wait_p.add_argument("--interval", type=float, default=0.5)
+    wait_p.add_argument("--quiet", action="store_true")
 
-    report_p = sub.add_parser("report", help="re-render report.html from a summary.json")
-    report_p.add_argument("summary", help="path to summary.json")
-    report_p.add_argument("--evidence", default=None, help="evidence.jsonl for the timeline/raw tabs")
+    case_p = sub.add_parser("case", help="run a Case foreground (start+wait+finalize)")
+    case_p.add_argument("case", help="path to a Case JSON file")
+    case_p.add_argument("--timeout", type=float, default=1800.0)
+    _run_flags(case_p)
+
+    run_p = sub.add_parser("run", help="run an ad-hoc target foreground")
+    run_p.add_argument("target")
+    run_p.add_argument("--timeout", type=float, default=1800.0)
+    _run_flags(run_p)
+
+    dry_p = sub.add_parser("dry-run", help="offline synthetic smoke (unique new dir)")
+    dry_p.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    dry_p.add_argument("--quiet", action="store_true")
+
+    monitor_p = sub.add_parser("monitor", help="print live state from real events")
+    monitor_p.add_argument("path")
+    monitor_p.add_argument("--follow", action="store_true")
+    monitor_p.add_argument("--interval", type=float, default=1.0)
+
+    hitl_p = sub.add_parser("hitl", help="answer the current pending HITL prompt")
+    hitl_p.add_argument("path")
+    hitl_p.add_argument("answer")
+
+    stop_p = sub.add_parser("stop", help="append a stop request")
+    stop_p.add_argument("path")
+
+    analyze_p = sub.add_parser("analyze", help="re-derive summary.json from artifacts")
+    analyze_p.add_argument("path")
+    analyze_p.add_argument("--quiet", action="store_true")
+
+    report_p = sub.add_parser("report", help="re-render report.html from a saved summary")
+    report_p.add_argument("path")
+    report_p.add_argument("--evidence", default=None, help="explicit evidence JSONL for the raw tab")
     report_p.add_argument("--output", default=None, help="report.html output path")
-    report_p.add_argument(
-        "--share",
-        action="store_true",
-        help="render the redacted, screenshot-free share copy instead",
-    )
 
-    status_p = sub.add_parser("status", help="print a run directory's status.json")
-    status_p.add_argument("path", help="run directory or status.json path")
+    status_p = sub.add_parser("status", help="print status.json")
+    status_p.add_argument("path")
     return parser
+
+
+_SUBCOMMANDS = {
+    "start": cmd_start,
+    "wait": cmd_wait,
+    "case": cmd_case,
+    "run": cmd_case,
+    "dry-run": cmd_dry_run,
+    "monitor": cmd_monitor,
+    "hitl": cmd_hitl,
+    "stop": cmd_stop,
+    "analyze": cmd_analyze,
+    "report": cmd_report,
+    "status": cmd_status,
+}
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    # Default (no subcommand, or a bare target) -> the `run` command. Only the
-    # four known subcommands are dispatched to their parsers.
-    if not argv or argv[0] not in {"run", "analyze", "report", "status"}:
-        run_p = argparse.ArgumentParser(prog="run_diagnosis.py")
-        _add_run_arguments(run_p)
-        return cmd_run(run_p.parse_args(argv))
-
     parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.command == "run":
-        return cmd_run(args)
-    if args.command == "analyze":
-        return cmd_analyze(args)
-    if args.command == "report":
-        return cmd_report(args)
-    if args.command == "status":
-        return cmd_status(args)
-    parser.error("unknown command")
-    return 2  # unreachable; parser.error exits
+
+    if not argv:
+        parser.print_help()
+        return 2
+    if argv[0] in {"-h", "--help", "help"}:
+        parser.print_help()
+        return 0
+    if argv[0] in _SUBCOMMANDS:
+        args = parser.parse_args(argv)
+        return _SUBCOMMANDS[args.command](args)
+    if argv[0].startswith("-"):
+        parser.error(f"unrecognized argument: {argv[0]}")
+        return 2  # unreachable; parser.error exits
+    # Backward-compatible bare target -> ad-hoc foreground run.
+    run_p = argparse.ArgumentParser(prog="run_diagnosis.py run")
+    run_p.add_argument("target")
+    run_p.add_argument("--timeout", type=float, default=1800.0)
+    _run_flags(run_p)
+    return cmd_case(run_p.parse_args(argv))
 
 
 if __name__ == "__main__":

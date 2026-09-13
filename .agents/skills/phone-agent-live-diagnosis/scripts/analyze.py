@@ -1,16 +1,30 @@
-"""Analyze a diagnostic evidence stream into the v2 ``summary.json`` structure.
+"""Analyze a diagnostic run into the v2 ``summary.json`` structure.
 
-Per ``outputs/design-council/ROUND2-D1.md`` §3. Consumes an
-:class:`~evidence.EvidenceView` (and the ``RunResult``-like outcome the driver
-captured) and produces the dimension blocks the R1 report renders, in first-page
-order: terminal + taskdoc_final -> finish_gate -> stagnation -> context -> hitl
--> tool_health / grounding / visual -> model, then findings + recommendations.
+Two evidence planes feed the analysis and are deliberately kept distinct:
 
-Analysis never touches the device or re-runs a tool.  In addition to the
-diagnostic evidence stream it best-effort reads the run's production trace and
-privacy-minimal memory ledgers.  Those optional inputs are deliberately
-fail-open: absent, malformed, or partially-written files produce empty
-dimension blocks without changing the established summary fields.
+* the **runner IPC** stream (``events.jsonl`` / ``control.jsonl`` / ``run.json`` /
+  ``spec.json``) is the authority for *what the harness did* — terminal status,
+  requested/actual model identity, reported token usage, control/stop, HITL;
+* the **diagnostic evidence** stream (``<run_id>.evidence.jsonl``) is the
+  authority for the *model-visible replay* — request context hygiene, tool args
+  and receipts, TaskDoc snapshots, screenshots on disk.
+
+The summary keeps three judgments apart, never collapsing them:
+
+1. ``harness_terminal`` — harness fact (finished / takeover / stopped / budget /
+   fuse / error);
+2. ``case_acceptance`` — the Case's own checkpoints, evaluated against recorded
+   evidence only (missing evidence -> ``unknown``; ``finished`` never implies
+   Case ``pass``);
+3. ``diagnosis`` — source-mapped **inferences** for a human to confirm, not
+   proven root causes.
+
+A single tool error is a tool-health fact, not a whole-run failure: the run
+verdict follows the harness terminal, not any one tool return.
+
+Analysis never touches the device or re-runs a tool. Optional inputs (trace,
+memory ledgers, resolver/capability artifacts) are read best-effort and are
+fail-open: absent/malformed/partially-written files produce empty blocks.
 """
 
 from __future__ import annotations
@@ -24,7 +38,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from case import (
+    AcceptanceEvidence,
+    Case,
+    evaluate_acceptance,
+    rollup_acceptance,
+)
 from evidence import EvidenceView, parse_obs_windows, result_text_of
+from events import RunnerEventsView
 from sourcemap import V2_SOURCE_RULES, add_line_numbers
 from taxonomy import (
     classify_result,
@@ -69,57 +90,61 @@ def _avg(values: list[float]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# verdict
+# verdict (harness terminal only — never a single tool error)
 # ---------------------------------------------------------------------------
-def classify_verdict(outcome: dict[str, Any], view: EvidenceView) -> str:
-    """Map outcome + evidence to ``success|failed|takeover|max_steps|uncertain``.
+def classify_verdict(
+    outcome: dict[str, Any],
+    view: EvidenceView,
+    harness: dict[str, Any] | None = None,
+) -> str:
+    """Map the *harness terminal* to a run verdict.
 
-    Order (§3): takeover_reason -> takeover; finished -> success;
-    reason==max_model_calls -> max_steps; any error event / rejected finish ->
-    failed; else uncertain.
+    The run verdict answers "how did the harness end?", not "did every tool
+    succeed?" and not "did the Case pass?". A tool error is recorded under
+    ``tool_health`` and never flips this verdict on its own.
+
+    Values: ``success | takeover | stopped | budget_exhausted | loop_fuse |
+    error | failed | uncertain``. Non-terminal harness states (running /
+    stopping / unknown_terminated / unknown) map to ``uncertain`` — the
+    diagnostic stream's own ``finished`` is never allowed to promote them.
     """
 
+    if harness:
+        state = str(harness.get("state") or "")
+        mapping = {
+            "succeeded": "success",
+            "takeover": "takeover",
+            "stopped": "stopped",
+            "token_budget_exhausted": "budget_exhausted",
+            "loop_fuse": "loop_fuse",
+            "error": "error",
+            "failed": "failed",
+        }
+        if state in mapping:
+            return mapping[state]
+        if harness.get("source") == "runner_ipc":
+            # A runner IPC stream exists but shows no terminal event -> not a
+            # success, regardless of what the diagnostic stream recorded.
+            return "uncertain"
+
+    takeover_reason = str(outcome.get("takeover_reason") or "")
     terminal = (view.run_end or {}).get("terminal", {}) if view.run_end else {}
-    takeover_reason = outcome.get("takeover_reason") or terminal.get("takeover_reason")
+    if not takeover_reason:
+        takeover_reason = str(terminal.get("takeover_reason") or "")
     if takeover_reason:
-        return "takeover"
-    finished = bool(outcome.get("finished") or terminal.get("finished"))
-    if finished:
+        from case import STOP_TAKEOVER_REASON
+
+        return "stopped" if takeover_reason == STOP_TAKEOVER_REASON else "takeover"
+    if bool(outcome.get("finished")) or bool(terminal.get("finished")):
         return "success"
-    reason = str(outcome.get("reason") or "")
-    if reason in {"token_budget_exhausted", "loop_fuse", "max_model_calls"}:
-        return "max_steps"
-    # An "error event" is a raised-exception tool result OR a fail-closed error
-    # return string (same accounting as build_tool_health's _ERROR_CLASSES), so
-    # the verdict never disagrees with a non-zero tool_health error count.
-    has_error = any(
-        c.get("error") or classify_result(c["result_text"]) in _ERROR_CLASSES
-        for c in view.tool_calls
-    )
-    rejected_finish = any(
-        classify_result(c["result_text"])
-        in {"finish_no_evidence", "finish_blocked_open_items"}
-        for c in view.finish_calls()
-    )
-    if has_error or rejected_finish:
-        return "failed"
+    reason = str(outcome.get("reason") or terminal.get("reason") or "")
+    if reason == "token_budget_exhausted":
+        return "budget_exhausted"
+    if reason == "loop_fuse":
+        return "loop_fuse"
+    if reason.startswith("error:"):
+        return "error"
     return "uncertain"
-
-
-# ---------------------------------------------------------------------------
-# terminal
-# ---------------------------------------------------------------------------
-def build_terminal(outcome: dict[str, Any], view: EvidenceView) -> dict[str, Any]:
-    terminal = (view.run_end or {}).get("terminal", {}) if view.run_end else {}
-    return {
-        "finished": bool(outcome.get("finished") or terminal.get("finished")),
-        "finish_summary": outcome.get("finish_summary")
-        or terminal.get("finish_summary"),
-        "takeover_reason": outcome.get("takeover_reason")
-        or terminal.get("takeover_reason"),
-        "reason": outcome.get("reason"),
-        "returncode": outcome.get("returncode"),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -217,25 +242,379 @@ def build_taskdoc_final(view: EvidenceView) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# stagnation
+# harness terminal (runner IPC authority)
 # ---------------------------------------------------------------------------
-def build_stagnation(view: EvidenceView) -> dict[str, Any]:
-    nudges = view.stagnation_nudges
-    peak = 0
-    for n in nudges:
-        peak = max(peak, int(n.get("stagnant_steps", 0) or 0))
-    # max distinct states = highest taskdoc-free proxy: count unique obs screens.
-    seen_screens = set()
-    for obs in view.observations:
-        block = obs.get("obs") or {}
-        seq = block.get("screen_seq")
-        if seq is not None:
-            seen_screens.add(seq)
+def build_harness_terminal(
+    outcome: dict[str, Any],
+    events: RunnerEventsView | None,
+    process_alive: bool | None = None,
+) -> dict[str, Any]:
+    """Harness fact layer: how the run ended.
+
+    IPC ``run_end`` is the authority. When an events view is present but carries
+    no ``run_end``, the harness state is a non-terminal state (running /
+    stopping / unknown_terminated) and the diagnostic stream's own terminal is
+    **not** allowed to override it. ``process_alive=False`` turns a would-be
+    running/stopping state into ``unknown_terminated`` (a dead process without a
+    terminal event). Only when there is no IPC event stream at all (an
+    evidence-only re-analyze) do we fall back to the diagnostic terminal,
+    labelled ``source="diagnostic_fallback"``.
+    """
+
+    if events is not None and events.has_events:
+        terminal = events.harness_terminal()
+        state = terminal["state"]
+        if process_alive is False and state in {"running", "stopping"}:
+            state = "unknown_terminated"
+        merged = {
+            "source": "runner_ipc",
+            "state": state,
+            "status": terminal.get("status"),
+            "finished": bool(terminal.get("finished")),
+            "finish_summary": terminal.get("finish_summary"),
+            "takeover_reason": terminal.get("takeover_reason"),
+            "reason": terminal.get("reason"),
+            "returncode": outcome.get("returncode"),
+            "steps": terminal.get("steps"),
+            "stop_requested": bool(terminal.get("stop_requested")),
+            "run_end_seen": bool(terminal.get("run_end_seen")),
+            "run_summary_present": bool(terminal.get("run_summary_present")),
+            "process_alive": process_alive,
+            "trace_path": terminal.get("trace_path"),
+            "tokens_total": terminal.get("tokens_total"),
+        }
+        return merged
+
+    # Evidence-only fallback: no IPC events were available at all.
     return {
-        "nudged": bool(nudges),
-        "nudge_step": nudges[0].get("step") if nudges else None,
-        "max_seen_states": len(seen_screens),
-        "stagnant_streak_peak": peak,
+        "source": "diagnostic_fallback",
+        "state": "unknown",
+        "status": None,
+        "finished": bool(outcome.get("finished")),
+        "finish_summary": outcome.get("finish_summary"),
+        "takeover_reason": outcome.get("takeover_reason"),
+        "reason": outcome.get("reason"),
+        "returncode": outcome.get("returncode"),
+        "steps": outcome.get("steps"),
+        "stop_requested": False,
+        "run_end_seen": False,
+        "run_summary_present": False,
+        "process_alive": process_alive,
+        "trace_path": None,
+        "tokens_total": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# case acceptance (evidence-only; missing -> unknown)
+# ---------------------------------------------------------------------------
+def build_case_block(case: Case | None) -> dict[str, Any] | None:
+    if case is None:
+        return None
+    return {
+        "id": case.id,
+        "title": case.title,
+        "goal": case.goal,
+        "preconditions": list(case.preconditions),
+        "preconditions_confirmed": case.preconditions_confirmed,
+        "safety_boundaries": list(case.safety_boundaries),
+        "acceptance": [
+            {"id": a.id, "description": a.description} for a in case.acceptance
+        ],
+        "notes": case.notes,
+    }
+
+
+def build_case_acceptance(
+    case: Case | None,
+    view: EvidenceView,
+    harness_finished: bool,
+) -> dict[str, Any]:
+    """Evaluate the Case checkpoints against recorded evidence only."""
+
+    if case is None or not case.acceptance:
+        return {
+            "overall": "unknown",
+            "checkpoints": [],
+            "note": "未提供 Case 验收检查点；无法判定验收（harness 终局 ≠ Case 通过）。",
+        }
+    evidence = build_acceptance_evidence(view, harness_finished=harness_finished)
+    checkpoints = evaluate_acceptance(case, evidence)
+    overall = rollup_acceptance(checkpoints, harness_finished=harness_finished)
+    return {
+        "overall": overall,
+        "checkpoints": checkpoints,
+        "note": (
+            "验收只依据客观设备观测（[OBS]/感知工具成功返回）判定 met/unmet；"
+            "TaskDoc evidence_note/facts 与 finish 自述仅作候选证据，永不自动判通过；"
+            "目标/intent/note/失败回执/未验证参考图不作为验收证据；"
+            "无客观证据的检查点为 unknown，绝不因 harness finished 记为 met。"
+        ),
+    }
+
+
+# The only objective observation anchor: a real ``[OBS] app=`` segment.
+_OBS_FAILED_MARKER = "[OBS] (re-observation failed:"
+_OBJECTIVE_OBS_HEADER = "[OBS] app="
+
+
+def _objective_observation_text(call: dict[str, Any]) -> str | None:
+    """Return the objective ``[OBS] app=…`` segment, or ``None``.
+
+    Only the real observation segment is evidence. A successful action receipt's
+    leading text (which may contain the target name) is **not** included — it is
+    at most candidate evidence. Unverified reference frames (``image.reference``
+    or no committed ``screen_seq``) are excluded even if their text looks right.
+    """
+
+    if call.get("error"):
+        return None
+    observation = call.get("observation") or {}
+    image = observation.get("image") if isinstance(observation, dict) else None
+    image = image if isinstance(image, dict) else {}
+    if image.get("present") and (image.get("reference") or image.get("screen_seq") is None):
+        return None
+    text = str(call.get("result_text") or "")
+    if not text or _OBS_FAILED_MARKER in text:
+        return None
+    if classify_result(text) in _ERROR_CLASSES:
+        return None
+    idx = text.find(_OBJECTIVE_OBS_HEADER)
+    if idx == -1:
+        return None
+    return text[idx:]
+
+
+def build_acceptance_evidence(
+    view: EvidenceView, *, harness_finished: bool
+) -> AcceptanceEvidence:
+    """Collect the typed acceptance corpus.
+
+    Objective entries come only from real ``[OBS] app=`` observation segments.
+    Successful action receipts, TaskDoc evidence notes / facts, and the actor's
+    finish self-claim are *candidate* entries and can never auto-pass. The goal,
+    per-step ``intent`` / ``note`` / ``target_description``, and failed receipts
+    are excluded entirely.
+    """
+
+    from case import KIND_CANDIDATE, KIND_OBJECTIVE
+
+    texts: list[tuple[str, str, str]] = []
+    for call in view.tool_calls:
+        text = call.get("result_text") or ""
+        if not text:
+            continue
+        objective = _objective_observation_text(call)
+        if objective:
+            texts.append((f"step {call.get('step')} {call.get('tool')} 观测", objective, KIND_OBJECTIVE))
+        elif classify_result(text) == "success":
+            # A successful action receipt is a world-action fact, but its text
+            # may echo the target; keep it candidate-only.
+            texts.append((f"step {call.get('step')} {call.get('tool')} 回执", text, KIND_CANDIDATE))
+    snap = view.latest_taskdoc()
+    if snap:
+        for item in snap.get("items", []) or []:
+            if item.get("evidence_note"):
+                texts.append(
+                    (f"TaskDoc {item.get('id')} 证据", str(item["evidence_note"]), KIND_CANDIDATE)
+                )
+        for fact in snap.get("facts", []) or []:
+            texts.append(("TaskDoc fact", str(fact), KIND_CANDIDATE))
+    # The actor's own finish claim is candidate-only (never objective).
+    for call in view.tool_calls:
+        if call.get("tool") != "finish":
+            continue
+        invoke = call.get("invoke") or {}
+        args = invoke.get("args") if isinstance(invoke, dict) else None
+        if isinstance(args, dict):
+            summary = args.get("summary")
+            if summary:
+                texts.append((f"step {call.get('step')} finish 自述", str(summary), KIND_CANDIDATE))
+            for i, ev in enumerate(args.get("evidence") or []):
+                if ev:
+                    texts.append(
+                        (f"step {call.get('step')} finish evidence[{i}]", str(ev), KIND_CANDIDATE)
+                    )
+    return AcceptanceEvidence(texts, harness_finished=harness_finished)
+
+
+# ---------------------------------------------------------------------------
+# safety / budget / context errors (real run facts)
+# ---------------------------------------------------------------------------
+def build_safety(view: EvidenceView, events: RunnerEventsView | None) -> dict[str, Any]:
+    warnings: list[dict[str, Any]] = []
+    if events is not None:
+        for event in events.safety_warnings:
+            warnings.append(
+                {
+                    "step": event.get("step"),
+                    "tool": event.get("tool"),
+                    "text": event.get("text"),
+                }
+            )
+    if not warnings:
+        for call in view.tool_calls:
+            if classify_result(call.get("result_text") or "") == "safety_warning":
+                warnings.append(
+                    {
+                        "step": call.get("step"),
+                        "tool": call.get("tool"),
+                        "text": call.get("result_text"),
+                    }
+                )
+    return {
+        "warnings": warnings,
+        "count": len(warnings),
+        "mode": (events.config.get("safety_mode") if events else None),
+        "note": (
+            "wary（默认）：风险执行不执行、不叫人工，只回预警；模型带 "
+            "confirm_irreversible=true 重发才执行。ask_user/take_over 仍 interrupt。"
+        ),
+    }
+
+
+def build_budget(
+    view: EvidenceView, events: RunnerEventsView | None, harness: dict[str, Any]
+) -> dict[str, Any]:
+    """Token cost ceiling vs loop fuse.
+
+    ``visible_used_tokens`` is only the *actor's provider-reported* usage seen in
+    the event stream. It is **not** the harness ``UsageLedger`` total (which also
+    includes aux/verifier calls and estimates). No ledger is exported to the
+    diagnosis artifacts, so the ledger total is ``unknown`` and must not be
+    equated with the visible usage.
+    """
+
+    usage = events.usage_totals() if events is not None else None
+    config = events.config if events is not None else {}
+    token_budget = config.get("token_budget")
+    visible_used = usage.get("total_tokens") if usage else None
+    state = harness.get("state")
+    return {
+        "token_budget": token_budget,
+        "visible_used_tokens": visible_used,
+        "visible_usage_reported": bool(usage.get("reported")) if usage else False,
+        "visible_usage_partial": bool(usage.get("partial")) if usage else False,
+        "ledger_available": False,
+        "ledger_used_tokens": None,
+        "exhausted": state == "token_budget_exhausted",
+        "warn_remaining": config.get("token_warn_remaining"),
+        "max_model_calls": config.get("max_model_calls"),
+        "loop_fuse_hit": state == "loop_fuse",
+        "note": (
+            "token 预算在调用边界达到即停；max_model_calls 是独立的 runaway-loop 保险丝。"
+            "visible_used_tokens 仅为 actor 上报用量，不等于 harness UsageLedger（含 aux/估算，未导出→unknown）。"
+        ),
+    }
+
+
+def build_context_errors(view: EvidenceView, events: RunnerEventsView | None) -> dict[str, Any]:
+    errors: list[dict[str, Any]] = []
+    for call in view.tool_calls:
+        text = str(call.get("result_text") or "")
+        if "native_context_pruning_conflict" in text:
+            errors.append(
+                {
+                    "step": call.get("step"),
+                    "kind": "native_context_pruning_conflict",
+                    "message": text[:300],
+                }
+            )
+    for call in view.tool_calls:
+        text = str(call.get("result_text") or "")
+        if text.startswith("[OBS] (re-observation failed:"):
+            errors.append(
+                {"step": call.get("step"), "kind": "obs_capture_failed", "message": text[:300]}
+            )
+    return {"errors": errors, "count": len(errors)}
+
+
+def build_fallback(trace_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Model fallback events from the production trace (real events only)."""
+
+    rows: list[dict[str, Any]] = []
+    for event in trace_events:
+        if event.get("event") != "model_fallback":
+            continue
+        rows.append(
+            {
+                "stage": event.get("stage"),
+                "role": event.get("role"),
+                "requested": event.get("requested"),
+                "actual": event.get("actual"),
+                "reason": event.get("reason"),
+                "outcome": event.get("outcome"),
+            }
+        )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# finish verifier (independent L2 acceptance)
+# ---------------------------------------------------------------------------
+def build_finish_verifier(
+    view: EvidenceView, events: RunnerEventsView | None = None
+) -> dict[str, Any]:
+    """Finish two-step receipts + independent verifier status.
+
+    Only a **persisted, authoritative verifier verdict** can report
+    ``pass`` / ``fail`` / ``skipped``. The finish receipts prove the two-step
+    (review packet / confirm) happened; they say nothing about whether the
+    verifier ran, passed, or was skipped fail-open. With no authoritative audit
+    the status is ``unknown`` — never inferred from a finish receipt.
+
+    ``events.run_json`` may carry a persisted ``result``-adjacent verifier field
+    if one exists; we only surface it when explicitly present.
+    """
+
+    packets = 0
+    confirmed = 0
+    rejections: list[dict[str, Any]] = []
+    dispute_takeover = False
+    for call in view.finish_calls():
+        text = call.get("result_text") or ""
+        cls = classify_result(text)
+        if cls == "finish_review_packet":
+            packets += 1
+        elif cls in {"finish_confirmed", "finish_ok"}:
+            confirmed += 1
+        elif cls == "verifier_reject":
+            rejections.append({"step": call.get("step"), "message": text[:300]})
+        elif cls == "verifier_dispute_takeover":
+            dispute_takeover = True
+            rejections.append({"step": call.get("step"), "message": text[:300]})
+
+    # A rejected finish IS an in-band verifier verdict (the rejection text came
+    # from the verifier), so `fail` is grounded; pass/skipped are not.
+    persisted = None
+    if events is not None and isinstance(events.run_json, dict):
+        candidate = events.run_json.get("finish_verifier")
+        if candidate in {"pass", "fail", "skipped"}:
+            persisted = candidate
+
+    if persisted is not None:
+        verifier_status = persisted
+        source = "persisted"
+    elif rejections:
+        verifier_status = "fail"
+        source = "in_band_rejection"
+    else:
+        verifier_status = "unknown"
+        source = "no_authoritative_audit"
+
+    return {
+        "review_packets": packets,
+        "confirmed": confirmed,
+        "rejections": rejections,
+        "rejection_count": len(rejections),
+        "dispute_takeover": dispute_takeover,
+        "verifier_status": verifier_status,
+        "verifier_status_source": source,
+        "note": (
+            "只有权威审计（本 run 持久化的 verdict 或 in-band 驳回回执）才显示"
+            " pass/fail/skipped；验收器故障是 fail-open skipped，绝不显示为 pass；"
+            "没有审计时按 unknown，不从 finish 回执推断未触发。"
+        ),
     }
 
 
@@ -261,7 +640,9 @@ def build_context(view: EvidenceView) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # hitl
 # ---------------------------------------------------------------------------
-def build_hitl(view: EvidenceView) -> dict[str, Any]:
+def build_hitl(
+    view: EvidenceView, events: RunnerEventsView | None = None
+) -> dict[str, Any]:
     decisions = view.hitl_decisions
     approvals = sum(1 for d in decisions if d.get("decision") == "approve")
     rejections = sum(1 for d in decisions if d.get("decision") == "reject")
@@ -274,6 +655,16 @@ def build_hitl(view: EvidenceView) -> dict[str, Any]:
         for c in view.tool_calls
         if classify_result(c["result_text"]) == "takeover_requested"
     )
+    unresolved: list[str] = []
+    answers: list[str] = []
+    submitted = consumed = unconsumed = 0
+    if events is not None:
+        state = events.hitl_state()
+        unresolved = state["unresolved_prompts"]
+        answers = state["answers"]
+        submitted = state["submitted_count"]
+        consumed = state["consumed_count"]
+        unconsumed = state["unconsumed_count"]
     return {
         "interrupts": len(decisions),
         "decisions": [
@@ -289,6 +680,15 @@ def build_hitl(view: EvidenceView) -> dict[str, Any]:
         "responds": responds,
         "ask_user_count": ask_user,
         "take_over_count": take_over,
+        "unresolved_prompts": unresolved,
+        "answers": answers,
+        "submitted_count": submitted,
+        "consumed_count": consumed,
+        "unconsumed_count": unconsumed,
+        "note": (
+            "control.jsonl 的答复只表示人工已提交，不代表已消费；只有 runner 的 "
+            "pending_hitl:null 清除事件证明已消费。未决 HITL 绝不自动批准。"
+        ),
     }
 
 
@@ -331,7 +731,8 @@ def build_tool_health(view: EvidenceView) -> dict[str, Any]:
     }
 
 
-# Classes that count as a tool error for health/verdict purposes.
+# Classes that count as a tool error for health purposes. A single one of these
+# is a tool-health fact — it never becomes a whole-run failure by itself.
 _ERROR_CLASSES = {
     "obs_capture_failed",
     "addressing_conflict",
@@ -351,6 +752,13 @@ _ERROR_CLASSES = {
     "taskdoc_validation_failed",
     "finish_no_evidence",
     "finish_blocked_open_items",
+}
+
+# Notable (not necessarily tool errors) classes that still deserve a finding.
+_NOTABLE_CLASSES = {
+    "safety_warning",
+    "verifier_reject",
+    "verifier_dispute_takeover",
 }
 
 
@@ -580,36 +988,70 @@ def build_windowing(view: EvidenceView) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # model
 # ---------------------------------------------------------------------------
-def build_model(view: EvidenceView) -> dict[str, Any]:
-    # Model latency is not recorded by the diagnostic stream (that's the trace's
-    # model_call event); calls are counted from model_request events. Token usage
-    # is aggregated from model_response events when the model reports it.
-    prompt_tokens = 0
-    output_tokens = 0
-    total_tokens = 0
-    have_usage = False
-    for resp in view.model_responses:
-        usage = resp.get("usage")
-        if not isinstance(usage, dict):
-            continue
-        have_usage = True
-        prompt_tokens += int(usage.get("input_tokens", 0) or 0)
-        output_tokens += int(usage.get("output_tokens", 0) or 0)
-        total_tokens += int(usage.get("total_tokens", 0) or 0)
-    if have_usage and not total_tokens:
-        total_tokens = prompt_tokens + output_tokens
+def build_model(
+    view: EvidenceView, events: RunnerEventsView | None = None
+) -> dict[str, Any]:
+    """Model calls + usage. Missing usage/cache is ``None``, never zero.
+
+    The runner event stream is authoritative for identity (requested vs actual)
+    and usage; the diagnostic stream is the fallback when no runner events exist
+    (e.g. an evidence-only re-analyze).
+    """
+
+    identity: list[dict[str, Any]] = []
+    usage: dict[str, Any] | None = None
+    calls = len(view.model_requests)
+    if events is not None and events.model_calls:
+        identity = events.model_identity()
+        usage = events.usage_totals()
+        calls = len(events.model_calls)
+    else:
+        prompt_tokens = 0
+        output_tokens = 0
+        input_calls = 0
+        output_calls = 0
+        resp_calls = 0
+        for resp in view.model_responses:
+            raw = resp.get("usage")
+            if not isinstance(raw, dict):
+                continue
+            resp_calls += 1
+            if raw.get("input_tokens") is not None:
+                input_calls += 1
+                prompt_tokens += int(raw.get("input_tokens") or 0)
+            if raw.get("output_tokens") is not None:
+                output_calls += 1
+                output_tokens += int(raw.get("output_tokens") or 0)
+        if input_calls or output_calls:
+            complete = resp_calls > 0 and input_calls == resp_calls and output_calls == resp_calls
+            usage = {
+                "reported": True,
+                "partial": not complete,
+                "calls": resp_calls,
+                "input_tokens": prompt_tokens if input_calls else None,
+                "output_tokens": output_tokens if output_calls else None,
+                "cache_read_tokens": None,
+                "cache_write_tokens": None,
+                "total_tokens": (prompt_tokens + output_tokens) if complete else None,
+                "coverage": {
+                    "calls": resp_calls,
+                    "input_tokens_calls": input_calls,
+                    "output_tokens_calls": output_calls,
+                    "cache_read_tokens_calls": 0,
+                    "cache_write_tokens_calls": 0,
+                },
+            }
+    requested = sorted({row.get("requested_model") for row in identity if row.get("requested_model")})
+    actual = sorted({row.get("actual_model") for row in identity if row.get("actual_model")})
     return {
-        "calls": len(view.model_requests),
+        "calls": calls,
         "avg_latency_ms": None,
         "p95_latency_ms": None,
         "errors": 0,
-        "token_usage": {
-            "input_tokens": prompt_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
-        }
-        if have_usage
-        else None,
+        "requested_models": requested,
+        "actual_models": actual,
+        "identity": identity,
+        "token_usage": usage,
     }
 
 
@@ -905,19 +1347,18 @@ def _configured_path(value: str) -> Path:
 
 
 def _memory_roots(root: Path | None, explicit: str | None) -> list[Path]:
-    candidates: list[Path] = []
-    if explicit:
-        candidates.append(_configured_path(explicit))
-    elif os.getenv("PHONE_AGENT_MEMORY_DIR"):
-        candidates.append(_configured_path(os.environ["PHONE_AGENT_MEMORY_DIR"]))
-    if root is not None:
-        candidates.extend((root / "memory", root))
-    candidates.append(_REPO_ROOT / "memory")
-    unique: list[Path] = []
-    for candidate in candidates:
-        if candidate not in unique:
-            unique.append(candidate)
-    return unique
+    """Explicit-only memory roots for offline analysis.
+
+    The MVP does **not** probe the repo ``memory/`` tree, the run dir, or the
+    ``PHONE_AGENT_MEMORY_DIR`` env by default — those are global/private and must
+    not become an implicit dependency of an offline analyze. Only an explicitly
+    supplied ``memory_dir`` is searched.
+    """
+
+    if not explicit:
+        return []
+    candidate = _configured_path(explicit)
+    return [candidate]
 
 
 def _first_existing(paths: list[Path]) -> Path | None:
@@ -931,13 +1372,13 @@ def _first_existing(paths: list[Path]) -> Path | None:
 
 
 def _episode_for_run(roots: list[Path], run_id: str) -> dict[str, Any]:
-    configured = os.getenv("PHONE_AGENT_EXPERIENCE_DIR")
+    """Find this run's episode outcome under the *explicit* roots only.
+
+    No env / repo / global fallback: an empty ``roots`` list yields ``{}``.
+    """
+
     event_paths: list[Path] = []
     json_paths: list[Path] = []
-    if configured:
-        experience = _configured_path(configured)
-        event_paths.append(experience / "events.jsonl")
-        json_paths.append(experience / "episodes.json")
     for root in roots:
         event_paths.extend(
             (root / "experience/events.jsonl", root / "memory/experience/events.jsonl")
@@ -1331,7 +1772,9 @@ def build_replay(view: EvidenceView) -> list[dict[str, Any]]:
         replay.append(
             {
                 "step": slot.get("step"),
-                "thinking": response.get("thinking", ""),
+                # The middleware records the assistant message's *visible* text
+                # (what the provider actually returned), never hidden reasoning.
+                "model_text": response.get("thinking", ""),
                 "model_tool_calls": response.get("tool_calls", []),
                 "usage": response.get("usage"),
                 "context": {
@@ -1362,7 +1805,7 @@ def build_findings(
     cat_examples: dict[str, list[str]] = {}
     for call in view.tool_calls:
         cls = classify_result(call["result_text"])
-        if cls in _ERROR_CLASSES:
+        if cls in _ERROR_CLASSES or cls in _NOTABLE_CLASSES:
             cat = category_of(cls)
             cat_counts[cat] = cat_counts.get(cat, 0) + 1
             cat_examples.setdefault(cat, [])
@@ -1470,6 +1913,8 @@ def build_summary(
     run_id: str,
     created_at: str,
     target: str,
+    case: Case | None = None,
+    events: RunnerEventsView | None = None,
     run_dir: str | None = None,
     command: list[str] | None = None,
     duration_sec: float | None = None,
@@ -1477,12 +1922,14 @@ def build_summary(
     trace: str | None = None,
     artifacts: dict[str, Any] | None = None,
     memory_dir: str | None = None,
+    process_alive: bool | None = None,
+    extra_data_issues: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Assemble the full v2 ``summary.json`` dict (§3) from outcome + evidence.
+    """Assemble the full ``summary.json`` from the two evidence planes.
 
-    ``target`` prefers the already-redacted ``task_goal_base`` from the evidence
-    ``run_start`` header (so we never re-introduce an unredacted goal), falling
-    back to the caller-supplied value.
+    ``outcome`` is the live driver's terminal snapshot (or an empty dict when
+    re-analyzing); ``events`` is the runner IPC view (present for runner-backed
+    and re-analyzed runs).
     """
 
     root = _artifact_root(run_dir, evidence_stream)
@@ -1536,14 +1983,17 @@ def build_summary(
             "blocked_taps": [],
             "observations": [],
         }
-    verdict = classify_verdict(outcome, view)
+    harness = build_harness_terminal(outcome, events, process_alive=process_alive)
+    verdict = classify_verdict(outcome, view, harness)
+    case_block = build_case_block(case)
+    case_acceptance = build_case_acceptance(
+        case, view, harness_finished=bool(harness.get("finished"))
+    )
     findings = build_findings(view, resolver, windowing)
     recommendations = build_recommendations(findings, view, verdict)
-    steps = None
-    if view.run_end:
+    steps = harness.get("steps")
+    if steps is None and view.run_end:
         steps = view.run_end.get("steps")
-    if steps is None:
-        steps = outcome.get("steps")
     redacted_target = (view.run_start or {}).get("task_goal_base") or target
     return {
         "run_id": run_id,
@@ -1554,26 +2004,44 @@ def build_summary(
         "command": command or [],
         "duration_sec": duration_sec,
         "steps": steps,
-        "evidence_stream": evidence_stream,
-        "trace": trace,
-        "artifacts": artifacts or {},
-        "terminal": build_terminal(outcome, view),
+        # -- the three independent judgments -----------------------------------
+        "harness_terminal": harness,
+        "case": case_block,
+        "case_acceptance": case_acceptance,
+        "diagnosis": {
+            "inference": True,
+            "caveat": (
+                "findings/recommendations 是依据真实步骤证据的候选归因，"
+                "源码 path:line 只是符号位置，不是已证根因；请对照步骤证据确认。"
+            ),
+        },
+        # -- dimensions --------------------------------------------------------
+        "run_summary": events.run_summary_block() if events is not None else None,
+        "data_issues": (list(events.parse_issues) if events is not None else [])
+        + list(extra_data_issues or []),
         "finish_gate": build_finish_gate(view),
+        "finish_verifier": build_finish_verifier(view, events),
         "taskdoc_final": build_taskdoc_final(view),
-        "stagnation": build_stagnation(view),
         "context": build_context(view),
-        "hitl": build_hitl(view),
+        "context_errors": build_context_errors(view, events),
+        "hitl": build_hitl(view, events),
+        "safety": build_safety(view, events),
+        "budget": build_budget(view, events, harness),
         "tool_health": build_tool_health(view),
         "grounding": build_grounding(view),
         "visual": build_visual(view),
         "windowing": windowing,
-        "model": build_model(view),
+        "model": build_model(view, events),
+        "fallback": build_fallback(trace_events),
         "resolver": resolver,
         "memory": memory,
         "capabilities": capabilities,
         "replay": build_replay(view),
         "findings": findings,
         "recommendations": recommendations,
+        "evidence_stream": evidence_stream,
+        "trace": trace,
+        "artifacts": artifacts or {},
     }
 
 
@@ -1616,10 +2084,17 @@ def build_recommendations(
 
 __all__ = [
     "classify_verdict",
-    "build_terminal",
+    "build_harness_terminal",
+    "build_case_block",
+    "build_case_acceptance",
+    "build_acceptance_evidence",
+    "build_safety",
+    "build_budget",
+    "build_context_errors",
+    "build_fallback",
+    "build_finish_verifier",
     "build_finish_gate",
     "build_taskdoc_final",
-    "build_stagnation",
     "build_context",
     "build_hitl",
     "build_tool_health",

@@ -69,7 +69,7 @@ outputs/
 call_model.py
 app_package_name.py
 
-.claude/
+.claude/*
 .venv
 .omc/
 .qoder/
@@ -88,7 +88,7 @@ models/
 
 # Agent tooling
 .pi/
-.codebuddy/
+.codebuddy/*
 Untitled
 openautoglm-vs-deepagents.html
 .wt/
@@ -111,6 +111,16 @@ bench/
 # Synthetic test sources are tracked; private/local grounding benches are not.
 tests/bench/
 tests/test_grounding_bench_*.py
+
+# Cross-agent entry points for the live-diagnosis skill. These are relative
+# symlinks to the canonical .agents/skills/phone-agent-live-diagnosis; no other
+# .claude/.codebuddy settings or configs are tracked.
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/phone-agent-live-diagnosis
+!.codebuddy/skills/
+.codebuddy/skills/*
+!.codebuddy/skills/phone-agent-live-diagnosis
 
 # MkDocs build output
 site/
