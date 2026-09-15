@@ -14,7 +14,11 @@ langchain-google-genai>=4.0.0
 # For iOS Support
 requests>=2.31.0
 sqlite-vec>=0.1.9
-mlx-embeddings==0.1.0
+# Apple-Silicon-only: mlx-embeddings requires mlx, which ships no Linux wheel.
+# The marker keeps `pip install -r requirements.txt` working on CI (ubuntu) and
+# on any non-MLX host; the MLX import itself is lazy (v2/recall.py), so nothing
+# but the local embedder path needs it.
+mlx-embeddings==0.1.0; sys_platform == "darwin" and platform_machine == "arm64"
 pypinyin>=0.55.0
 
 # For Model Deployment
