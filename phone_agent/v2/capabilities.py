@@ -40,7 +40,7 @@ _RUN_HOOK_WHEN = frozenset({"start", "end"})
 
 # Middleware is now reserved for LangChain bridge middleware only; all policy
 # behavior lives on the event bus.  Capabilities should not register middleware
-# directly; the core harness owns the four bridges plus optional extra_middleware.
+# directly; the core harness owns the five bridges plus optional extra_middleware.
 _RUN_HOOK_ORDER = {
     "start": {
         "taskdoc": 10,
@@ -916,7 +916,7 @@ def assemble_capabilities(
 
 
 def build_capability_registry(config: Any) -> CapabilityRegistry:
-    """Build the ten-capability composition shared by agent and runner."""
+    """Build the eleven-capability composition shared by agent and runner."""
 
     registry = CapabilityRegistry()
     for spec in (

@@ -649,7 +649,7 @@ def _build_provider_bootstrap(
 class ThinPhoneAgent:
     """Thin-loop phone agent built on ``create_agent`` + v2 event-bus bridges.
 
-    The compiled LangChain middleware stack contains only four bridge
+    The compiled LangChain middleware stack contains only five bridge
     middlewares (tool/execute, model/pre_request, model/request,
     model/post_request, agent/after) plus any ``extra_middleware`` observers.
     All policy behavior — safety, image hygiene, budget, compaction, trace,
