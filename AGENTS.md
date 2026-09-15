@@ -38,7 +38,7 @@ python3 -m venv .venv
 | 1 | **Coordinate** | 0-1000 相对坐标→绝对像素的换算只在工具内；模型永远看不到绝对像素。 | [#coords](pages/architecture.md#coords) |
 | 2 | **Marks-first** | 执行动作必须绑定 mark（唯一解，歧义/未命中 fail-closed）；裸坐标只留给 `swipe` 兜底。 | [#marks-first](pages/architecture.md#marks-first)、[#windowed-marks](pages/architecture.md#windowed-marks) |
 | 3 | **Image Hygiene** | 每次模型调用前滚动剪除历史截图，只保留最新 K 条含图消息；原生签名冲突 fail-closed。 | [#image-hygiene](pages/architecture.md#image-hygiene) |
-| 4 | **Safety Warning Flow** | 默认 `wary`：风险调用不执行、不召唤人工，只回预警；带 `confirm_irreversible=true` 重发才执行；reviewer 档构建链只一跳 `safety_reviewer`→`verifier`。 | [#safety-classification](pages/safety.md#safety-classification)、[#safety-warning](pages/safety.md#safety-warning)、[#safety-reviewer](pages/safety.md#safety-reviewer)、[#human-interrupt](pages/safety.md#human-interrupt) |
+| 4 | **Safety Warning Flow** | 默认 `wary`：风险调用不执行、不召唤人工，只回预警；带 `confirm_irreversible=true` 重发才执行；reviewer 档构建失败时一跳回落到 `verifier` 或 actor 主模型。 | [#safety-classification](pages/safety.md#safety-classification)、[#safety-warning](pages/safety.md#safety-warning)、[#safety-reviewer](pages/safety.md#safety-reviewer)、[#human-interrupt](pages/safety.md#human-interrupt) |
 | 5 | **Tool Fail-Closed** | 失败返回错误文本，绝不伪装成功；结果不明只说未知，不声称未执行。 | [#tool-fail-closed](pages/architecture.md#tool-fail-closed) |
 | 6 | **Trace Redaction** | 每个 model/tool 事件落 trace：文本截断 64 字、敏感子串脱敏、截图 base64 永不落盘。 | [#trace-redaction](pages/architecture.md#trace-redaction) |
 | 7 | **Device via DeviceFactory** | 所有设备操作经 `DeviceFactory` → `adb/`；无直接 ADB 调用。 | [#device-factory](pages/architecture.md#device-factory) |
