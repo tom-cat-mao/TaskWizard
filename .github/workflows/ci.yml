@@ -127,7 +127,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install dependencies
-        run: pip install -r requirements.txt pytest
+        # requirements.lock (pip freeze of the known-good venv) pins every transitive
+        # version; requirements.txt ranges resolve to newer releases with breaking
+        # changes (e.g. anthropic's httpx2 switch), which made this job red.
+        run: pip install -r requirements.lock
       - name: Run tests
         shell: bash
         # pipefail keeps the step red even though tee exits 0; the log file is

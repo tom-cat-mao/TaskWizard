@@ -29,6 +29,9 @@ Status: implemented
   docs job 能一直开着、且比 test job 快一个数量级的原因。
 - **测试矩阵只需要解释器**：全套 1815 个测试是离线单测，不需要安卓设备、不需要 API key、不需要网络。
 - **真机验收不进 CI**：真机诊断留在 `.agents/skills/phone-agent-live-diagnosis/SKILL.md` 描述的本地路径。
+- **版本不定就是没门禁**：CI 首次实测即被依赖漂移击穿（anthropic 新版切到 httpx2、openai 新版改异常包装，
+  requirements.txt 的 `>=` 范围装出与本地不同的版本）。`requirements.lock`（已知良好 venv 的 pip freeze）
+  是 CI 的确定性真相源，`requirements.txt` 保持人类可读范围；升级依赖的流程：本地更新 venv → 跑绿 → 重新 freeze。
 - **`requirements.txt` 用环境 marker，不删依赖**：`mlx-embeddings` 依赖 `mlx`，而 `mlx` 在旧 glibc 标签集
   （manylinux2014）下没有 wheel，新版仅提供 `manylinux_2_35_x86_64` 轮子——是否装得上视 runner glibc 而定，
   marker 是防御性措施。加上 `; sys_platform == "darwin" and
