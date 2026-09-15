@@ -112,6 +112,11 @@ bench/
 tests/bench/
 tests/test_grounding_bench_*.py
 
+# The tests/docs/ gates are tracked. The unanchored docs/ rule above is meant
+# for the repo-root local working documents, but it also matches any nested
+# docs/ directory, so re-include this one explicitly.
+!/tests/docs/
+
 # Cross-agent entry points for the live-diagnosis skill. These are relative
 # symlinks to the canonical .agents/skills/phone-agent-live-diagnosis; no other
 # .claude/.codebuddy settings or configs are tracked.
