@@ -1,0 +1,147 @@
+name: CI
+
+# Three parallel trust gates for a repository where agents produce most of the
+# code and humans only adjudicate: lint, docs, test.  All three must be green
+# before a change may enter main; branch protection is the enforcement point.
+# Deployment lives in pages.yml, never here.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Style gate: ~30s.  `ruff check .` is the command AGENTS.md declares and it
+  # is the only style signal this repository can currently block on.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint
+        run: ruff check .
+
+      # The two steps below are ADVISORY on purpose, and the reason is debt this
+      # repository already carries, not a preference:
+      #
+      #   * `ruff format --check .` fails on ~161 files.  The tree has never been
+      #     auto-formatted by any tool (black disagrees at both 88 and 120 too),
+      #     and the two commands this workflow replaced never checked formatting.
+      #     Clearing it means one mechanical 161-file commit, which must not ride
+      #     along inside a CI pull request: in a parallel-branch workflow that
+      #     diff conflicts with every open branch.  Land the reformat as its own
+      #     decided change, then drop `continue-on-error` here.
+      #   * `typos` fails on 15 pre-existing findings that are all false
+      #     positives (`aafter_model` / `abefore_model` LangChain overrides, the
+      #     `com.sdu.didi.psnger` package id, `iy`/`ix` coordinate variables,
+      #     `(mis)named`).  Clearing it needs a `.typos.toml` allowlist, which
+      #     pre-commit would auto-discover too, so CI and the hook would stay in
+      #     agreement.  Until that file exists, spelling is reported, not
+      #     enforced.
+      #
+      # Turning these into real gates is deliberately a separate, visible
+      # decision (see .agents/notes/implemented/2026-09-15-ci-three-gate-pipeline.md).
+      - name: Check formatting (advisory)
+        continue-on-error: true
+        run: ruff format --check .
+      - name: Check spelling (advisory)
+        continue-on-error: true
+        uses: crate-ci/typos@master
+
+  # Documentation gate: ~1min.  tests/docs imports nothing outside the standard
+  # library, so this job deliberately installs no requirements.txt; keeping it
+  # that way is what makes the documentation gates cheap enough to always run.
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install documentation tools
+        run: pip install pytest mkdocs-material
+      - name: Check documentation word budgets and references
+        run: python -m pytest tests/docs -q
+      - name: Build site
+        run: mkdocs build --strict
+      - name: Validate built site artifact
+        run: |
+          python - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path("site")
+          problems = []
+          if not (root / "index.html").is_file():
+              problems.append("site/index.html is missing")
+          for path in sorted(root.rglob("*")):
+              if not path.is_file():
+                  continue
+              if path.name == ".env" or path.suffix == ".env":
+                  problems.append(f"env file in artifact: {path}")
+                  continue
+              try:
+                  text = path.read_text(errors="ignore")
+              except OSError:
+                  continue
+              if "/Users/" in text:
+                  problems.append(f"local absolute path in {path}")
+              if "PRIVATE KEY-----" in text:
+                  problems.append(f"private key marker in {path}")
+              if re.search(r"PHONE_AGENT_API_KEY=\S{24,}", text):
+                  problems.append(f"secret-like api key value in {path}")
+          if problems:
+              print("\n".join(problems))
+              sys.exit(1)
+          print("artifact checks passed")
+          PY
+
+  # Test gate: ~3min per interpreter.  The whole suite is offline unit tests —
+  # no Android device, no API key, no network — so the ubuntu-only matrix is the
+  # whole story.  Live diagnosis stays a local skill; see .agents/notes/.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Run tests
+        shell: bash
+        # pipefail keeps the step red even though tee exits 0; the log file is
+        # what the failure artifact carries.
+        run: |
+          set -o pipefail
+          python -m pytest tests -q --junitxml=junit.xml 2>&1 | tee pytest.log
+      - name: Upload pytest output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-${{ matrix.python-version }}
+          path: |
+            junit.xml
+            pytest.log
+          if-no-files-found: ignore
+          retention-days: 7

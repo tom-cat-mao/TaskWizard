@@ -24,6 +24,9 @@ python3 -m venv .venv
 .venv/bin/ruff check .
 ```
 
+CI 门禁见 [.github/workflows/ci.yml](.github/workflows/ci.yml)：`lint` / `docs` / `test` 三个 job 并行，全绿才能合 main；
+本地通过不等于验收，云端绿才算。
+
 真机诊断从 `.agents/skills/phone-agent-live-diagnosis/SKILL.md` 开始；运行或监控设备任务前先读该 skill。
 诊断使用 Case + 正式 runner/IPC，报告分开呈现终局事实、检查点证据与诊断推断；`dry-run` 仅验证合成管线，
 不等于真机验收。该目录是唯一权威源，`.claude/skills/…` 与 `.codebuddy/skills/…` 是随仓库维护的相对
