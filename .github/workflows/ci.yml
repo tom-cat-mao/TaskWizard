@@ -135,9 +135,106 @@ jobs:
         shell: bash
         # pipefail keeps the step red even though tee exits 0; the log file is
         # what the failure artifact carries.
+        #
+        # Coverage is collected on both legs but deliberately NOT gated: there
+        # is no `--cov-fail-under` here and there must never be one.  A research
+        # project with unexercised adb/web edge paths would buy its green by
+        # writing tests that exist to raise a number, so the data is a review
+        # signal instead of a gate.  Rationale and rejected alternatives:
+        # .agents/notes/implemented/2026-09-15-coverage-report-no-gate.md
         run: |
           set -o pipefail
-          python -m pytest tests -q --junitxml=junit.xml 2>&1 | tee pytest.log
+          python -m pytest tests -q --junitxml=junit.xml \
+            --cov=phone_agent --cov-report=term-missing --cov-report=xml:coverage.xml 2>&1 | tee pytest.log
+
+      # `always()` + `continue-on-error` are both load-bearing: a red suite is
+      # exactly when a coverage number is worth reading, and a report that
+      # cannot be rendered must never be the reason this job is red.
+      - name: Coverage summary
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          report = pathlib.Path("coverage.xml")
+          target = pathlib.Path(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout"))
+          version = os.environ.get("PYTHON_VERSION", "?")
+
+
+          def pct(covered, valid):
+              return "n/a" if valid == 0 else f"{100 * covered / valid:.1f}%"
+
+
+          def scope_of(filename):
+              # pytest-cov writes paths relative to the measured package
+              # (`v2/agent.py`); `coverage xml` writes them relative to the
+              # checkout (`phone_agent/v2/agent.py`).  Normalize both, then
+              # aggregate to one row per subsystem rather than per file.
+              parts = [part for part in filename.split("/") if part]
+              if parts and parts[0] == "phone_agent":
+                  parts = parts[1:]
+              if len(parts) < 2:
+                  return "phone_agent"
+              return f"phone_agent/{parts[0]}"
+
+
+          lines = [f"## Coverage (Python {version}) — reported, never enforced", ""]
+
+          if not report.is_file():
+              lines += [
+                  "No `coverage.xml`: the test run did not reach coverage reporting.",
+                  "",
+              ]
+          else:
+              scopes = {}
+              for cls in ET.parse(report).getroot().iter("class"):
+                  scope = scope_of(cls.attrib.get("filename", ""))
+                  covered = sum(
+                      1
+                      for line in cls.iter("line")
+                      if int(line.attrib.get("hits", "0")) > 0
+                  )
+                  valid = sum(1 for _ in cls.iter("line"))
+                  acc = scopes.setdefault(scope, [0, 0])
+                  acc[0] += covered
+                  acc[1] += valid
+
+              total_covered = sum(c for c, _ in scopes.values())
+              total_valid = sum(v for _, v in scopes.values())
+              lines += [
+                  f"**Total: {pct(total_covered, total_valid)}** "
+                  f"({total_covered}/{total_valid} statements, "
+                  f"{total_valid - total_covered} missed)",
+                  "",
+                  "| Scope | Coverage | Statements | Missed |",
+                  "|---|---:|---:|---:|",
+              ]
+              for scope, (covered, valid) in sorted(
+                  scopes.items(), key=lambda kv: (-kv[1][1], kv[0])
+              ):
+                  label = f"`{scope}`" + (
+                      " (top-level files)" if scope == "phone_agent" else ""
+                  )
+                  lines.append(
+                      f"| {label} | {pct(covered, valid)} | {covered}/{valid} "
+                      f"| {valid - covered} |"
+                  )
+              lines += [
+                  "",
+                  "No threshold is enforced: this table is a review signal, not a gate.",
+                  "",
+              ]
+
+          with target.open("a", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n")
+          PY
+
       - name: Upload pytest output
         if: failure()
         uses: actions/upload-artifact@v4
@@ -146,5 +243,16 @@ jobs:
           path: |
             junit.xml
             pytest.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Upload coverage report
+        # Only the 3.13 leg publishes the file: both legs measure the same
+        # statements, so one copy keeps the download unambiguous.  `always()`
+        # because the report is most interesting next to a failed run.
+        if: always() && matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
           if-no-files-found: ignore
           retention-days: 7
