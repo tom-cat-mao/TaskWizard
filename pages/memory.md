@@ -17,7 +17,7 @@ flowchart TD
     DREAM --> EP
 ```
 
-## 第一层：App-KB（应用事实库）
+## 第一层：App-KB（应用事实库） {#app-kb}
 
 记录本机可启动应用及其别名，按设备序列号隔离。
 
@@ -33,19 +33,44 @@ flowchart TD
 
 错误别名纠正：dream 在整理时识别"启动 A → 1-2 步内模型自述开错并退出 → 启动 B 成功"的签名，直接覆盖错误 learned 映射（仅保存命中的自述词，不落完整模型 note）；user 别名阻止自动覆盖。
 
-App 名解析（启动时的名字→包名）：归一化 → 多路候选生成（精确/词汇/拼音/嵌入向量）→ 先验排序 → 证据分型三态决策。设备事实类强证据（精确别名、产品名等于包名片段且唯一）才自动执行；拼音/模糊/嵌入弱证据只给排序候选由模型选择。
+### 隐式别名契约 {#implicit-alias}
+
+`PHONE_AGENT_IMPLICIT_ALIAS=on`（默认）时，`launch_app(name)` 的名字解析失败并不直接写记忆：失败回执里实际出现的候选包名只作为 **run 内证据**暂留（随 run 结束丢弃，不跨 run 累积）。之后设备确认启动的包名与该证据精确相等时，才把该叫法写成 `kind=learned` 别名（`scope=global`、`confidence=0.9`、`success_count=1`、带 evidence note）。启动成功但叫法与官方名不同时，另有一条同样写 `learned` 的路径，只受 App-KB 总开关约束。
+
+以下情况绝不写入：`PHONE_AGENT_IMPLICIT_ALIAS=off`、证据为空或与确认启动的包名不匹配、叫法本身等于包名、该叫法已写过、叫法不是合法包名形态，以及命中敏感词表。
+
+### 别名纠正契约 {#alias-correction}
+
+`PHONE_AGENT_ALIAS_OVERWRITE=on`（默认）时，dream 按 run 分组识别纠正签名：成功启动 A → 1-2 步内成功 `back` 或成功启动另一个应用、且该步的 note 命中 `PHONE_AGENT_ALIAS_OVERWRITE_NOTES` 词表（默认 `开错,不对,不是,错了,wrong app`）→ 随后成功启动 B。命中的叫法若是 `kind=learned`，则先删掉该词下的旧 learned 条目再写入唯一的新 learned 条目（delete-old / store-new），并追加 `alias_overwritten` 事件（含旧包、新包、证据 run 与签名指纹）。`kind=user` 的别名永不参与自动覆盖；同一签名指纹只处理一次。
+
+管理入口的语义：`--learn-alias "名称=包名"` 写入全局 `user` 别名（最高信任，包未安装时警告后仍保存，不做设备清单同步）；`--forget-alias "名称"` 只删除该名称的全局 `user` / `learned` 条目，device 清单条目不动。两者的实际变更都追加到 `memory/app_kb/events.jsonl`。
+
+App 名解析（启动时的名字→包名）：归一化 → 多路候选生成（精确/词汇/拼音/嵌入向量）→ 先验排序 → 证据分型三态决策。设备事实类强证据（精确别名、产品名等于包名片段且唯一）才自动执行；拼音/模糊/嵌入弱证据只给排序候选由模型选择；resolved 之后仍要过装机清单与 launch policy。详见[架构](architecture.md#app-name-resolution)。
 
 存储为 JSONL 事件日志 + 可重建的 `kb.json` 视图。`dream` 在 run 之间整理：淘汰已卸载应用、衰减长期未用条目（`--dream` 或 `PHONE_AGENT_DREAM=auto`）。
 
-## 第二层：episode 经验档案
+## 第二层：episode 经验档案 {#experience-plane}
 
 每次 run 结束写一条结构化档案（`memory/experience/`）：目标原文、成败与终局原因、步数、分角色 token、警告次数、验收判决、涉及应用、时段/星期、能力快照；工具事件另存模型逐步自述的 intent/note（各 200 字封顶）。
 
 - 固定 schema：字符串原文照存；schema 之外的字段（工具参数与回执、输入文本、mark 文本、截图、模型推理）直接丢弃，永不落盘；
-- observe-only：记录不改变模型行为；
+- observe-only：记录不改变模型行为；写入路径全部 fail-open，档案写入失败不影响 run；
 - 超量（默认 500 条）或超龄（默认 90 天）的档案由 dream 折叠为聚合统计。
 
-## 第三层：语义回想（RAG，默认 shadow）
+### 档案契约 {#experience-schema}
+
+每个正常收尾的 run 在结束钩子里恰好追加一条 `episode_outcome` 事件；工具回执追加固定 schema 的 `experience_event`。两者写入 `memory/experience/events.jsonl`（追加式真相），`episodes.json` 是可重建视图——读取时发现缺失或损坏就从事件流重放重建并原子写回。事件名与字段定义见 `phone_agent/v2/experience.py`。
+
+`episode_outcome` 的固定字段：运行标识与时间（`run_id` / `ts_start` / `ts_end` / `time_of_day` / `day_of_week`）、`device_scope`、`goal_text`、`apps`、`success` / `reason` / `steps`、token 计量（`tokens_total` / `tokens_by_role`）、`warnings`、`takeover`、`verifier`、`capabilities` 能力快照、`injected_lessons` 与 `injected_procedures`（只记 lesson id）、`deliverable_path`。
+
+校验而不转换：只做形状与类型校验，不派生新语义。
+
+- 只有 `intent` / `note` 两个字段有长度上限（各 200 字），其余文本原文照存；
+- `injected_lessons` / `injected_procedures` 只接受 lesson id 形态的字符串，不落经验正文；
+- `deliverable_path` 仅在本 run 成功写出交付物后非空；
+- 档案视图除 episode 条目外还包含 `aggregate:<分类>` 聚合键，供 dream 归档后统计。
+
+## 第三层：语义回想（RAG，默认 shadow） {#rag-recall}
 
 ```mermaid
 flowchart LR
@@ -65,7 +90,21 @@ flowchart LR
 - 统计口径：Hit@1、命中率、污染率（contaminated run rate）、包级 P/R，控制台「记忆」页展示；`on` 档注入的是
   下面的 lesson，**不是**这里召回的 episode（召回结果无论哪个档位都不进 actor 上下文）。
 
-## 提炼、晋升与回注（已实现）
+### 召回与投递契约 {#lesson-injection}
+
+索引由 `phone_agent/v2/recall.py` 维护，分三个命名空间：`episode`、`app_alias`、`procedure`。索引可全量重建（`--rebuild-vec`）、可增量更新（run 结束时）、可对账（dream 时），三者共用同一份事件真相，因此删掉索引文件不会丢数据。
+
+`PHONE_AGENT_MEMORY_RAG` 三档的边界：
+
+| 档位 | 行为 |
+|---|---|
+| `shadow`（默认） | run 开局做一次召回，只写 trace 与统计，**绝不进 actor 上下文** |
+| `on` | 按下面的契约注入可注入 lesson；recall 结果本身仍不进上下文 |
+| `off` | 能力不挂载，不召回也不注入 |
+
+**可注入的只有 `approved` / `auto_approved` 两类 lesson**；`proposed` / `needs_review` / `revoked` / `superseded` 永不注入。投递前按权威视图复检每一项，任一项不成立只抑制该次投递（不影响其余项），并区分原因：`snapshot_missing`、`snapshot_corrupt`、`lesson_missing`、`not_injectable`、`version_mismatch`、`no_lesson_id`，以及 run 内撤销的 `runtime_revoked`。规则与过程卡的抑制计数独立（`rule_suppressed` / `latest_rule_suppressed` 与 `procedure_suppressed` / `latest_procedure_suppressed`），只记 lesson id、原因与类型，不落经验正文。可选记忆缺失、坏快照、诊断写失败一律 fail-open：下一次模型调用照常进行。统计写入 `memory/experience/recall_stats.json`。
+
+## 提炼、晋升与回注（已实现） {#distill-promote}
 
 - **提炼**：`--distill` 离线蒸馏——按水位线取新档案整批交给 LLM（每张卡含目标原文、逐步 intent/note 账本与结局，外加 harness 机械算出的 struggle_markers：报错步/弯路重走/finish 驳回数，上限 40 条，处理后推进水位线不重复消费）。harness 只做三件事：**核验客观事实**（严格 JSON、证据 run_id/task_keys/scope 必须逐字引自本批次、kind 形状、steps 不得含坐标/mark id/工具字面量）、**供给事实表**、**自填簿记字段**（lesson_id/support_count/时间戳等，模型只输出语义字段）。语义判断全部归第二次调用的模型自评；仅引用成功 run 的卡不再被丢弃，改由自评结合事实表定夺；
 - **晋升**：蒸馏自判分级为主（auto_approved 两类均可注入），人工 CLI（`--approve-lesson` / `--revoke-lesson`）是纠正通道而非闸门，版本链可撤销（supersede 即下线，重新批准才恢复注入）；
@@ -75,6 +114,17 @@ flowchart LR
 - **加载诊断（不打断任务）**：快照缺失（`snapshot_missing`）与损坏（`snapshot_corrupt`，含非 UTF-8 字节、权限等 OS 错误）分别记录；lesson 已撤销、版本不符、条目缺失也各有独立 reason。rule 抑制与 card 抑制计数独立（`rule_suppressed` / `latest_rule_suppressed` vs `procedure_suppressed` / `latest_procedure_suppressed`），只记 lesson id、原因与类型，不记经验正文。缺经验、坏快照或诊断写失败都 fail-open：下一次模型调用照常进行。
 
 原则：先记录、再影子验证、晋升靠蒸馏自判分级（auto_approved 两类均可注入）、人类 CLI 是纠正通道，注入有上限可撤销；每一步可回退。
+
+### 进化状态机契约 {#lesson-evolution}
+
+`phone_agent/v2/evolution.py` 只在显式离线命令里运行，不参与 run。harness 在这里只是**事实核验者、供给者与簿记员**：语义判断归模型自评，纠正归人工 CLI 与 dream 降级。
+
+- **批次**：`--distill` 按水位线游标（上一批的 `(ts_end, run_id)`）取新档案，单批上限 40 条，处理完推进游标、不重复消费；同一批次连续失败 3 次后放弃该批并记录审计事件；
+- **核验的边界**：harness 只拒可判定的假话——严格 JSON、证据 `run_id` / `task_keys` / `scope` 必须逐字引自本批次（闭世界引用）、`kind` 形状、语义步不得含坐标 / mark id / 工具字面量。违规按候选逐条丢弃，不整批拒绝；不存在"失败锚定"或复现次数硬门槛；
+- **分级**：第二次调用按 harness 供给的事实单统一自评，拿不准一律落 `needs_review`；任何分级失败都 fail-open，绝不丢候选（记 `distill_grading_failed`）；
+- **状态集合**：`proposed` / `needs_review` / `auto_approved` / `approved` / `revoked` / `superseded`。只有 `approved` / `auto_approved` 可注入；已被撤销的 id 重新提交到达即降级（规则降回 `proposed`，过程卡降回 `needs_review`），该降级只由显式批准清除；
+- **存储**：LessonStore 的读写都在进程锁 + 文件锁内进行，先重放权威事件再原子重写视图（临时文件 + fsync + replace），因此并发写不会产生半更新的视图；
+- **dream 降级**：唯一触发条件是证据丢失——lesson 引用的 run 已不在当前物化的档案视图里，够格的已批准经验降回草案（`lesson_demoted`，停止注入，需重新批准）。dream 同时按"注入组 vs 未注入组"成功率给出建议撤销清单（只提醒，不自动撤）。
 
 ### 过程卡（procedure card，WP-WF 已落地）
 

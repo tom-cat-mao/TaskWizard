@@ -52,11 +52,23 @@ my_plugin = "my_plugin.plugin:CAPABILITY"
 实际 runner 启动后才 import/apply。插件不支持运行中热重载——内建能力同样是静态装配（无文件监视、无运行中
 工具表重建），要变更需重启进程。`ctx.on_dispose(...)` 可注册 release 或失败清理回调，归属当前 capability。
 
+### 授权与发现 {#plugin-authorization}
+
+| 机制 | 内容 |
+|---|---|
+| entry points | pip 包声明 `taskwizard.capabilities` 组即被自动发现 |
+| manifest | 用户级 `~/.taskwizard/profile.toml` 与项目级 `<repo>/.taskwizard.toml`（可用 `PHONE_AGENT_PLUGIN_MANIFEST` 覆盖路径）；同名条目项目级优先 |
+| 清单写入 | `plugin add` 只做两件事：pip 安装，或在 manifest 里登记本地路径（不注入其它资源，包括应用词表） |
+| 严格模式 | 默认 strict：已启用条目加载失败或 API 版本不匹配即报错；只有显式 `enabled=false` 才跳过 |
+| 总开关 | `PHONE_AGENT_PLUGINS=false` 关闭全部外部插件，内建能力不受影响 |
+
+`plugin add` 就是执行授权：登记或安装之后，该插件的 `plugin.py` 会在 runner 装配时执行，与 `pip install` 同级信任。Web 进程没有插件加载路径（也不执行插件代码）；决定是否激活的是 runner 装配阶段，每个 run 装配一次。需要给 App-KB 注入词表时走 `main_v2.py --learn-alias`，不经插件通道。
+
 自定义 API builder 即使没有实现 context support，注册表声明的 `ModelSpec.context_window` 也会私有绑定到
 构建结果，供主模型与备用模型最终准入使用。它不替换插件的 estimate/prepare/usage，也不会猜测未知
 serializer 如何处理 `maxTokens`；没有窗口声明时保持 unknown。
 
-## 事件
+## 事件 {#events}
 
 观察型监听器 `fn(payload) -> None`；洋葱型 `fn(payload, next) -> result`，先注册者居外，不调 `next()` 即短路，内层短路的结果对外层照常可见。
 
@@ -75,9 +87,20 @@ model/pre_request:  compact → taskdoc → budget → diagnostic → model_limi
 model/request:      trace → diagnostic
 ```
 
-## 其他接缝
+## 其他接缝 {#other-seams}
 
 除监听器外，`apply(ctx)` 里还可以挂：工具（模型可见）、提示块（system 前缀/后缀/消息）、run hooks（开始/结束）、CLI 子命令。完整 API 见 `phone_agent/v2/capabilities.py::CapabilityAssemblyContext`。
+
+## 装配契约 {#capability-mount}
+
+`phone_agent/v2/capabilities.py` 是唯一装配器：十一个内建能力（providers、taskdoc、safety、budget、compact、finish_verify、deliverable、app_kb、dream、experience、recall）经五条接缝挂载——`register_middleware`、`register_tool`、`add_prompt_block`、`add_run_hook`、`add_cli_command`。内建策略全部是事件总线监听器，因此策略顺序由注册顺序决定。
+
+- **core 监听器顺序**：`tool/execute` 为 trace → diagnostic → admission → control HITL → 能力链，safety 位于能力链最内。插件在能力链之后注册，因此插件的 `tool/execute` 监听器排在 safety 之内；
+- **归属与释放**：`ctx.on` / `ctx.on_dispose` 把订阅与清理绑定到当前 capability。`release` 先反序跑清理回调，再摘除该能力注册的中间件、工具、提示块、run hooks 与 CLI 命令；正常模式变更在该 release 之后仍会 apply 新能力，只有在清理报错时才不再替换；
+- **依赖状态**：能力的对外状态由依赖推导（off 优先；依赖为 off 或待定时为 pending；就绪且档位为 shadow 时为影子；否则生效）；
+- **静态装配**：内建能力无文件监视、无运行中工具表重建，变更需重启进程；
+- **provider bootstrap**：只支持声明 `providers` 与外部 helper，缺失、循环依赖或依赖 runtime 内建能力都在启动时可见失败，不做静默降级；
+- **in-run 控制**：runner 唯一的运行中能力变更控制是 `revoke_lesson`——撤销 lesson 只影响后续投递，已经发送出去的上下文不可撤回；停止与 HITL 等既有控制照常存在。
 
 ## 可选模型上下文支持
 

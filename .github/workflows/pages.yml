@@ -3,9 +3,23 @@ name: Build and deploy MkDocs site
 on:
   push:
     branches: [main]
-    paths: [pages/**, mkdocs.yml, .github/workflows/pages.yml]
+    paths:
+      - pages/**
+      - AGENTS.md
+      - README.md
+      - tests/docs/**
+      - .agents/notes/**
+      - mkdocs.yml
+      - .github/workflows/pages.yml
   pull_request:
-    paths: [pages/**, mkdocs.yml, .github/workflows/pages.yml]
+    paths:
+      - pages/**
+      - AGENTS.md
+      - README.md
+      - tests/docs/**
+      - .agents/notes/**
+      - mkdocs.yml
+      - .github/workflows/pages.yml
   workflow_dispatch:
 
 permissions:
@@ -26,6 +40,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install mkdocs-material
+      # Documentation gates must stay runnable with pytest alone: tests/docs
+      # imports nothing outside the standard library, so no requirements.txt.
+      - name: Install pytest for documentation gates
+        run: pip install pytest
+      - name: Check documentation word budgets
+        run: python -m pytest tests/docs -q
       - run: mkdocs build --strict
       - name: Validate built site artifact
         run: |

@@ -4,6 +4,24 @@
 环境变量 > `.env` > 默认值**。默认值与支持取值以 `phone_agent/v2/config.py` 为准，模板与逐项注释见
 [`.env.example`](https://github.com/tom-cat-mao/TaskWizard/blob/main/.env.example)。
 
+## 配置层级与装配 {#config-precedence}
+
+| 层 | 来源 | 说明 |
+|---|---|---|
+| 1 | CLI 参数 | 只覆盖少量运行控制项（设备、步数、安全模式、语言等），最强 |
+| 2 | shell 环境变量 | 显式导出的 `PHONE_AGENT_*` |
+| 3 | `.env` | 仓库根的 `.env`；**只填充未导出的键**，不覆盖已存在的 shell 环境变量 |
+| 4 | 默认值 | `v2/config.py` 中的声明 |
+
+模型层在环境变量之下再叠一层单层 `models.json`：`PHONE_AGENT_MODELS_FILE` 显式指定的文件优先，否则读运行目录下的 `.taskwizard.models.json`。它只为声明式提供方、模型条目与可选 `roles` 段服务，不是通用配置层。
+
+装配时的容错与失败边界：
+
+- **可见失败**：显式的未知 provider、无法构建的显式引用不会静默改走其它网关——只有显式配置 `PHONE_AGENT_FALLBACK_MODEL` 时才按该备用降级一次（首选构建失败时降级一次；调用在传输自身重试耗尽后仍失败时再经备用调用一次，同目标不重复）；
+- **逐项跳过**：声明文件缺失、损坏或部分条目坏时跳过该项并记录结构化的 `declaration_warnings`（来源、范围、名称、错误；脱敏且有长度上限），run 内另落 `models_declaration_warning` trace 事件；env 合成的 gateway 始终可用；
+- **严格解析**：`load_raw_document` / `parse_models_document` 保留完整校验语义，显式校验路径仍 fail-closed 报配置错误；拼写错误的新协议/缓存声明会阻止选择受影响的 provider/model，避免被跳过后静默按默认值执行；
+- **窗口绑定**：构建器把声明或探测到的 `contextWindow` 私有绑定到实际模型对象，主模型与备用模型的最终准入使用该上界；已知的实际容量只允许被收紧，不能被较大的覆盖值放宽。未知 serializer 的输出上限报告为 unknown，不从 `maxTokens` 猜一个值。
+
 ## 模型
 
 | 变量 | 类型 | 默认值 | 说明 |
@@ -25,9 +43,9 @@
 `PHONE_AGENT_VERIFIER_MODEL` / `PHONE_AGENT_MEMORY_MODEL` / `PHONE_AGENT_SAFETY_REVIEWER_MODEL` 见下方
 对应章节，都是“缺省回落”型可选项，不需要为了跑通任务而设置。
 
-### 多提供方（models.json）
+### 多提供方（models.json） {#models-json}
 
-默认零配置：所有角色走上面的网关，与旧版行为一致。声明额外提供方/模型时使用单层 `models.json`（项目根 `.taskwizard.models.json`，`PHONE_AGENT_MODELS_FILE` 显式指定时优先；用户级文件已不再读取），之后各角色模型变量都可写成 `provider:model` 路由到第二模型。
+默认零配置：所有角色走上面的网关。声明额外提供方/模型时使用单层 `models.json`（运行目录下的 `.taskwizard.models.json`，`PHONE_AGENT_MODELS_FILE` 显式指定时优先），之后各角色模型变量都可写成 `provider:model` 路由到第二模型。
 
 | 变量 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
@@ -40,7 +58,7 @@
 
 models.json 条目字段：`api`（`openai-completions`/`anthropic-messages`/`google-generative-ai`）、`baseUrl`、`apiKey`（支持 `"$ENV_VAR"` 引用）、`headers`、`compat`（如 `thinkingFormat`、`supportsUsageInStreaming`）、`models[]`（`id`、`contextWindow`、`maxTokens`、`samplingParams`、`thinkingLevelMap`、`streaming`）、`modelOverrides`、可选顶层 `roles` 段（见下）。采样参数合并顺序：模型条目 < 环境变量 < 角色覆盖。`--list-models` 打印生效注册表。
 
-#### 请求协议与可选缓存
+#### 请求协议与可选缓存 {#compat-request-cache}
 
 `compat` 可写在 provider 或模型条目上。模型只覆盖明确设置的字段；`null`/省略表示继承，显式
 `auto`/`off` 可以撤销 provider 层的对应选择。
@@ -76,9 +94,17 @@ Provider 的 context 支持对象跟随实际模型。内建输入估算仍是�
 输出 cap 与实际协议使用同一 SDK 本地序列化依据，包含 alias 合并与最终 HTTP `extra_body` 覆盖；
 无法确定有效 cap 时报告 unknown，不把看起来更小的 binding 字段当作实际输出上限。
 
-`streaming`（`off`/`on`，可写在模型条目、`modelOverrides` 与 `roles.<role>`）控制该模型/角色的流式调用，优先级为 **角色 > 模型条目 > `PHONE_AGENT_STREAMING`**：模型条目的声明视为端点能力事实（某模型端点不能流式时，即使全局开也可保持 `off`），角色声明是最具体的调用级覆盖。有效决策被翻译为各协议正式参数（OpenAI/Anthropic/Google 的传输层 `streaming`），由 SDK 流式接收并聚合出完整消息；`off`/未声明不下发该参数，默认构建不变。非法取值由严格解析函数（显式校验路径）fail-closed 报错；运行时装配逐项跳过并计入 `declaration_warnings`。
+### 流式决策（streaming） {#streaming}
 
-`compat.supportsUsageInStreaming` 是 **usage 上报能力声明，不是 streaming 开关**：显式声明时，openai 路径翻译为传输层 `stream_usage`（流式请求携带 `stream_options.include_usage`），anthropic 路径翻译为是否从流式事件采集 usage；**未声明时不下发任何参数**，保持 SDK/legacy 默认（零配置构建与旧客户端逐字段一致）。Google 协议没有等价的请求侧开关（SDK 始终从流读取 `usageMetadata`），因此该声明在 Google 路径没有 wire 效果——如实界定，不做假装翻译。
+有效决策 = `roles.<role>.streaming` > 模型条目（含 `modelOverrides`）`streaming` > 全局 `PHONE_AGENT_STREAMING`。模型条目的声明视为端点能力事实（某端点不能流式时，即使全局打开也可保持 `off`），角色声明是最具体的调用级覆盖。可用性 fallback 按其自身模型声明 + 全局配置构建，不继承首选角色的覆盖。
+
+有效决策由 `phone_agent/v2/providers/builders.py` 翻译为各协议正式参数（OpenAI / Anthropic / Google 三种 transport 的 `streaming`），SDK 自行流式接收并聚合成**同一条完整消息**——headless CLI、各 aux 角色与 Web 都据此生效；`off` / 未声明不下发该参数，默认构建逐字段不变。
+
+Web 控制台只是在同一次调用上挂观察者（模型副本 + callbacks），不决定启用与否，也不会把声明 `off` 的模型强制流式。工具只从聚合完成的消息执行一次；动作序列、安全策略、重试与 usage 计账不变（usage 仍按完整消息计一次）。每次尝试（首选、以及备用调用）有独立身份：失败或中断的尝试保留已收到的部分文本并标注原因，后续尝试绝不与之拼接。增量事件只含文本字段，并按“未闭合敏感段不出站”的 settle 缓冲跨 chunk 与 flush 做脱敏。
+
+`compat.supportsUsageInStreaming` 是 **usage 上报能力声明，不是 streaming 开关**：显式声明时，openai 路径翻译为传输层 `stream_usage`（流式请求携带 `stream_options.include_usage`），anthropic 路径翻译为是否从流式事件采集 usage；**未声明时不下发任何参数**，保持 SDK/legacy 默认（零配置构建与旧客户端逐字段一致）。Google 协议没有等价的请求侧开关（SDK 始终从流读取 `usageMetadata`），因此该声明在 Google 路径没有 wire 效果——如实界定，不做假装翻译。流式下若未声明 usage 支持，该调用的 token 统计退回估算口径。
+
+`streaming` 可写在模型条目、`modelOverrides` 与 `roles.<role>`：非法取值由严格解析函数（显式校验路径）fail-closed 报错；运行时装配逐项跳过并计入 `declaration_warnings`。
 
 运行时装配（registry 构建）是可用性优先：声明文件缺失、损坏或部分条目坏时逐项跳过，并把每处跳过的
 来源/范围/名称/错误写入结构化 `declaration_warnings`（路径与错误类型，脱敏、有界）加一条有界日志告警，
@@ -124,7 +150,7 @@ provider、无法构建的显式引用不会静默改用其它 gateway；唯显�
 | `PHONE_AGENT_MAX_STEPS` | int | `100` | 单轮最大模型调用数；仅作失控保险丝，非成本手段 |
 | `PHONE_AGENT_MAX_HITL_RESUMES` | int | `20` | 人工中断恢复次数上限 |
 
-## 预算与上下文压缩
+## 预算与上下文压缩 {#budget-and-compact}
 
 | 变量 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
@@ -145,24 +171,27 @@ provider、无法构建的显式引用不会静默改用其它 gateway；唯显�
 | `PHONE_AGENT_IMAGE_KEEP` | int | `2` | 历史中保留的含图消息数 |
 | `PHONE_AGENT_OBS_MARKS_KEEP` | int | `2` | 历史中保留完整 marks 摘要的观测数 |
 
-Token 预算在模型调用边界检查，已发生的调用与验收用量仍完整累计，因此最终用量可以超过阈值。
-若达到阈值时已有由成功观测产生的 finish 复核包，且屏幕序号、目标与关闭的任务板仍匹配，本 run
-最多再给模型一次真实回复机会，处理该复核包的 `finish(confirm=true)`；不增加 `MAX_STEPS`，不自动完成。
-这份续办额度只覆盖该响应中的一次有效确认，其他工具操作返回 error-status 未执行回执。重复复核、
-确认被拒或人工中断恢复都不会补发额度；`ask_user` / `take_over` 的人工控制与其他停止条件继续生效。
-`FINISH_VERIFY=off` 不使用这份续办额度。独立验收器的拒绝与故障 `skipped` 语义保持原样。
-复核后再次委托执行普通工具时，旧复核立即失效；即使命令可能已派发但回执失败、没有新观测，也不能
-沿用旧复核续办。续办响应中被预算直接拒绝、未委托执行的普通工具不会撤销同响应的合法确认机会。
+### 预算契约 {#token-budget}
+
+成本以 token 计，累计 `usage_metadata` 的 input + output；没有 usage 时回退到本地启发式估算：CJK 字符按约 1 token/字、其余文本按 `len // 4`，每张图片按 1500 token，工具调用参数与未识别的非空 `additional_kwargs` 也计入。用量台账跨压缩持续累加，因此压缩不会重置预算。
+
+Token 预算在模型调用边界检查，已发生的调用与验收用量仍完整累计，因此最终用量可以超过阈值；达到阈值后以 `token_budget_exhausted` 停止本轮。
+
+唯一续办例外：若达到阈值时已有由成功观测产生的 finish 复核包，且屏幕序号、原始目标与关闭且合法的任务板仍匹配，本 run 最多再给模型一次真实回复机会，处理该复核包的 `finish(confirm=true)`；不增加 `MAX_STEPS`、不自动完成。这份续办额度只覆盖该响应中的一次有效确认，其他工具操作返回 error-status 未执行回执。以下情况不补发额度：重复复核、确认被拒、人工中断恢复、复核后再次委托执行普通工具（即使命令可能已派发但回执失败、没有新观测）；续办响应中被预算直接拒绝、未委托执行的普通工具也不会撤销同响应的合法确认机会。`FINISH_VERIFY=off` 不使用这份续办额度。独立验收器的拒绝与故障 `skipped` 语义保持原样，人工控制、`PHONE_AGENT_MAX_STEPS`（`loop_fuse` 保险丝）与已接受的终局优先。
+
+### 压缩契约 {#auto-compact}
 
 工作目标不改变 `contextWindow`。每轮先清理旧图/marks，再按实际模型的可选 context support 估算；provider 已计入工具定义时不重复加 schema reserve。未知/native 内容使用明确的启发式估算，不视为零成本；这不等同于真实 provider tokenizer。
 
-语义压缩只归并完整的已闭合 AI/工具组，保留原始任务、当前 TaskDoc、最新完整组、活跃图/marks 和 opaque 依赖；不截 HTML 调用参数。摘要模型输入过长时按完整组分段后合并，单组装不下则跳过。单次压缩最多 8 次逻辑摘要调用（含本层重试/合并，不包含 SDK 内部 HTTP 重试）；每次调用前检查已有 run token 预算，耗尽后不再付摘要调用。失败、超长或净缩减不足时保留已经完成必要图像清理的基线，不提交部分摘要。最终发送前还需对实际模型、最新 pins 与工具定义做容量准入，不能在 fallback 内单独截断一份临时历史。
+语义压缩只归并完整的已闭合 AI/工具组，保留原始任务、当前 TaskDoc、最新完整组、活跃图/marks 和 opaque 依赖；不截 HTML 调用参数。摘要模型输入过长时按完整组分段后合并，单组装不下则跳过。单次压缩最多 8 次逻辑摘要调用（含本层重试/合并，不包含 SDK 内部 HTTP 重试）；每次调用前检查已有 run token 预算，耗尽后不再付摘要调用。失败、超长或净缩减不足时保留已经完成必要图像清理的基线，不提交部分摘要。最终发送前还需对实际模型、最新 pins 与工具定义做容量准入，不能在 fallback 内单独截断一份临时历史。已超物理窗口的请求只要正净缩减并恢复准入，就不会被普通软收益门槛拒绝。
 
-软目标不能阻止合法的物理容量修复。例如最新必留 HTML 组大于 32k 的低水位、但仍能放进实际模型窗口时，接近/超过物理阈值的请求会按物理目标重新规划。已超窗口的请求只要正净缩减并恢复准入，不能被普通软收益门槛拒绝；完整工具组、原生依赖与观测仍保留。压缩完成但软目标未达到会记录 `soft_target_unattainable`，不冒充已达到 32k。
+软目标不能阻止合法的物理容量修复。例如最新必留 HTML 组大于 32k 的低水位、但仍能放进实际模型窗口时，接近/超过物理阈值的请求会按物理目标重新规划；完整工具组、原生依赖与观测仍保留。压缩完成但软目标未达到会记录 `soft_target_unattainable`，不冒充已达到 32k。
 
 原生签名可位于标准 text/image block 的嵌套 `extras` 中，估算与保护会递归识别。普通 SDK function-call id 对照表不因此永久占住压缩边界。若自定义 Provider 把原生签名放在必须移除的旧图片或 OBS marks 块上，当前没有可验证的合法重放投影：micro 在改任何消息前预检并报告 `native_context_pruning_conflict`，不会搬动签名或保留额外旧图。最新 K 的签名块保持原样；同消息其他文本块有签名不妨碍无签名旧图清理。
 
 未识别的非空 `additional_kwargs` 默认作为可能的 Provider 续接载荷保留，并作非零序列化估算。只有已经被结构化调用表示覆盖的 `tool_calls` / `function_call` 和已确认的 `__openai_function_call_ids__` 对照表属于例外；不能因为某个字段不在已知签名列表中，就认为可以丢弃。
+
+**消息协议契约**：`model/pre_request` 监听器是纯的全消息列表变换——**不得**返回 `RemoveMessage`，也不返回 `jump_to` 做流程控制。监听器改动了列表时，由桥接中间件统一铸出唯一合法的 `[RemoveMessage(REMOVE_ALL), *result]` 形态交给下游。
 
 ## 界面落地（Grounding）
 
@@ -193,7 +222,7 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | `PHONE_AGENT_SAFETY_MODE` | `off`/`wary`/`hard`/`reviewer` | `wary` | 执行类动作门控，详见[安全模式](safety.md) |
 | `PHONE_AGENT_SAFETY_REVIEWER_MODEL` | str | 回落 `VERIFIER_MODEL` | `reviewer` 档的风险精排模型；两者皆空（且 models.json `roles` 未指定）时精排不可用，该档按 fail-closed 预警处理——**不**回落主模型 |
 | `PHONE_AGENT_FINISH_VERIFY` | `off`/`auto`/`always` | `auto` | finish 独立验收器触发策略；`off` 退化为单段落定。验收器故障 **fail-open**：放行并在审计记 `skipped`，绝不记 `pass` |
-| `PHONE_AGENT_FINISH_VERIFY_K` | int | `1` | 验收器查看的尾部截图数 |
+| `PHONE_AGENT_FINISH_VERIFY_K` | int | `1` | 验收器查看的尾部截图数；当前实现恒取一次新观测的当前帧，`K>1` 的历史帧保留未接 |
 | `PHONE_AGENT_VERIFIER_MODEL` | str | 主模型 | 验收器模型 |
 
 ## 记忆
