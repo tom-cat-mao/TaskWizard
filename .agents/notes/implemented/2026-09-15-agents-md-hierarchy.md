@@ -93,9 +93,8 @@ Status: implemented
 - **代价**：多出三个需要维护的文件（两份子树 AGENTS + `postmortem/README.md`）；规则分散后，
   改一条跨层约定要同时改根文件与子树文件，可能出现说法漂移；`postmortem/` 的结构（四节、事实/推断
   分开）目前只靠人工遵守，没有机器门禁。
-- **仍然脆弱**：`phone_agent/v2/AGENTS.md` 与 `pages/AGENTS.md` 的引用不受
-  `tests/docs/test_doc_references.py` 覆盖（该测试只扫 `AGENTS.md`、`README.md`、
-  `docs/future-roadmap.md`），也没有词数预算条目——把新文件纳入这两道门禁是并行分支的工作；
-  在此之前，两个子文件的路径真实性靠人工核对。
+- **仍然脆弱**：锚点仍无机器校验——`tests/docs/test_doc_references.py` 跳过含 `#` 的 token，P0 表里的
+  `{#anchor}` 是否落地靠人工核对；两个子文件的引用真实性与词数上限已在本批纳入 `tests/docs/` 门禁
+  （`_DOCUMENTS` 含 `phone_agent/v2/AGENTS.md` 与 `pages/AGENTS.md`，词数预算各 750）。
 - **边界**：层级只建到「有独立纪律的子树」为止（`v2/` 与 `pages/`），不为每个目录造一份 AGENTS.md；
   `phone_agent/adb/`、`grounding/`、`config/` 作为保留库继续由根文件与模块 docstring 约束。

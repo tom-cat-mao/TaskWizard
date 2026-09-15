@@ -22,6 +22,7 @@ python3 -m venv .venv
 .venv/bin/python -m pytest tests -q        # 全量矩阵（本地复现 CI）
 .venv/bin/python -m pytest tests/v2 -q     # 只改了 v2 代码
 .venv/bin/python -m pytest tests/docs -q   # 只改了文档 / AGENTS.md
+.venv/bin/python -m pytest tests/web -q    # 只改了 Web 前端
 .venv/bin/ruff check .
 ```
 

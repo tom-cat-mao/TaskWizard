@@ -36,9 +36,9 @@
 ## 改完跑什么
 
 ```bash
-pytest tests/v2 -q          # 改了本子树代码
-pytest tests/docs -q        # 改了 AGENTS.md / README.md / docs / pages
-ruff check .                # 改动前后都值得跑
+.venv/bin/python -m pytest tests/v2 -q     # 改了本子树代码
+.venv/bin/python -m pytest tests/docs -q   # 改了 AGENTS.md / README.md / docs / pages
+.venv/bin/ruff check .                     # 改动前后都值得跑
 ```
 
 全量矩阵（`lint` / `docs` / `test`）交给 CI，本地不默认跑全套。
