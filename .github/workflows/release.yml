@@ -1,0 +1,57 @@
+name: Release
+
+# Tag-driven release: pushing an annotated tag such as v0.1.0 (which must match
+# setup.py's version) publishes a GitHub Release with auto-generated notes.
+# No build artifacts and no PyPI upload — this repository is cloned to drive a
+# real device, not installed as a library.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check tag matches setup.py version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          tag = os.environ["TAG"]
+          expected = tag[1:] if tag.startswith("v") else tag
+
+          setup_py = pathlib.Path("setup.py").read_text(encoding="utf-8")
+          match = re.search(r'^\s*version\s*=\s*["\']([^"\']+)["\']', setup_py, re.MULTILINE)
+          if match is None:
+              sys.exit("::error::could not parse the `version` string from setup.py")
+          version = match.group(1)
+
+          if version != expected:
+              sys.exit(
+                  f"::error::tag {tag} does not match setup.py version {version}; "
+                  f"bump setup.py (or move the tag to v{version}) before releasing"
+              )
+          print(f"tag {tag} matches setup.py version {version}")
+          PY
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
