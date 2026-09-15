@@ -96,7 +96,7 @@ model/request:      trace → diagnostic
 `phone_agent/v2/capabilities.py` 是唯一装配器：十一个内建能力（providers、taskdoc、safety、budget、compact、finish_verify、deliverable、app_kb、dream、experience、recall）经五条接缝挂载——`register_middleware`、`register_tool`、`add_prompt_block`、`add_run_hook`、`add_cli_command`。内建策略全部是事件总线监听器，因此策略顺序由注册顺序决定。
 
 - **core 监听器顺序**：`tool/execute` 为 trace → diagnostic → admission → control HITL → 能力链，safety 位于能力链最内。插件在能力链之后注册，因此插件的 `tool/execute` 监听器排在 safety 之内；
-- **归属与释放**：`ctx.on` / `ctx.on_dispose` 把订阅与清理绑定到当前 capability。`release` 先反序跑清理回调，再摘除该能力注册的中间件、工具、提示块、run hooks 与 CLI 命令；正常模式变更在该 release 之后仍会 apply 新能力，只有在清理报错时才不再替换；
+- **归属与释放**：`ctx.on` / `ctx.on_dispose` 把订阅与清理绑定到当前 capability。`release` 先反序跑清理回调，再摘除该能力注册的中间件、工具、提示块、run hooks 与 CLI 命令；正常模式变更在该 release 之后仍会 apply 新能力，只有在清理报错时才不再替换<!-- allow:不再 -->；
 - **依赖状态**：能力的对外状态由依赖推导（off 优先；依赖为 off 或待定时为 pending；就绪且档位为 shadow 时为影子；否则生效）；
 - **静态装配**：内建能力无文件监视、无运行中工具表重建，变更需重启进程；
 - **provider bootstrap**：只支持声明 `providers` 与外部 helper，缺失、循环依赖或依赖 runtime 内建能力都在启动时可见失败，不做静默降级；

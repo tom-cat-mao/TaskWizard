@@ -183,7 +183,7 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 
 工作目标不改变 `contextWindow`。每轮先清理旧图/marks，再按实际模型的可选 context support 估算；provider 已计入工具定义时不重复加 schema reserve。未知/native 内容使用明确的启发式估算，不视为零成本；这不等同于真实 provider tokenizer。
 
-语义压缩只归并完整的已闭合 AI/工具组，保留原始任务、当前 TaskDoc、最新完整组、活跃图/marks 和 opaque 依赖；不截 HTML 调用参数。摘要模型输入过长时按完整组分段后合并，单组装不下则跳过。单次压缩最多 8 次逻辑摘要调用（含本层重试/合并，不包含 SDK 内部 HTTP 重试）；每次调用前检查已有 run token 预算，耗尽后不再付摘要调用。失败、超长或净缩减不足时保留已经完成必要图像清理的基线，不提交部分摘要。最终发送前还需对实际模型、最新 pins 与工具定义做容量准入，不能在 fallback 内单独截断一份临时历史。已超物理窗口的请求只要正净缩减并恢复准入，就不会被普通软收益门槛拒绝。
+语义压缩只归并完整的已闭合 AI/工具组，保留原始任务、当前 TaskDoc、最新完整组、活跃图/marks 和 opaque 依赖；不截 HTML 调用参数。摘要模型输入过长时按完整组分段后合并，单组装不下则跳过。单次压缩最多 8 次逻辑摘要调用（含本层重试/合并，不包含 SDK 内部 HTTP 重试）；每次调用前检查已有 run token 预算，耗尽后不再付摘要调用。失败、超长或净缩减不足时保留已经完成必要图像清理的基线，不提交部分摘要。最终发送前还需对实际模型、最新 pins 与工具定义做容量准入，不能在 fallback 内单独截断一份临时历史。已超物理窗口的请求只要正净缩减并恢复准入，就不会被普通软收益门槛拒绝。<!-- allow:不再 -->
 
 软目标不能阻止合法的物理容量修复。例如最新必留 HTML 组大于 32k 的低水位、但仍能放进实际模型窗口时，接近/超过物理阈值的请求会按物理目标重新规划；完整工具组、原生依赖与观测仍保留。压缩完成但软目标未达到会记录 `soft_target_unattainable`，不冒充已达到 32k。
 
@@ -206,7 +206,7 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | `PHONE_AGENT_LOCATE_MAX_SIZE` | int | `0` | locate 工具输入图最长边；`0` = 原图 |
 | `PHONE_AGENT_SCOPE_PADDING_RATIO` | float | `0.05` | scope 区域裁剪的边缘扩展比例 |
 | `PHONE_AGENT_LOCATEANYTHING_CONTEXT_MAX_CHARS` | int | `200` | locate 指令中单字段提示长度上限 |
-| `PHONE_AGENT_PARALLEL_TOOL_CALLS` | bool | `false` | 仅 provider hint：默认不向 OpenAI 兼容传输发送 `parallel_tool_calls`；设 `true` 只是不再发送该 hint，不解除单批执行（工具调用仍由 admission 串行） |
+| `PHONE_AGENT_PARALLEL_TOOL_CALLS` | bool | `false` | 仅 provider hint：默认向 OpenAI 兼容传输发送 `parallel_tool_calls=false`（provider 声明不支持该参数时不发送），设 `true` 则不发送该 hint（仅供拒绝该参数的网关使用）。两种取值都不解除单批执行（工具调用仍由 admission 串行） |
 
 ## 观测
 
@@ -289,7 +289,7 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | 变量 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `PHONE_AGENT_TASKDOC` | bool | `true` | TaskDoc 任务板开关 |
-| `PHONE_AGENT_TASKDOC_NUDGE_STEPS` | int | `5` | **已废弃/no-op**：停滞轻推已由流程线取代，保留仅为兼容，不再生效 |
+| `PHONE_AGENT_TASKDOC_NUDGE_STEPS` | int | `5` | **no-op**：停滞轻推不产生行为，该键仅为 env 兼容保留 |
 | `PHONE_AGENT_TRACE` | bool | `true` | JSONL trace 开关（脱敏，不含截图） |
 | `PHONE_AGENT_TRACE_DIR` | path | `.traces` | trace 目录 |
 | `PHONE_AGENT_DIAG_EVIDENCE` | bool | `false` | 诊断证据流（live-diagnosis 用；生产默认关闭、零成本） |

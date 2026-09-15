@@ -1,7 +1,9 @@
 """Doc reference contract: paths named by the tracked docs must resolve.
 
 ``AGENTS.md`` / ``README.md`` / ``docs/future-roadmap.md`` are the entry points a
-fresh clone is read through, so every repository path they name has to exist —
+fresh clone is read through, and the two subtree ``AGENTS.md`` files
+(``pages/``, ``phone_agent/v2/``) carry the same obligation to the readers who
+enter those directories, so every repository path they name has to exist —
 otherwise a reader (human or coding agent) is pointed at a file that is not
 there.  The check covers backticked tokens and inline markdown links and
 resolves the shorthands ``AGENTS.md`` defines at the top of the file:
@@ -31,7 +33,13 @@ import pytest
 # ``tests/docs/test_doc_references.py`` -> repo root, independent of the cwd.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-_DOCUMENTS = ("AGENTS.md", "README.md", "docs/future-roadmap.md")
+_DOCUMENTS = (
+    "AGENTS.md",
+    "README.md",
+    "docs/future-roadmap.md",
+    "pages/AGENTS.md",
+    "phone_agent/v2/AGENTS.md",
+)
 
 # AGENTS.md header: `v2/...` means phone_agent/v2/..., `middleware/...` means
 # phone_agent/v2/middleware/..., `adb/`/`grounding/`/`config/` live under

@@ -8,10 +8,10 @@
 ## What This Is
 
 每步一次模型调用（LangChain `create_agent`）；harness 只提供工具、执行安全边界、上下文卫生、trace 与固定
-schema 经验档案，**不做工作流路由**。所有策略行为都是事件总线上的监听器，编译后的中间件栈只剩桥接器加
-可选 `extra_middleware` 观察者。可选 `phone_agent/web/` NiceGUI 前端启动
-`python -m phone_agent.runner`，经 `PHONE_AGENT_RUNS_DIR` 的追加式文件观察；web 进程不得拥有设备访问、
-工具执行或工作流路由，headless 的 `ThinPhoneAgent.run(...)` 必须始终可用。
+schema 经验档案，**不做工作流路由**。所有策略行为都是事件总线监听器，中间件栈只剩桥接器（另有可选
+`extra_middleware` 观察者）。可选 `phone_agent/web/` NiceGUI 前端经 `python -m phone_agent.runner` 启动，
+走 `PHONE_AGENT_RUNS_DIR` 的追加式文件观察；web 进程不拥有设备、工具与路由，headless 的
+`ThinPhoneAgent.run(...)` 必须始终可用。
 
 ## Development Commands
 
@@ -19,8 +19,10 @@ schema 经验档案，**不做工作流路由**。所有策略行为都是事件
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-.venv/bin/pytest tests -q
-.venv/bin/python -m pytest tests -q
+.venv/bin/python -m pytest tests -q        # 全量矩阵（本地复现 CI）
+.venv/bin/python -m pytest tests/v2 -q     # 只改了 v2 代码
+.venv/bin/python -m pytest tests/docs -q   # 只改了文档 / AGENTS.md
+.venv/bin/python -m pytest tests/web -q    # 只改了 Web 前端
 .venv/bin/ruff check .
 ```
 
@@ -28,13 +30,12 @@ CI 门禁见 [.github/workflows/ci.yml](.github/workflows/ci.yml)：`lint` / `do
 本地通过不等于验收，云端绿才算。
 
 真机诊断从 `.agents/skills/phone-agent-live-diagnosis/SKILL.md` 开始；运行或监控设备任务前先读该 skill。
-诊断使用 Case + 正式 runner/IPC，报告分开呈现终局事实、检查点证据与诊断推断；`dry-run` 仅验证合成管线，
-不等于真机验收。该目录是唯一权威源，`.claude/skills/…` 与 `.codebuddy/skills/…` 是随仓库维护的相对
-符号链接，勿另行复制成独立版本。
+报告分开呈现终局事实、检查点证据与诊断推断；`dry-run` 仅验证合成管线，不等于真机验收。该目录是唯一权威源，
+`.claude/skills/…` 与 `.codebuddy/skills/…` 是相对符号链接，勿复制成独立版本。
 
 ## P0 Contracts (Must Never Violate)
 
-一行一条军规；**完整语义以「正文」列链接为准**，本表不重复展开。
+一行一条军规；**完整语义以「正文」列链接为准**。
 
 | # | 领域 | 军规 | 正文 |
 |---|------|------|------|
@@ -70,7 +71,7 @@ CI 门禁见 [.github/workflows/ci.yml](.github/workflows/ci.yml)：`lint` / `do
 
 | Area | Entry |
 |---|---|
-| CLI / run 入口 | `main_v2.py`（任务或显式离线命令） |
+| CLI / run 入口 | `main_v2.py`（任务或离线命令） |
 | Agent 装配与终局 | `v2/agent.py`（五条桥接器、core 监听器、`RunResult`） |
 | 能力装配 | `v2/capabilities.py`（cap-id、mode、release 簿记） |
 | 观测与设备状态 | `v2/session.py`（epoch/marks/参考图/locate） |
@@ -91,8 +92,14 @@ v1 的 `graph/`、`actions/`、`checkpoint/`、旧 `agent.py`/`main.py`、`evals
 
 - `.env`、`memory/`、`outputs/`、trace 与真实设备画面是本机私有数据：不提交、不发布、不进 Pages/Issue；
   公开演示只用 synthetic/fake 数据。
-- Web 只投影事件，不向浏览器发送 API key、认证头或完整配置；生产 trace 脱敏且无截图 base64。
-- 经验/记忆写入 observe-only：schema 外字段（工具参数/回执、输入文本、mark 文本、截图、推理）直接丢弃。
+- Web 只投影事件，不给浏览器发 API key、认证头或完整配置；生产 trace 脱敏且无截图 base64。
+- 经验/记忆写入 observe-only：schema 外字段（工具参数、截图、推理等）直接丢弃。
+
+## Working Agreements
+
+- **Prefer maintained dependencies**：能用成熟包净删手写代码时就引包——先搜生态、再写实现，不闭门造车；
+  引包与自研的取舍照样写决策笔记（P0 #23）。
+- **改了哪层只跑哪层**：本地不默认跑全套，只跑改动的那层（分层命令见上）；全量矩阵交给 CI。
 
 ## Environment Gotchas
 
@@ -112,11 +119,12 @@ v1 的 `graph/`、`actions/`、`checkpoint/`、旧 `agent.py`/`main.py`、`evals
 | Install / run / CLI flags / examples | `README.md`、`.venv/bin/python main_v2.py --help` |
 | Config keys | `pages/configuration.md`（唯一详细配置页）+ `.env.example` + `v2/config.py` |
 | 用户手册与契约正文（P0 表锚点都在这里） | `pages/*.md`（文档站源） |
-| 实现状态、延期项与批次记录 | `docs/future-roadmap.md`（批次原始记录是本机私有文档，不入库） |
+| 实现状态、延期项、批次执行/验收 | `docs/future-roadmap.md`（含「本分支已落地」段；原始批次记录不入库） |
 | 模块契约 | 对应模块 docstring；预算/压缩另见 `middleware/{budget,compact,_tokens}.py` |
 | 真机诊断 | `.agents/skills/phone-agent-live-diagnosis/SKILL.md` |
 | 决策笔记（为什么这样设计） | `.agents/notes/AGENTS.md`；某篇的正文在 `.agents/notes/<status>/` |
-| 批次执行/验收 | `docs/future-roadmap.md` 的「本分支已落地」段 |
+| 事故与历史沿革（当年踩过什么坑） | `postmortem/`（唯一允许写历史叙述的目录） |
+| 进子树改代码 | 该子树的 `AGENTS.md`（就近约束：`phone_agent/v2/`、`pages/`） |
 
 注意：`docs/` 默认被 `.gitignore` 忽略，只有显式加入索引的文件才入库。
 
@@ -124,4 +132,4 @@ v1 的 `graph/`、`actions/`、`checkpoint/`、旧 `agent.py`/`main.py`、`evals
 
 - 内部状态在 `docs/future-roadmap.md`；公开能力状态在 `pages/roadmap.md`。
 - 架构/工具/配置变化时，同一 commit 同步 `README.md` 与 `AGENTS.md`；用户可见行为同步 `pages/`。
-- 非平凡改动同一 commit 带决策笔记（见 P0 #23）；只有被明确要求时才 commit。
+- 非平凡改动同一 commit 带决策笔记（见 P0 #23）。

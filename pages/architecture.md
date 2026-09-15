@@ -108,7 +108,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 
 ## 单批执行 {#single-batch-execution}
 
-同一轮模型给出的多个工具调用由 execution-admission 监听器**串行**执行：整个调用期间持有可重入锁，并按 provider 的并发上限 1 保证声明顺序。进入终局转换（finish 被接受或 takeover 被接受）后，同轮剩余 sibling 不再执行，只收到 status 为 error 的 skipped 回执。`PHONE_AGENT_PARALLEL_TOOL_CALLS` 只是 provider hint（默认不向 OpenAI 兼容传输下发 `parallel_tool_calls`），设 `true` 只是不再发送该 hint，不解除串行。
+同一轮模型给出的多个工具调用由 execution-admission 监听器**串行**执行：整个调用期间持有可重入锁，并按 provider 的并发上限 1 保证声明顺序。进入终局转换（finish 被接受或 takeover 被接受）后，同轮剩余 sibling 不再执行，只收到 status 为 error 的 skipped 回执。`PHONE_AGENT_PARALLEL_TOOL_CALLS` 只是 provider hint（默认下发 `parallel_tool_calls=false`；设 `true` 则不发送该 hint），不解除串行。<!-- allow:不再 -->
 
 ## App 名解析 {#app-name-resolution}
 
@@ -177,7 +177,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 ## finish 两段式与验收 {#finish-two-step}
 
 1. **两段式**：首次 `finish` 返回复核包（目标、路线完成度、疑点），模型带 `confirm=true` 再次调用才定稿；声明 `completed` 的路线项必须带 `evidence_note`，缺证据的声明被拒。复核包记录当时提交的屏幕序号，`confirm` 时比较当前序号；序号已前进则重新出复核包。`PHONE_AGENT_FINISH_VERIFY=off` 退化为单段落定，不生成复核包、不做序号守卫。
-2. **终局**：被接受的 finish 立即终局——同轮后续 sibling 工具调用不再执行，收到 status 为 error 的 skipped 回执（`自动化已终止；该后续工具调用已跳过。`），且此后不再采样模型。被接受的 `take_over` 同样终局；被拒绝的 `take_over` 不设终局，run 继续。
+2. **终局**：被接受的 finish 立即终局——同轮后续 sibling 工具调用不再执行，收到 status 为 error 的 skipped 回执（`自动化已终止；该后续工具调用已跳过。`），且此后不再采样模型。被接受的 `take_over` 同样终局；被拒绝的 `take_over` 不设终局，run 继续。<!-- allow:不再 -->
 3. **独立验收器**（`PHONE_AGENT_FINISH_VERIFY`，默认 `auto`）：上下文独立于 actor，只看目标、证据路线与尾部截图，**绝不读 actor transcript**；TaskDoc 关闭时以 run 的原始目标为权威。`auto` 档在目标命中高风险词表，或复核发现硬矛盾（最后一步工具失败、观测无效、前台回到 Launcher）时触发；`always` 总是触发；`off` 关闭。验收器连续两次拒绝转为 `take_over`。
 4. **故障 fail-open**：验收器构建或调用失败时放行该 finish 并记审计状态 `skipped`，绝不记 `pass`。
 
