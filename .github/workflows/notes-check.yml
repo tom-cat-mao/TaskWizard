@@ -13,8 +13,8 @@ on:
 permissions:
   contents: read
 
-# Serialise per pull request so two runs cannot both pass the idempotency check
-# and post duplicate comments.
+# Keep only the latest run per pull request; the idempotency marker is the real
+# guard against duplicate comments if an older run still lands a comment.
 concurrency:
   group: notes-check-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -22,6 +22,7 @@ concurrency:
 jobs:
   notes-reminder:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write

@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install ruff
-        run: pip install ruff
+        run: pip install "ruff==0.11.7"  # pinned to match .pre-commit-config.yaml
       - name: Lint
         run: ruff check .
 
@@ -58,7 +58,7 @@ jobs:
         run: ruff format --check .
       - name: Check spelling (advisory)
         continue-on-error: true
-        uses: crate-ci/typos@master
+        uses: crate-ci/typos@v1.32.0  # pinned to match .pre-commit-config.yaml
 
   # Documentation gate: ~1min.  tests/docs imports nothing outside the standard
   # library, so this job deliberately installs no requirements.txt; keeping it

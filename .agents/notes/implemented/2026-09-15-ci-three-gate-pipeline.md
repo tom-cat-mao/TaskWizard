@@ -29,8 +29,9 @@ Status: implemented
   docs job 能一直开着、且比 test job 快一个数量级的原因。
 - **测试矩阵只需要解释器**：全套 1815 个测试是离线单测，不需要安卓设备、不需要 API key、不需要网络。
 - **真机验收不进 CI**：真机诊断留在 `.agents/skills/phone-agent-live-diagnosis/SKILL.md` 描述的本地路径。
-- **`requirements.txt` 用环境 marker，不删依赖**：`mlx-embeddings` 依赖 `mlx`，而 `mlx` 没有 Linux wheel，
-  `pip install -r requirements.txt` 在 ubuntu 上必失败。加上 `; sys_platform == "darwin" and
+- **`requirements.txt` 用环境 marker，不删依赖**：`mlx-embeddings` 依赖 `mlx`，而 `mlx` 在旧 glibc 标签集
+  （manylinux2014）下没有 wheel，新版仅提供 `manylinux_2_35_x86_64` 轮子——是否装得上视 runner glibc 而定，
+  marker 是防御性措施。加上 `; sys_platform == "darwin" and
   platform_machine == "arm64"` 后，macOS 本地装法不变、ubuntu 可干净安装；MLX 的导入本来就是懒的
   （`v2/recall.py` 在 `_ensure_loaded` 里才 import），所以测试路径不需要它。
 - **格式与拼写暂时是 advisory，不是 gate**：`ruff format --check .` 在 161 个文件上失败、`typos` 在 15 处
