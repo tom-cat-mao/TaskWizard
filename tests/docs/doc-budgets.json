@@ -1,0 +1,16 @@
+{
+  "_comment": "Documentation word budgets, enforced by tests/docs/test_doc_budgets.py from the pages.yml workflow. Metric: one word per CJK character plus one word per maximal latin/digit run, counted after stripping fenced code blocks and HTML comments. Calibration: README.md and docs/future-roadmap.md are current size +20%, every pages/*.md is current size +50%, all rounded to the nearest hundred. Keys starting with '_' document the manifest and are not budgets.",
+  "_agents_note": "AGENTS.md is pinned to its present 5075 words rounded to 5100, not to the agreed 1950-word target: that target only becomes reachable once the .agents/notes/ migration moves the P0 contract detail out of the file. Ratchet this entry down in that change.",
+  "AGENTS.md": 5100,
+  "README.md": 1900,
+  "docs/future-roadmap.md": 1700,
+  "pages/architecture.md": 2800,
+  "pages/configuration.md": 8700,
+  "pages/console.md": 2600,
+  "pages/index.md": 1100,
+  "pages/memory.md": 3100,
+  "pages/plugins.md": 2100,
+  "pages/quickstart.md": 800,
+  "pages/roadmap.md": 1500,
+  "pages/safety.md": 1200
+}
