@@ -4,7 +4,7 @@
 机制不受影响。启动：
 
 ```bash
-.venv/bin/python -m phone_agent.web --device-id <serial> --port 8080
+.venv/bin/python -m phone_agent.web --device-id "$SERIAL" --port 8080
 ```
 
 默认地址是 `http://127.0.0.1:8080`。
