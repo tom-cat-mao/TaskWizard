@@ -95,7 +95,8 @@ S=.agents/skills/phone-agent-live-diagnosis/scripts/run_diagnosis.py
 - 配置项的**唯一详细手册**：[配置参考](https://tom-cat-mao.github.io/TaskWizard/configuration/)；模板见 [`.env.example`](.env.example)
 - OpenAI 兼容网关可用 `compat.requestApi=auto|chat|responses` 明确协议（默认保留 SDK auto）；支持的端点可显式启用 `cachePolicy=stable-prefix`。模型 context 支持可由插件提供，缓存准备仅允许缓存参数，输出上限按 SDK 实际序列化评估；默认不猜网关缓存能力，详见[配置参考](pages/configuration.md)与[插件开发](pages/plugins.md)。
 - 编码约束、开发命令与模块地图：[AGENTS.md](AGENTS.md)
-- 特定批次的执行与验收记录：[`docs/execution/`](docs/execution/)
+- 现行实现状态与延期项：[`docs/future-roadmap.md`](docs/future-roadmap.md)；特定批次的执行与验收原始记录是维护者本机私有文档（不入库）
+- 决策笔记（每个非平凡改动为什么这样定）：[`.agents/notes/`](.agents/notes/AGENTS.md)
 
 ## 安全与隐私
 

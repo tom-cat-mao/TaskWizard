@@ -110,7 +110,8 @@ v1 的 `graph/`、`actions/`、`checkpoint/`、旧 `agent.py`/`main.py`、`evals
 | 实现状态与延期项 | `docs/future-roadmap.md` |
 | 模块契约 | 对应模块 docstring；预算/压缩另见 `middleware/{budget,compact,_tokens}.py` |
 | 真机诊断 | `.agents/skills/phone-agent-live-diagnosis/SKILL.md` |
-| 批次执行/验收记录 | `docs/execution/`；v1 历史日志在 `docs/archive/` |
+| 决策笔记（为什么这样设计） | `.agents/notes/AGENTS.md`；某篇的正文在 `.agents/notes/<status>/` |
+| 批次执行/验收记录 | `docs/future-roadmap.md` 的「本分支已落地 / 本轮整合状态」；批次原始记录是维护者本机私有文档，不入库 |
 
 注意：`docs/` 默认被 `.gitignore` 忽略，只有显式加入索引的文件才入库。
 

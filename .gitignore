@@ -101,6 +101,9 @@ memory/
 
 # Local working documents — never tracked
 docs/
+# ...except the doc-reference tests, which must be tracked to guard the docs
+# above (the bare `docs/` pattern would otherwise swallow `tests/docs/`).
+!tests/docs/
 
 # Local-only working dirs — never tracked
 .codex/

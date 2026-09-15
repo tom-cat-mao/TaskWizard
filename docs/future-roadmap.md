@@ -1,8 +1,8 @@
 # Future Roadmap（内部状态）
 
 > 维护者视角的当前状态与延期项。硬性编码约束见根 `AGENTS.md`（P0 表）；模块契约以 `phone_agent/v2/`
-> docstring 为准；**公开**能力状态在 `pages/roadmap.md`。特定批次的授权、设计与验收记录在
-> `docs/execution/`——本文件不复制实施流水账。
+> docstring 为准；**公开**能力状态在 `pages/roadmap.md`。特定批次的授权、设计与验收原始记录是维护者
+> 本机的私有文档（不入库，clone 后不可见）——本文件不复制实施流水账。
 
 **状态时间：2026-09-10。主修改分支 `fix/harness-contracts-20260909`，更新现有 PR #23；尚未合入 `main`，
 线上只反映已合并内容。**
@@ -44,7 +44,7 @@
 
 | 包 | 状态 |
 |---|---|
-| A 可用性 fallback | 已合入 `557cb79`，验收记录见 `docs/execution/availability-restoration-20260910.md` |
+| A 可用性 fallback | 已合入 `557cb79`（验收原始记录为本机私有文档，不入库） |
 | B 参考图 / C 记忆诊断 | 已合入 `cf33cf4` / `a8e7aca`；IME 空参数修复有真实 ADB 回环证据，尚未真机复测 |
 | D 文档与 Pages 手册 | 已合入 `1c1087f` |
 | F 控制台改版 | 已合入 `811c39e`（含合成预览脚本 `scripts/fake_console_preview.py`）；界面为用户手动视觉验收 |
@@ -63,9 +63,9 @@
 
 ## 证据入口
 
-- `docs/execution/availability-restoration-20260910.md`：A/B/C 的范围、验收与合并记录（最新决定覆盖旧
-  「provider 不允许 fallback」「观测失败只返回文字」要求）。
-- `docs/execution/console-and-docs-refresh-20260910.md`：控制台与文档的本轮授权、职责与验收（控制台验收
-  方式已由用户从「浏览器自动化截图」改为手动看图，最终结论见该文件末尾）。
-- `docs/execution/harness-contract-repair.md`：S1–S5 的契约修复记录。
-- `docs/archive/`：v1 时代历史日志，仅作证据，不当作现行规范。
+- 入库可查的证据是 merge 记录与代码本身：本文「本分支已落地」「本轮整合状态」列出的 commit hash，以及
+  对应模块的 docstring 与测试。批次级的授权、评审与验收原始记录是维护者本机的私有文档，不入库。
+- 决策的覆盖关系仍然有效：`PHONE_AGENT_FALLBACK_MODEL` 与失败参考图取代了早期「provider 不允许
+  fallback」「观测失败只返回文字」的旧要求。
+- v1 时代的历史日志同样只在本机保留，仅作历史证据，不当作现行规范；v1 约定以根 `AGENTS.md` 的 Module
+  Map 与 P0 表为准。
