@@ -1,6 +1,6 @@
 {
   "_comment": "Documentation word budgets, enforced by tests/docs/test_doc_budgets.py from the pages.yml workflow. Metric: one word per CJK character plus one word per maximal latin/digit run, counted after stripping fenced code blocks and HTML comments. Calibration: README.md and docs/future-roadmap.md are current size +20%, pages/*.md entries were recalibrated to post-expansion size +30% after the contract-body migration. Keys starting with '_' document the manifest and are not budgets.",
-  "_agents_note": "AGENTS.md migration is complete: the P0 contract bodies now live in pages/ behind stable anchors and this index is all that stays resident, so 2100 (its 1947 words + 10%, rounded to the nearest hundred) is the hard ceiling, no longer a placeholder for a larger target.",
+  "_agents_note": "AGENTS.md migration is complete: the P0 contract bodies now live in pages/ behind stable anchors and this index is all that stays resident, so 2100 (its 1955 words + 10%, rounded to the nearest hundred) is the hard ceiling, no longer a placeholder for a larger target.",
   "AGENTS.md": 2100,
   "README.md": 1900,
   "docs/future-roadmap.md": 1700,

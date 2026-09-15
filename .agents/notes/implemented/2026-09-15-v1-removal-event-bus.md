@@ -82,8 +82,7 @@ TaskDoc 自行维护，见 `pages/architecture.md`：「harness 不做流程编�
 - **代价**：v1 现成的 checkpoint/HITL 需要重建（v2 用 `ControlHitlListener` + 中断恢复实现）；v1 的评估体系
   `evals/` 整体删除后需要重建；`.agents/skills/phone-agent-live-diagnosis` 当时依赖 v1 run 结构，需要适配
   （重构文档 §2.3 记录在案）；`README.md` / `AGENTS.md` 一度描述 v1，需要同步。
-- **已知瑕疵**：`phone_agent/v2/agent.py` 的 `ThinPhoneAgent` docstring 写 "only four bridge middlewares"
-  却列出五个（tool/execute、model/pre_request、model/request、model/post_request、agent/after），
-  `pages/architecture.md` 记的是 5 个——陈旧文案，不影响行为。
+- **已知瑕疵（2026-09-15 已修复）**：`phone_agent/v2/agent.py` 的 `ThinPhoneAgent` docstring 曾写 "only four bridge middlewares"
+  却列出五个；本次文档重构已改为 five，`pages/architecture.md` 记的是 5 个。
 - **边界**：删除是「不再经由 v1 路由」，不是「v1 的一切都消失」：`adb/`、`grounding/`、`config/` 作为库
   继续被 v2 调用；`phone_agent/{graph,actions,checkpoint}` 不得重建，新行为也不得经由它们路由。
