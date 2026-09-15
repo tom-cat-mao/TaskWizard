@@ -2,7 +2,7 @@
 
 `PHONE_AGENT_SAFETY_MODE` 控制执行类动作（tap / long_press / type_text / launch_app）的门控。
 
-## 四档
+## 四档 {#safety-modes}
 
 | 档位 | 行为 | 适用场景 |
 |---|---|---|
@@ -17,11 +17,51 @@
 真正需要人工的只有 `ask_user` / `take_over`，以及 `hard` 档的审批中断。`reviewer` 档的精排模型不可用
 时按 fail-closed 处理（当作风险预警），不会静默放行。
 
-## 风险判定
+## 风险判定 {#safety-classification}
 
-满足以下任一条件即触发门控：承诺动词 + 不可逆对象（如"确认支付"）；密码/凭据/验证码输入；模型自声明 `sensitive=true`。可逆动作（如打开应用）不触发。
+安全门只覆盖四个执行工具：`tap` / `long_press` / `type_text` / `launch_app`。`scroll`、`swipe`、`back`、`home`、`wait` 与读屏类工具不参与判定。每个调用被判定为一个层级：`none`、`recall`（软候选）、`reviewer`（交由复核模型精排）、`hard`。`launch_app` 与 `type_text` 走各自的专属分支，其余工具的判定基于目标文本：
 
-## wary 流程
+| 条件 | 层级 |
+|---|---|
+| 模型自申报 `sensitive=true`（或 `dangerous=true`） | `hard` |
+| `type_text` 目标确为密码输入框（只看显式的 `target_mark_id`） | `hard` |
+| `type_text` 内容命中凭据/验证码域（手机号/邮箱/订单号/密钥形态，或密码/验证码/登录/账户词表） | `hard` |
+| `launch_app` 目标疑似支付/银行类敏感应用 | 软候选（可逆） |
+| 承诺动词 + 不可逆对象共现（如“确认支付”“提交订单”“删除”） | `hard` |
+| 目标命中凭据/验证码敏感域（经 `tap`/`long_press` 目标） | `hard` |
+| 其余命中策略词表的软候选 | 软候选 |
+
+软候选与预警不是一回事：`wary` / `hard` 档**不**对软候选预警，只有 `hard` 信号升级；软候选只在 `reviewer` 档由复核模型精排。`launch_app` 恒为软候选——启动应用是可逆动作。
+
+## 预警文案 {#safety-warning}
+
+预警回执（status 为 error）由世界事实与选项空间组成，形如：
+
+```
+⚠️ 已拦截（未执行）：tap → 「确认支付」
+世界事实：该操作疑似『不可逆提交』（如支付/转账/下单/删除等确认动作）。
+选项：
+  1) 确认执行：带 confirm_irreversible=true 重新调用同一工具（其余参数不变）。
+  2) 放弃：改做其它操作或重新观测。
+  3) 交人工：调用 ask_user 询问，或 take_over 请求人工接管。
+```
+
+`confirm_irreversible` 参数存在于 `tap` / `long_press` / `type_text` / `launch_app` 四个执行工具上（`swipe` / `scroll` / `back` / `home` / `wait` 没有）。确认标记的检查在判定之前：带 `confirm_irreversible=true` 重发的调用直接放行，不再重新分类，因此自申报敏感 + 确认标记的组合也会执行。复核模型判为不可逆时，回执里的世界事实写「复核模型判定该操作『不可逆』」。
+
+## 复核模型（reviewer 档） {#safety-reviewer}
+
+`reviewer` 档只对软候选征询第二个模型：复核器只看工具名与被脱敏的目标文本摘要（最多 120 字），不读完整对话。判定可逆则放行，判为不可逆则按预警处理。
+
+- 复核模型的来源依次为 `PHONE_AGENT_SAFETY_REVIEWER_MODEL`、`models.json` 的 `roles.safety_reviewer.model`、`PHONE_AGENT_VERIFIER_MODEL`；三者皆空时不构建复核器，该档对软候选转为 fail-closed 预警（原因 `reviewer_unavailable_failclosed`），**不**回落到 actor 模型；
+- 复核器构建失败时同样跳过精排并按预警处理；构建期沿角色链再试一跳一次（`safety_reviewer` 的下一跳是 `verifier` 或 actor 主模型），并记 `model_fallback` 审计；
+- 精排调用异常记原因 `reviewer_error_failclosed` 并按预警处理；答复无法解析时同样按不可逆处理（fail-closed）；
+- 精排调用作为 `reviewer` 角色计入同一份 token 用量台账，因此消耗 run 的 token 预算。
+
+## 人工中断 {#human-interrupt}
+
+`ask_user` 与 `take_over` 在任何档位都中断并等待人工输入，与安全门控相互独立。`hard` 档的审批中断经 `langgraph` 的 HITL 中断实现：审批通过则执行原调用，拒绝则返回 error 回执且不执行；人工的自由文本答复中，肯定词（`approve` / `yes` / `y` / `同意` / `确认` / `ok`）映射为批准，其余映射为拒绝。
+
+## wary 流程 {#wary-flow}
 
 ```mermaid
 flowchart TD
@@ -34,9 +74,9 @@ flowchart TD
     CHOICE -- "ask_user / take_over" --> HUMAN["中断，等待人工"]
 ```
 
-## finish 验收
+## finish 验收 {#finish-verification}
 
-与安全门控独立的两道完成检查：
+与安全门控独立的两道完成检查（机制细节见[架构](architecture.md#finish-two-step)）：
 
 1. **两段式 finish**：首次 `finish` 返回复核包（目标、路线完成度、疑点）；模型 `confirm=true` 再次调用才定稿。
    被接受的 finish 立即终局：同轮的后续 sibling 工具调用收到 error-status skipped 回执，且不再采样模型；
