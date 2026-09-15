@@ -444,8 +444,14 @@ def test_empty_card_pool_exits_cleanly(tmp_path: Path, capsys) -> None:
     assert "candidate pool empty" in payload["recommended_reason"]
 
 
-def test_exemplar_channel_is_untouched(tmp_path: Path, capsys) -> None:
+def test_exemplar_channel_is_untouched(tmp_path: Path, capsys, monkeypatch) -> None:
     """The exemplar channel keeps its shape; the CLI default still routes to it."""
+
+    # The CLI builds its embedder internally; swap the MLX default for the
+    # hermetic HashEmbedder so the test does not require the optional mlx stack.
+    import phone_agent.v2.replay as replay
+
+    monkeypatch.setattr(replay, "MlxEmbedder", lambda: HashEmbedder(dimension=64))
 
     experience = tmp_path / "experience"
     day = 86_400.0

@@ -1,0 +1,120 @@
+name: Notes soft check
+
+# P0 contract #23 asks every non-trivial change to ship with a decision note in
+# .agents/notes/. This workflow is deliberately a SOFT gate: it leaves one
+# reminder comment on the pull request and always exits 0, so a missing note can
+# never block a merge. Noise is bounded by the idempotency guard below; if the
+# reminder turns out to be wrong too often, revisit the decision (see
+# .agents/notes/implemented/2026-09-15-notes-soft-gate-and-tag-release.md).
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+# Keep only the latest run per pull request; the idempotency marker is the real
+# guard against duplicate comments if an older run still lands a comment.
+concurrency:
+  group: notes-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  notes-reminder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Remind when phone_agent code changes without a decision note
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const MARKER = '<!-- notes-check -->';
+            const { owner, repo } = context.repo;
+            const pullNumber = context.payload.pull_request.number;
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pullNumber,
+              per_page: 100,
+            });
+
+            // Changed Python sources under phone_agent/ (any status, including
+            // renames). Pure frontend assets under phone_agent/web/ (.css/.html/
+            // .js) are not .py, so the suffix test already skips them.
+            const touchesAgentPython = files.some(
+              (file) => file.filename.startsWith('phone_agent/') && file.filename.endsWith('.py'),
+            );
+            const addsDecisionNote = files.some(
+              (file) =>
+                file.status === 'added' &&
+                file.filename.startsWith('.agents/notes/') &&
+                file.filename.endsWith('.md'),
+            );
+
+            if (!touchesAgentPython || addsDecisionNote) {
+              core.info(
+                `notes check: ${files.length} changed file(s), agent python=${touchesAgentPython}, ` +
+                  `added note=${addsDecisionNote} — no reminder needed`,
+              );
+              return;
+            }
+
+            const defaultBranch = context.payload.repository.default_branch;
+            const repoUrl = `${context.serverUrl}/${owner}/${repo}`;
+            const rulesUrl = `${repoUrl}/blob/${defaultBranch}/.agents/notes/AGENTS.md`;
+            const contractsUrl = `${repoUrl}/blob/${defaultBranch}/AGENTS.md`;
+
+            const body = [
+              MARKER,
+              '### 决策笔记提醒（软提醒，不阻塞合并）',
+              '',
+              '本 PR 改动了 `phone_agent/` 下的 Python 代码，但没有新增 `.agents/notes/**/*.md` 决策笔记。',
+              '',
+              `P0 契约 #23（见 [AGENTS.md](${contractsUrl}) 与[笔记规则](${rulesUrl})）：非平凡改动命中以下任一类，` +
+                '就要与代码同批提交一篇四格笔记（Problem / Decision / Alternatives considered / Consequences）。',
+              '',
+              '1. **用户可见行为**：CLI 参数、回执文案、控制台交互、终局语义。',
+              '2. **架构切分 / 调用方向**：谁调谁、谁拥有状态、进程边界。',
+              '3. **跨文件契约**：P0 表条目、事件 topic、工具 schema、固定 schema 落盘。',
+              '4. **流程与工具链 / 环境变量**：新增或改变 env、构建 / 诊断 / 发布流程。',
+              '5. **测试策略**：测什么、以什么为准（真机 vs 合成）、什么不再测。',
+              '6. **落盘 / 网络 / 配置格式**：文件格式、存储布局、网关协议。',
+              '',
+              '纯机械改动（样式与格式化、注释错字、不改行为的依赖补丁、纯重命名）不用写。',
+              '',
+              `四格模板与状态目录规则：${rulesUrl}`,
+              '',
+              '---',
+              '这是自动软提醒，**不会阻塞合并**；若本 PR 确属琐碎改动，直接忽略即可。',
+            ].join('\n');
+
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: pullNumber,
+                per_page: 100,
+              });
+              const existing = comments.find((comment) => (comment.body || '').includes(MARKER));
+              if (existing) {
+                core.info(`notes check: reminder already posted (comment ${existing.id})`);
+                return;
+              }
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pullNumber,
+                body,
+              });
+              core.info('notes check: reminder comment posted');
+            } catch (error) {
+              // Pull requests from forks get a read-only GITHUB_TOKEN, so reading
+              // or writing comments can fail. This is a soft gate: warn and stay
+              // green rather than turning the reminder into a red check.
+              core.warning(`notes check: could not post the reminder comment: ${error.message}`);
+            }

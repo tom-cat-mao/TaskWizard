@@ -1,0 +1,18 @@
+# Allowlist for false positives shared by the crate-ci/typos GitHub Action and
+# the pre-commit typos hook (both auto-discover this file at the repo root).
+# Keep entries as narrow as possible; widen only with a recorded reason.
+
+[default.extend-words]
+# LangChain middleware override names (abefore_model / aafter_model) in phone_agent/v2.
+abefore = "abefore"
+aafter = "aafter"
+# Package id com.sdu.didi.psnger in phone_agent/config/apps.py.
+didi = "didi"
+psnger = "psnger"
+# "unparseable" is accepted English usage in this repo.
+unparseable = "unparseable"
+# "(mis)named" parenthetical in phone_agent/v2/replay.py.
+mis = "mis"
+# Coordinate shorthand variables.
+iy = "iy"
+ix = "ix"
