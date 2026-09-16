@@ -46,7 +46,7 @@
   3) 交人工：调用 ask_user 询问，或 take_over 请求人工接管。
 ```
 
-`confirm_irreversible` 参数存在于 `tap` / `long_press` / `type_text` / `launch_app` 四个执行工具上（`swipe` / `scroll` / `back` / `home` / `wait` 没有）。确认标记的检查在判定之前：带 `confirm_irreversible=true` 重发的调用直接放行，不再重新分类，因此自申报敏感 + 确认标记的组合也会执行。复核模型判为不可逆时，回执里的世界事实写「复核模型判定该操作『不可逆』」。
+`confirm_irreversible` 参数存在于 `tap` / `long_press` / `type_text` / `launch_app` 四个执行工具上（`swipe` / `scroll` / `back` / `home` / `wait` 没有）。确认标记的检查在判定之前：带 `confirm_irreversible=true` 重发的调用直接放行，不再重新分类，因此自申报敏感 + 确认标记的组合也会执行。复核模型判为不可逆时，回执里的世界事实写「复核模型判定该操作『不可逆』」。<!-- allow:不再 -->
 
 ## 复核模型（reviewer 档） {#safety-reviewer}
 
@@ -79,7 +79,7 @@ flowchart TD
 与安全门控独立的两道完成检查（机制细节见[架构](architecture.md#finish-two-step)）：
 
 1. **两段式 finish**：首次 `finish` 返回复核包（目标、路线完成度、疑点）；模型 `confirm=true` 再次调用才定稿。
-   被接受的 finish 立即终局：同轮的后续 sibling 工具调用收到 error-status skipped 回执，且不再采样模型；
+   被接受的 finish 立即终局：同轮的后续 sibling 工具调用收到 error-status skipped 回执，且不再采样模型；<!-- allow:不再 -->
    首次复核、陈旧 confirm 与验收器拒绝在预算允许时仍可继续。被接受的 `take_over` 同样终局。
 2. **独立验收器**（`PHONE_AGENT_FINISH_VERIFY`，默认 `auto`，`off` 退化为单段落定）：`auto` 档在高风险
    目标或硬矛盾时触发——验收器只能看到目标、证据路线与尾部截图，看不到 actor 的完整对话；验收器
@@ -88,7 +88,7 @@ flowchart TD
 若 token 达到预算时已有有效复核包，系统最多保留一次模型真实确认机会，避免仅因预算跨线而无法
 完成第二段。它绑定成功观测的屏幕序号及关闭的任务板、原始目标；这些事实变化后不能使用。模型仍可
 不确认或请求人工介入，系统不代写 `confirm=true`。该额外响应中的普通工具操作不执行，重复 finish
-不能续期；验收器拒绝后也不再获得额外模型轮次。确认仍经过原有证据、任务板、seq 与独立验收器检查；
+不能续期；验收器拒绝后也不再获得额外模型轮次。确认仍经过原有证据、任务板、seq 与独立验收器检查；<!-- allow:不再 -->
 人工中断、`MAX_STEPS` 和已经接受的终局保持优先。完整规则见[预算配置](configuration.md)。
-普通工具一旦在复核后被委托执行，旧复核就不再有续办资格；这也覆盖命令可能已派发、结果未知且屏幕
+普通工具一旦在复核后被委托执行，旧复核就不再有续办资格；这也覆盖命令可能已派发、结果未知且屏幕<!-- allow:不再 -->
 序号尚未更新的错误。后续成功的新复核可重新证明当前状态，但仍不能刷新已经使用的一次续办额度。

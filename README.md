@@ -24,13 +24,13 @@ cp .env.example .env
 命令行运行一条自然语言任务（多设备时加 `--device-id <serial>`）：
 
 ```bash
-.venv/bin/python main_v2.py "打开设置进入 WLAN" --device-id <serial>
+.venv/bin/python main_v2.py "打开设置进入 WLAN"
 ```
 
 本地 Web 控制台（默认只监听 `127.0.0.1:8080`）：
 
 ```bash
-.venv/bin/python -m phone_agent.web --device-id <serial> --port 8080
+.venv/bin/python -m phone_agent.web --device-id "$SERIAL" --port 8080
 ```
 
 控制台设备编号留空表示自动选择；App-KB 定时刷新只读快照，记忆变化只记审计，不阻止启动。
@@ -83,8 +83,8 @@ cp .env.example .env
 S=.agents/skills/phone-agent-live-diagnosis/scripts/run_diagnosis.py
 .venv/bin/python "$S" dry-run
 .venv/bin/python "$S" start path/to/case.json
-.venv/bin/python "$S" monitor <run_dir>
-.venv/bin/python "$S" analyze <run_dir>
+.venv/bin/python "$S" monitor path/to/run_dir
+.venv/bin/python "$S" analyze path/to/run_dir
 ```
 
 合成检查不代表真机或网关验收；报告和截图仅留本地，不能将完整运行目录当作脱敏分享包。
