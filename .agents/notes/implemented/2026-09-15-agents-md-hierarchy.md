@@ -98,3 +98,5 @@ Status: implemented
   （`_DOCUMENTS` 含 `phone_agent/v2/AGENTS.md` 与 `pages/AGENTS.md`，词数预算各 750）。
 - **边界**：层级只建到「有独立纪律的子树」为止（`v2/` 与 `pages/`），不为每个目录造一份 AGENTS.md；
   `phone_agent/adb/`、`grounding/`、`config/` 作为保留库继续由根文件与模块 docstring 约束。
+
+2026-09-16：上文「边界」一条已被 `2026-09-16-agents-md-web-tests-subtrees.md` 取代（其余结论继续有效；`_DOCUMENTS` 现含四份子树 AGENTS.md）。

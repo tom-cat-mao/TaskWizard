@@ -9,9 +9,8 @@
 
 每步一次模型调用（LangChain `create_agent`）；harness 只提供工具、执行安全边界、上下文卫生、trace 与固定
 schema 经验档案，**不做工作流路由**。所有策略行为都是事件总线监听器，中间件栈只剩桥接器（另有可选
-`extra_middleware` 观察者）。可选 `phone_agent/web/` NiceGUI 前端经 `python -m phone_agent.runner` 启动，
-走 `PHONE_AGENT_RUNS_DIR` 的追加式文件观察；web 进程不拥有设备、工具与路由，headless 的
-`ThinPhoneAgent.run(...)` 必须始终可用。
+`extra_middleware` 观察者）。可选 `phone_agent/web/` NiceGUI 前端是纯观察层，边界见该子树 `AGENTS.md`；
+headless 的 `ThinPhoneAgent.run(...)` 必须始终可用。
 
 ## Development Commands
 
@@ -124,7 +123,7 @@ v1 的 `graph/`、`actions/`、`checkpoint/`、旧 `agent.py`/`main.py`、`evals
 | 真机诊断 | `.agents/skills/phone-agent-live-diagnosis/SKILL.md` |
 | 决策笔记（为什么这样设计） | `.agents/notes/AGENTS.md`；某篇的正文在 `.agents/notes/<status>/` |
 | 事故与历史沿革（当年踩过什么坑） | `postmortem/`（唯一允许写历史叙述的目录） |
-| 进子树改代码 | 该子树的 `AGENTS.md`（就近约束：`phone_agent/v2/`、`pages/`） |
+| 进子树改代码 | 该子树的 `AGENTS.md`：`phone_agent/v2/`、`phone_agent/web/`、`pages/`、`tests/` |
 
 注意：`docs/` 默认被 `.gitignore` 忽略，只有显式加入索引的文件才入库。
 
