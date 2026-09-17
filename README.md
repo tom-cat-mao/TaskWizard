@@ -30,10 +30,11 @@ cp .env.example .env
 本地 Web 控制台（默认只监听 `127.0.0.1:8080`）：
 
 ```bash
-.venv/bin/python -m phone_agent.web --device-id "$SERIAL" --port 8080
+.venv/bin/python -m phone_agent.web --device-id "$SERIAL" --model "autoglm-phone-9b" --port 8080
 ```
 
-控制台设备编号留空表示自动选择；App-KB 定时刷新只读快照，记忆变化只记审计，不阻止启动。
+控制台设备编号留空表示自动选择，`--model` 可覆盖模型 ID（不给出时取 `PHONE_AGENT_MODEL`）；App-KB 定时
+刷新只读快照，记忆变化只记审计，不阻止启动。
 
 常用维护命令：
 
@@ -45,9 +46,14 @@ cp .env.example .env
 .venv/bin/python main_v2.py --list-models
 ```
 
+维护命令组（`--dream`、`--distill`、`--rebuild-vec`、`--learn-alias` 等）与 `plugin` 子命令
+（`list`/`add`/`remove`/`update`/`search`）的完整语义见 [记忆](pages/memory.md)、[自进化](pages/evolution.md)
+与 [插件开发](pages/plugins.md)，本页只给入口。
+
 运行结束打印 `steps=… reason=…` 与 trace 路径；退出码 `0` 表示 run 报告 `success=true`，非零只是当前 CLI
 对失败/接管/熔断的粗略区分，具体以 `reason` 与 trace 为准。`reason` 由终局原因决定（成功时是模型的 finish
-摘要），不保证固定字符串。逐步工具回执与观测过程在 trace 文件和控制台步骤时间线中查看，stdout 不会逐步打印。
+摘要），不保证固定字符串。逐步工具回执与观测过程在 trace 文件和控制台步骤时间线中查看；stdout 不打逐步
+回执，只在 `wary`/`reviewer` 档拦截风险调用时打一行 `[safety] <tool>: <reason> — 已拦截，等待模型确认`。
 
 ## 能做什么
 
@@ -58,8 +64,8 @@ cp .env.example .env
 | 安全预警制 | 风险动作先预警（不执行、不叫人），模型显式确认后才执行；四档模式 | [安全模式](https://tom-cat-mao.github.io/TaskWizard/safety/) |
 | 可信完成 | TaskDoc 任务板 + 流程线；finish 两段式，独立上下文验收器复核（故障 fail-open 记 `skipped`） | [架构](https://tom-cat-mao.github.io/TaskWizard/architecture/) |
 | 成本控制 | token 阈值与一次有效 finish 确认续办；独立 32k 软工作目标与有界成组压缩 | [配置参考](https://tom-cat-mao.github.io/TaskWizard/configuration/) |
-| 应用记忆 | App-KB 别名与启动事实；隐式纠正、dream 整理、用户纠正入口 | [记忆与自进化](https://tom-cat-mao.github.io/TaskWizard/memory/) |
-| 经验与回注 | episode 档案（固定 schema、隐私白名单）+ 离线蒸馏自判分级 + `MEMORY_RAG=on` 受控注入 | [记忆与自进化](https://tom-cat-mao.github.io/TaskWizard/memory/) |
+| 应用记忆 | App-KB 别名与启动事实；隐式纠正、dream 整理、用户纠正入口 | [记忆](https://tom-cat-mao.github.io/TaskWizard/memory/) |
+| 经验与回注 | episode 档案（固定 schema、隐私白名单）+ 离线蒸馏自判分级 + `MEMORY_RAG=on` 受控注入 | [记忆](https://tom-cat-mao.github.io/TaskWizard/memory/) · [自进化](https://tom-cat-mao.github.io/TaskWizard/evolution/) |
 | 产出物 | `write_document` / `update_document` 写成本 run 的单页 HTML | [Web 控制台](https://tom-cat-mao.github.io/TaskWizard/console/) |
 | 模型提供方 | 默认零配置走 `.env` 网关；多提供方用单层 `models.json` + 角色 `provider:model` 路由；可选 `PHONE_AGENT_FALLBACK_MODEL` 在首选构建/调用失败时降级一次并写审计；可选 `PHONE_AGENT_STREAMING` 让模型流式接收并聚合完整消息（headless/各角色/控制台一致，控制台另可增量观察正文） | [配置参考](https://tom-cat-mao.github.io/TaskWizard/configuration/) |
 | 插件系统 | 策略层全事件化；插件经 entry points 或 `plugin add` 挂入同一装配层 | [插件开发](https://tom-cat-mao.github.io/TaskWizard/plugins/) |
