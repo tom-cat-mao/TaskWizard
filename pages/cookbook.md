@@ -4,8 +4,8 @@
 App-KB、经验档案与回想见[记忆](memory.md)，蒸馏、分级与注入见[自进化](evolution.md)，插件接缝与授权见
 [插件开发](plugins.md)，提供方与角色路由见[模型提供方与路由](providers.md)，观察层见[Web 控制台](console.md)。
 
-以下命令都在仓库根目录用共享虚拟环境执行；安装与前置条件见[快速开始](quickstart.md)。多设备时给每条命令补
-`--device-id` 与 `adb devices` 列出的 serial。
+以下命令都在仓库根目录用共享虚拟环境执行；安装与前置条件见[快速开始](quickstart.md)。多设备时给 run 类命令补
+`--device-id` 与 `adb devices` 列出的 serial；`plugin` 子命令走独立 parser，不接受该参数。
 
 ## 真机接入与首跑验证
 
@@ -34,13 +34,14 @@ App-KB、经验档案与回想见[记忆](memory.md)，蒸馏、分级与注入�
     ```
 
 4. 验证：stdout 打印 `steps=… reason=…` 与本次 trace 路径；退出码 `0` 表示 run 报告成功，`2` 是人工接管，
-   `3` 是预算或保险丝耗尽。trace 默认落在 `.traces/`（`PHONE_AGENT_TRACE_DIR` 可改），每个 run 一个 JSONL 文件：
+   `3` 是预算或保险丝耗尽，其余非零为运行错误。trace 默认落在 `.traces/`（`PHONE_AGENT_TRACE_DIR` 可改），
+   每个 run 一个 JSONL 文件：
 
     ```bash
     ls -lt .traces | head
     ```
 
-    退出码与 `reason` 的判定口径见[快速开始](quickstart.md)。
+    首跑全流程与常见问题见[快速开始](quickstart.md)。
 
 ## 记忆与自进化维护
 
@@ -111,13 +112,14 @@ ls memory/lessons/lessons.json memory/experience/recall_stats.json
     .venv/bin/python main_v2.py plugin list
     ```
 
-    每行是一个 JSON 回执，含 `enabled`、`state` 与 `cap_id`；加载失败或 `REQUIRES_API` 不匹配时 `state` 为
-    `error` 并带 `reason`。
+    每行是一个 JSON 回执，固定含 `name`、`version`、`enabled`、`path` 与 `state`；`cap_id` 只出现在已启用且加载
+    成功的行，未启用的行 `state` 为 `disabled`，加载失败或 `REQUIRES_API` 不匹配的行 `state` 为 `error` 并带
+    `reason`。
 
 3. 跑一次任务（或开 Web 控制台），在 trace 的 `capability_snapshot` 事件里确认该 cap 的 `state` 为 `active`；
    控制台「记忆」页也列能力状态。
 
-4. 严格模式：已启用条目加载失败时启动直接报 `error: plugin load failed: …` 并以退出码 1 结束，不静默降级。
+4. 加载期 fail-visible：已启用条目加载失败时启动即报 `error: plugin load failed: …` 并以退出码 1 结束，不静默降级。
 
 接缝与授权契约见[插件开发](plugins.md#plugin-authorization)，能力挂载见[插件开发](plugins.md#capability-mount)。
 
@@ -143,13 +145,14 @@ ls memory/lessons/lessons.json memory/experience/recall_stats.json
     条目字段、`$ENV` 解析与合并语义见[模型提供方与路由](providers.md#models-file)；键表见
     [配置参考](configuration.md#models-json)。
 
-2. 指向该文件：
+2. 把指向写进 `.env`（只想单次生效时也可在命令前内联，见第 3 步）：
 
     ```bash
-    PHONE_AGENT_MODELS_FILE=models.json
+    PHONE_AGENT_MODELS_FILE="models.json"
     ```
 
-3. 验证解析与角色路由（`--list-models` 打印生效注册表，默认 provider 带 `*` 前缀，模型逐行缩进列出）：
+3. 验证解析与角色路由（`--list-models` 打印生效注册表，默认 provider 带 `*` 前缀，模型逐行缩进列出；内联变量
+   只对本次命令生效）：
 
     ```bash
     PHONE_AGENT_MODELS_FILE=models.json .venv/bin/python main_v2.py --list-models
@@ -163,7 +166,7 @@ ls memory/lessons/lessons.json memory/experience/recall_stats.json
 
     `roles.<role>.model` 只在该角色专属 env 未设置时生效。
 
-5. 需要 actor 备用目标时：
+5. 需要 actor 备用目标时，同样写进 `.env`：
 
     ```bash
     PHONE_AGENT_FALLBACK_MODEL="secondgw:vision-model-a"
