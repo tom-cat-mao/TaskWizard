@@ -49,6 +49,7 @@ nav:
   - 首页: index.md
   - 快速开始: quickstart.md
   - 配置参考: configuration.md
+  - 模型提供方: providers.md
   - 架构: architecture.md
   - Web 控制台: console.md
   - 安全模式: safety.md
