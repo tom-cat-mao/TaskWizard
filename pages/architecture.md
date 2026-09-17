@@ -104,7 +104,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 - 寻址语义不变：执行动作仍只认当前批次的 `ax_*@eN`；`op` 与窗口归属不参与 `resolve_mark` 判定，不是执行门控；
 - dump 失败（超时/解析错）触发一次重试，最终失败在观测文本显式标注，不装成“本屏无控件”。
 
-`PHONE_AGENT_MARKS_WINDOWED` 三档：`auto`（默认）先试窗口化 dump、设备不支持则回退单根；`on` 强制窗口化，采集不支持时可见失败；`off` 只跑 legacy 单根 dump。分组判定只看窗口集合：legacy dump 出现多个顶层 node 时每个 node 算一个弱窗口，仍判 grouped 并按窗口渲染、输出 `op=`；弱窗口没有真 layer/type，最高只到 unknown。三档只影响分组、标注与渲染，不改寻址、执行、安全门、图片/摘要折叠与 `locate`。
+`PHONE_AGENT_MARKS_WINDOWED` 三档：`auto`（默认）先试窗口化 dump、设备不支持则回退单根；`on` 强制窗口化，采集不支持时可见失败；`off` 只跑 legacy 单根 dump。分组判定只看窗口集合：legacy dump 出现多个顶层 node 时每个 node 算一个弱窗口，仍判 grouped 并按窗口渲染、输出 `op=`；弱窗口没有真 layer/type，只可能落 likely 或 unknown（被更高推断窗遮盖即 unknown），到不了 confirmed 或 blocked。三档只影响分组、标注与渲染，不改寻址、执行、安全门、图片/摘要折叠与 `locate`。
 
 ## 单批执行 {#single-batch-execution}
 
@@ -198,7 +198,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 - 截图 base64 永不落盘：图片块替换为 `{type, screen_seq, bytes}`，`bytes` 是按 base64 长度估算的字节数；
 - 交付物的 HTML 正文作为工具参数时整段略去，只留 `{"type": "text", "omitted": true, "bytes": N}`（顶层参数；嵌套出现的同名参数按 64 字截断规则处理）；
 - context 请求观测只输出数字与有界标签（角色、尝试序号、消息数、容量判断、估算来源与覆盖范围、实际协议、缓存模式）。指纹口径是调用前的有序客户端消息，provider 仍可能提升 system 或合并块，因此不冒充服务端精确 token 前缀；`attempt_scope=handler_invoke` 只区分显式备用尝试，不声称观测到 SDK 或网关内部的每次 HTTP 重试；
-- usage 四元组（input / output / cache read / cache write）缺失记 `null`，与明确的 `0` 分开；调用失败的事件整键缺席这四个字段；缓存输入仍计入上下文与原 token 预算。
+- usage 四元组（input / output / cache read / cache write）缺失记 `null`，与明确的 `0` 分开；trace 的 `model_call` 调用失败时整键缺席这四个字段；缓存输入仍计入上下文与原 token 预算。
 
 ## 约束（P0） {#p0}
 
@@ -242,7 +242,8 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 不声称已观察 SDK/网关内部每次 HTTP 重试。
 
 `model_call` / 模型事件记录可空 `input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`：
-缺失和明确 0 分开；兼容普通、priority、flex 的缓存明细；调用失败的事件这四个键整键缺席、只有 `error` 与延迟。
+缺失和明确 0 分开；兼容普通、priority、flex 的缓存明细；trace 的 `model_call` 调用失败时这四个键整键缺席、
+只有 `error` 与延迟，Web 事件流的同名失败分支仍带四个 `null` 键。
 只输出数字，不输出 prompt、HTML、认证信息或截图。缓存 token 只在用量台账里按角色累计求和，没有命中率计算；
 缓存输入仍计入上下文与原 token 预算。这些字段用于定位缓存行为，不引入金额预算或价格换算。
 

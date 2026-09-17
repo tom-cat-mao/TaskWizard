@@ -46,7 +46,7 @@
   3) 交人工：调用 ask_user 询问，或 take_over 请求人工接管。
 ```
 
-`confirm_irreversible` 参数存在于 `tap` / `long_press` / `type_text` / `launch_app` 四个执行工具上（`swipe` / `scroll` / `back` / `home` / `wait` 没有）。确认标记只在 `wary` / `reviewer` 的预警监听里先于分类检查：带 `confirm_irreversible=true` 重发的调用直接放行，不重新分类，因此自申报敏感 + 确认标记的组合也会执行。`hard` 档的审批中断直接分类、不读该标记，带确认重发仍会中断等待人工 approve / reject。预警目标文本先脱敏再截断：`type_text` 32 字、`launch_app` 与 `target_description` 24 字；wary 拦截时 stdout 打一行非阻塞提示 `[safety] <tool>: <reason> — 已拦截，等待模型确认`。复核模型判为不可逆时，回执里的世界事实写「复核模型判定该操作『不可逆』」。
+`confirm_irreversible` 参数存在于 `tap` / `long_press` / `type_text` / `launch_app` 四个执行工具上（`swipe` / `scroll` / `back` / `home` / `wait` 没有）。确认标记只在 `wary` / `reviewer` 的预警监听里先于分类检查：带 `confirm_irreversible=true` 重发的调用直接放行，不重新分类，因此自申报敏感 + 确认标记的组合也会执行。`hard` 档的审批中断直接分类、不读该标记，带确认重发仍会中断等待人工 approve / reject。预警目标文本的加工方式：`type_text` 与 `target_description` 先脱敏再截断（32 / 24 字），`launch_app` 目标只截断到 24 字；`wary` / `reviewer` 档拦截时 stdout 打一行非阻塞提示 `[safety] <tool>: <reason> — 已拦截，等待模型确认`。复核模型判为不可逆时，回执里的世界事实写「复核模型判定该操作『不可逆』」。
 
 ## 复核模型（reviewer 档） {#safety-reviewer}
 
