@@ -49,6 +49,9 @@
 - marks `op=blocked` **不计划**直接用于执行门控（当前纯展示）；若未来要启用属于独立决策，需先完成真机验证
   与授权。成功先例回注（exemplar 三闸达标前不开工）。
 - verifier 多帧输入（`K>1` 需历史帧保留能力）；compact 异步水位线；产出物进语义索引。
+- `setup.py` 的 `console_scripts` 入口 `phone-agent=main:main` 指向仓库里不存在的顶层 `main.py`（v1 入口
+  已删除），而 `setup.py` 只声明 `find_packages()`、没有 `py_modules`，顶层单文件 `main_v2.py` 不进安装
+  产物；修复属独立决策——补 `py_modules` 并把入口指到 `main_v2:main`，或删掉该 `entry_points`。
 - 真机回归与短输入任务测试：手机保持停止，等用户明确授权后再启动。
 
 ## 证据入口
