@@ -43,8 +43,9 @@ Web 控制台（默认 `http://127.0.0.1:8080`）：
 ```
 
 运行结束打印 `steps=… reason=…` 与 trace 路径；退出码 `0` 表示 run 报告 `success=true`，非零只是当前 CLI 的
-粗略区分，具体以 `reason` 与 trace 为准。工具回执与逐步过程在 trace 文件和控制台步骤时间线中查看，stdout
-不会逐步打印；最终是否达成目标以实际任务验收为准，不要只看单个字符串。
+粗略区分，具体以 `reason` 与 trace 为准。工具回执与逐步过程在 trace 文件和控制台步骤时间线中查看；stdout
+基本静默，只在 `wary` / `reviewer` 档拦截风险调用时打一行 `[safety]` 提示（见[安全模式](safety.md#safety-warning)）。
+最终是否达成目标以实际任务验收为准，不要只看单个字符串。
 
 只需要一个网关时不用额外配置；需要多提供方/多模型时可选一个单层 `models.json`，见[配置参考](configuration.md)。
 
@@ -65,7 +66,9 @@ Web 控制台（默认 `http://127.0.0.1:8080`）：
 
 ## 下一步
 
+- [操作手册](cookbook.md)：记忆维护、插件、新网关与诊断证据包的编号步骤
 - [配置参考](configuration.md)：调整预算、安全模式、记忆开关与模型路由
 - [Web 控制台](console.md)：界面各区说明
 - [安全模式](safety.md)：四档门控的选择
-- [记忆与自进化](memory.md)：App-KB、经验档案与受控回注
+- [记忆](memory.md)：App-KB 与经验档案
+- [自进化](evolution.md)：蒸馏分级与受控回注

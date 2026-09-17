@@ -48,10 +48,13 @@ markdown_extensions:
 nav:
   - 首页: index.md
   - 快速开始: quickstart.md
+  - 操作手册: cookbook.md
   - 配置参考: configuration.md
+  - 模型提供方: providers.md
   - 架构: architecture.md
   - Web 控制台: console.md
   - 安全模式: safety.md
-  - 记忆与自进化: memory.md
+  - 记忆: memory.md
+  - 自进化: evolution.md
   - 插件开发: plugins.md
   - 路线图: roadmap.md

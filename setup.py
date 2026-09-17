@@ -14,7 +14,7 @@ setup(
     description="AI-powered phone automation framework",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/phone-agent",
+    url="https://github.com/tom-cat-mao/TaskWizard",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",

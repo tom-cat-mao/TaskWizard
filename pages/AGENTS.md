@@ -15,18 +15,17 @@
    要么链接源码，要么只写语义。完整配置键清单的归宿是 `pages/configuration.md`。
 4. **代码块必须可跑**。示例是真命令：改文件名、改默认参数、删入口时同批改示例；跑不通的示例等于错误文档。
 
-第 2-4 条各有机器门禁，都在 `tests/docs/`：变迁措辞（`test_docs_freshness.py`）、笔记格式
+第 2-4 条与引用完整性都有机器门禁，都在 `tests/docs/`：变迁措辞（`test_docs_freshness.py`）、笔记格式
 （`test_notes_format.py`）、配置键三方一致（`test_config_keys_sync.py`）、bash 块可解析
-（`test_doc_bash_blocks.py`）。行为规则句里的变迁词可以带 `<!-- allow:词 -->` 行级豁免：注释与命中词同行或
+（`test_doc_bash_blocks.py`）、锚点存在性（`test_doc_anchors.py`）、Module Map 覆盖
+（`test_module_map.py`）。行为规则句里的变迁词可以带 `<!-- allow:词 -->` 行级豁免：注释与命中词同行或
 紧邻上一行才生效，渲染后不可见——它是一句「这行是规则」的声明，不是一个页面的免检牌。
 
 ## 锚点是兼容面
 
 P0 表除 #9、#10（仓库规则，无正文）与 #23（链到笔记规则）外，每行都链到本目录的 `{#anchor}`；历史链接与
-文档站深链也按它落地。改小节标题可以，改锚点 id 不行——它是对外契约。
-
-锚点 id 靠人工约定维护：`tests/docs/test_doc_references.py` 跳过含 `#` 的 token，没有机器核对锚点是否
-存在，改标题时自己回头核对本文件与根 `AGENTS.md` 里的引用。
+文档站深链也按它落地。改小节标题可以，改锚点 id 不行——它是对外契约，存在性由
+`tests/docs/test_doc_anchors.py` 机器核对：链接指向的目标文件必须真的声明该 `{#id}`。
 
 ## 字数超限怎么办
 
@@ -41,7 +40,7 @@ P0 表除 #9、#10（仓库规则，无正文）与 #23（链到笔记规则）�
 ## 发布门禁
 
 ```bash
-pytest tests/docs -q                # 预算、引用存在性、变迁词、笔记格式、配置键、bash 块
+pytest tests/docs -q                # 预算、引用与锚点存在性、变迁词、笔记格式、配置键、bash 块、Module Map
 python -m mkdocs build --strict     # 站内链接、nav 与构建
 ```
 
