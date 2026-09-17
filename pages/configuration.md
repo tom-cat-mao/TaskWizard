@@ -29,7 +29,7 @@
 | `PHONE_AGENT_BASE_URL` | url | `http://localhost:8000/v1` | OpenAI-compatible 网关地址；默认面向本地无鉴权网关，正式部署按需指定 |
 | `PHONE_AGENT_MODEL` | str | `autoglm-phone-9b` | 主模型 id，需视觉多模态能力；正式部署按需指定 |
 | `PHONE_AGENT_API_KEY` | str | `EMPTY` | 网关 API key；本地无鉴权网关可用默认值 |
-| `PHONE_AGENT_MODEL_TIMEOUT` | int | `180` | 单次模型请求超时（秒） |
+| `PHONE_AGENT_MODEL_TIMEOUT` | float | `180.0` | 单次模型请求超时（秒） |
 | `PHONE_AGENT_MODEL_MAX_RETRIES` | int | `2` | 模型请求重试次数 |
 | `PHONE_AGENT_TEMPERATURE` | float | 不发送 | 采样参数；网关限制固定值时在此覆盖 |
 | `PHONE_AGENT_TOP_P` | float | 不发送 | 同上 |
@@ -85,7 +85,7 @@
 | 变量 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `PHONE_AGENT_DEVICE_ID` | str | 自动识别 | ADB 设备序列号；多设备时必填 |
-| `PHONE_AGENT_LANG` | `cn`/`en` | `cn` | 提示词语言 |
+| `PHONE_AGENT_LANG` | `cn`/`en` | `cn` | 提示词语言；`zh` / `zh-cn` / `zh_cn` / `chinese` 同样按中文处理，其余值按英文 |
 | `PHONE_AGENT_MAX_STEPS` | int | `100` | 单轮最大模型调用数；仅作失控保险丝，非成本手段 |
 | `PHONE_AGENT_MAX_HITL_RESUMES` | int | `20` | 人工中断恢复次数上限 |
 
@@ -106,7 +106,7 @@
 | `PHONE_AGENT_COMPACT_SCHEMA_RESERVE` | int | `3000` | T1/T2 比较时为随每轮请求发送的序列化工具 schema 预留的 token 数（估算不可见部分） |
 | `PHONE_AGENT_COMPACT_OUTPUT_RESERVE` | int | `2000` | T1/T2 比较时为下一轮回复预留的 token 数 |
 | `PHONE_AGENT_CONTEXT_WINDOW` | int | 按实际构建的 actor 推断，兜底 `256000` | 用于窗口规划；最终请求准入只能收紧已知实际模型的窗口声明，不能放大。未设置时按**实际构建**的 actor（含构建降级目标）推断；旧自定义 Provider 没有新 support 时也保留 ModelSpec 的已知窗口，备用模型按自己的声明检查 |
-| `PHONE_AGENT_MEMORY_MODEL` | str | 主模型 | compact 摘要使用的模型 |
+| `PHONE_AGENT_MEMORY_MODEL` | str | 主模型 | compact 摘要与 `--distill` 的两次调用（候选抽取 + 自评分）共用的模型；缺省回落到主模型，`roles.distill.model` 优先于本键 |
 | `PHONE_AGENT_IMAGE_KEEP` | int | `2` | 历史中保留的含图消息数 |
 | `PHONE_AGENT_OBS_MARKS_KEEP` | int | `2` | 历史中保留完整 marks 摘要的观测数 |
 
@@ -136,11 +136,11 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 
 | 变量 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `PHONE_AGENT_GROUNDING_PROVIDER` | `hybrid`/`accessibility`/`locateanything` | `hybrid` | mark 来源；hybrid = 控件树优先，视觉兜底 |
+| `PHONE_AGENT_GROUNDING_PROVIDER` | `hybrid`/`accessibility`/`locateanything` | `hybrid` | `locate` 工具的视觉 provider 档位。观测 marks 恒由控件树产出，与本键无关；`hybrid` / `locateanything` 构建 LocateAnything 视觉 provider，`accessibility` 不构建——该档下 `locate` 报 `provider_unavailable` |
 | `PHONE_AGENT_ACCESSIBILITY_TIMEOUT` | float | `3.0` | 控件树抓取超时（秒） |
 | `PHONE_AGENT_ACCESSIBILITY_MAX_MARKS` | int | `80` | 单次观测最多输出的 mark 数 |
-| `PHONE_AGENT_MARKS_WINDOWED` | `auto`/`on`/`off` | `auto` | 窗口感知 marks（纯展示层）。`auto` 先试 `uiautomator dump --windows`，不支持则回退单根 dump；`on` 强制 `--windows`（不支持报错可见）；`off` 旧平铺渲染。仅影响分组/标注/渲染，寻址/执行/安全门/折叠/locate 不变，`op=blocked` 仅展示不拦截 |
-| `PHONE_AGENT_LOCATEANYTHING_MODEL` | path | 无 | 本地视觉定位模型路径；不配置则视觉定位不可用 |
+| `PHONE_AGENT_MARKS_WINDOWED` | `auto`/`on`/`off` | `auto` | 窗口感知 marks（纯展示层）。`auto` 先试 `uiautomator dump --windows`，不支持则回退 legacy 单根 dump；`on` 强制 `--windows`（不支持报错可见）；`off` 只跑 legacy 单根 dump。分组条件是出现多个不同窗口或存在真窗口证据（layer/type），否则平铺渲染——legacy 单根 dump 的多个顶层 node 会各生成一个弱窗口，因此同样按分组渲染并输出 `op=` 字段。仅影响分组/标注/渲染，寻址/执行/安全门/折叠/locate 不变，`op=blocked` 仅展示不拦截 |
+| `PHONE_AGENT_LOCATEANYTHING_MODEL` | path | `models/LocateAnything-3B-4bit` | 本地视觉定位模型路径；留空时按该默认路径加载，路径不存在时视觉定位不可用 |
 | `PHONE_AGENT_LOCATEANYTHING_MAX_SIZE` | int | `960` | 视觉定位 provider 自身输入图的最长边上限（模型侧档位）。与工具侧 `LOCATE_MAX_SIZE` 独立 |
 | `PHONE_AGENT_LOCATE_MAX_SIZE` | int | `0` | locate 工具输入图最长边；`0` = 原图 |
 | `PHONE_AGENT_SCOPE_PADDING_RATIO` | float | `0.05` | scope 区域裁剪的边缘扩展比例 |
@@ -152,7 +152,7 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | 变量 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `PHONE_AGENT_OBSERVE_SETTLE_MS` | int | `300` | 每次观测采样前的静置毫秒数；`0` 关闭。应对加载延迟的页面 |
-| `PHONE_AGENT_BLACK_SCREEN_DETECT` | bool | `true` | 全黑截图判定为 FLAG_SECURE 保护屏，不下发黑图 |
+| `PHONE_AGENT_BLACK_SCREEN_DETECT` | `on`/`off` | `on` | 全黑截图判定为 FLAG_SECURE 保护屏，不下发黑图；只认 `off`，写 `false`/`0` 会静默回落默认 `on` |
 
 ## 安全与验收
 
@@ -161,7 +161,7 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | `PHONE_AGENT_SAFETY_MODE` | `off`/`wary`/`hard`/`reviewer` | `wary` | 执行类动作门控，详见[安全模式](safety.md) |
 | `PHONE_AGENT_SAFETY_REVIEWER_MODEL` | str | 回落 `VERIFIER_MODEL` | `reviewer` 档的风险精排模型；两者皆空（且 models.json `roles` 未指定）时精排不可用，该档按 fail-closed 预警处理——**不**回落主模型 |
 | `PHONE_AGENT_FINISH_VERIFY` | `off`/`auto`/`always` | `auto` | finish 独立验收器触发策略；`off` 退化为单段落定。验收器故障 **fail-open**：放行并在审计记 `skipped`，绝不记 `pass` |
-| `PHONE_AGENT_FINISH_VERIFY_K` | int | `1` | 验收器查看的尾部截图数；当前实现恒取一次新观测的当前帧，`K>1` 的历史帧保留未接 |
+| `PHONE_AGENT_FINISH_VERIFY_K` | int | `1` | **no-op**：无消费方，任何取值行为相同——验收器恒取一次新观测的当前帧，`K>1` 所需的历史帧保留未接 |
 | `PHONE_AGENT_VERIFIER_MODEL` | str | 主模型 | 验收器模型 |
 
 ## 记忆
@@ -205,7 +205,7 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 
 | 变量 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `PHONE_AGENT_EXPERIENCE` | bool | `true` | episode 档案记录开关（observe-only） |
+| `PHONE_AGENT_EXPERIENCE` | `on`/`off` | `on` | episode 档案记录开关（observe-only）；只认 `off`，写 `false`/`0` 会静默回落默认 `on` |
 | `PHONE_AGENT_EXPERIENCE_DIR` | path | `memory/experience` | 档案目录 |
 | `PHONE_AGENT_EPISODE_KEEP` | int | `500` | 保留的完整档案数；更老的归档为聚合统计 |
 | `PHONE_AGENT_EPISODE_ARCHIVE_DAYS` | int | `90` | 超过该天数的档案在 dream 时归档 |
@@ -235,7 +235,7 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | `PHONE_AGENT_DIAG_EVIDENCE_DIR` | path | `outputs/live-diagnosis/.evidence` | 诊断证据流目录 |
 | `PHONE_AGENT_DIAG_UNREDACTED` | bool | `false` | 本机诊断全保真模式（仅影响证据流，生产 trace 始终脱敏） |
 | `PHONE_AGENT_RUNS_DIR` | path | `memory/runs` | runner 子进程运行目录（事件/控制通道） |
-| `PHONE_AGENT_DELIVERABLE` | bool | `true` | run 级 HTML 产出物能力（`write_document`/`update_document`） |
+| `PHONE_AGENT_DELIVERABLE` | `on`/`off` | `on` | run 级 HTML 产出物能力（`write_document`/`update_document`）；只认 `off`，写 `false`/`0` 会静默回落默认 `on` |
 | `PHONE_AGENT_DELIVERABLE_DIR` | path | `outputs/deliverables` | 产出物目录；文件固定为 `<run_id>.html`，上限 256 KiB |
 
 ## 插件
@@ -246,7 +246,32 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | `PHONE_AGENT_PLUGIN_MANIFEST` | path | `<repo>/.taskwizard.toml` | 项目级插件清单路径覆盖 |
 | `PHONE_AGENT_PLUGIN_INDEX` | str | `plugins/index.json` | `plugin search` 索引源（URL 或本地 json） |
 
+## 保留库直读键 {#retained-library-keys}
+
+`phone_agent/adb/`、`phone_agent/grounding/` 与 `phone_agent/config/` 是保留库：下列键在调用点直接读 env，不经
+`V2Config`，因此不进 CLI/env 解析链；取值与默认值以对应模块为准。
+
+| 变量 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `PHONE_AGENT_SCREENSHOT_FORMAT` | `jpeg`/`png` | `jpeg` | 模型输入图的编码格式；非 `jpg`/`jpeg` 值按 PNG 保存 |
+| `PHONE_AGENT_SCREENSHOT_JPEG_QUALITY` | int | `80` | JPEG 质量，钳制在 1-95；非法值回落 `80` |
+| `PHONE_AGENT_LOCATEANYTHING_STRUCTURE_MODE` | `off`/`target`/`screen` | `off` | 视觉定位的结构化提示档位；非法值回落 `off` |
+| `PHONE_AGENT_GROUNDING_MAX_SIZE` | int | `960` | 视觉定位输入图最长边的兜底别名；v2 session 恒先提供 `PHONE_AGENT_LOCATEANYTHING_MAX_SIZE` 的值，故本键在 v2 路径不生效 |
+| `PHONE_AGENT_LOCATEANYTHING_MAX_VISUAL_CANDIDATES` | int | `30` | 单次结构化的视觉候选上限 |
+| `PHONE_AGENT_LOCATEANYTHING_VISUAL_CATEGORY_BUDGET` | int | `5` | 单类视觉候选配额 |
+| `PHONE_AGENT_LOCATEANYTHING_MAX_STRUCTURE_CALLS` | int | `5` | 单次结构化的模型调用次数上限 |
+| `PHONE_AGENT_TAP_DELAY` / `PHONE_AGENT_DOUBLE_TAP_DELAY` / `PHONE_AGENT_LONG_PRESS_DELAY` / `PHONE_AGENT_SWIPE_DELAY` / `PHONE_AGENT_BACK_DELAY` / `PHONE_AGENT_HOME_DELAY` / `PHONE_AGENT_LAUNCH_DELAY` | float | `1.0` | 各动作执行后的等待秒数 |
+| `PHONE_AGENT_DOUBLE_TAP_INTERVAL` | float | `0.1` | 双击两次点击之间的间隔 |
+| `PHONE_AGENT_ADB_RESTART_DELAY` | float | `2.0` | 切到 TCP/IP 模式后的等待秒数 |
+| `PHONE_AGENT_SERVER_RESTART_DELAY` | float | `1.0` | 重启 ADB server 前后的等待秒数 |
+
+`PHONE_AGENT_SCREENSHOT_FORMAT` 与 `PHONE_AGENT_SCREENSHOT_JPEG_QUALITY` 决定模型实际看到的图（编码与压缩强度）；
+token 估算仍按[预算契约](#token-budget)的固定口径，不随这两项变化。
+
 !!! note "保留但无读取方的字段"
-    `PHONE_AGENT_BUDGET_WARN_RATIO`（旧模型调用预算时代的阈值）已无读取方，仅为 env 兼容保留；成本控制
-    请使用 `PHONE_AGENT_TOKEN_BUDGET` 与 `PHONE_AGENT_TOKEN_WARN_REMAINING`。`PHONE_AGENT_TASKDOC_NUDGE_STEPS`
-    见上表，为 no-op。
+    `PHONE_AGENT_BUDGET_WARN_RATIO`（模型调用预算阈值）的字段无读取方，仅为 env 兼容保留；成本控制请使用
+    `PHONE_AGENT_TOKEN_BUDGET` 与 `PHONE_AGENT_TOKEN_WARN_REMAINING`。`PHONE_AGENT_TASKDOC_NUDGE_STEPS`
+    见上表，为 no-op。`PHONE_AGENT_LOCATE_LA_MAX_SIZE` 同样无读取方（`resolve_locate_la_max_size` 没有调用方），
+    locate 工具的输入档位用 `PHONE_AGENT_LOCATE_MAX_SIZE`。`PHONE_AGENT_KEYBOARD_SWITCH_DELAY` /
+    `PHONE_AGENT_TEXT_CLEAR_DELAY` / `PHONE_AGENT_TEXT_INPUT_DELAY` / `PHONE_AGENT_KEYBOARD_RESTORE_DELAY`
+    被 `phone_agent/config/timing.py` 读入 `ActionTimingConfig`，但该配置的字段无读取方。
