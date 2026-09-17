@@ -200,7 +200,7 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | `PHONE_AGENT_GROUNDING_PROVIDER` | `hybrid`/`accessibility`/`locateanything` | `hybrid` | `locate` 工具的视觉 provider 档位。观测 marks 恒由控件树产出，与本键无关；`hybrid` / `locateanything` 构建 LocateAnything 视觉 provider，`accessibility` 不构建——该档下 `locate` 报 `provider_unavailable` |
 | `PHONE_AGENT_ACCESSIBILITY_TIMEOUT` | float | `3.0` | 控件树抓取超时（秒） |
 | `PHONE_AGENT_ACCESSIBILITY_MAX_MARKS` | int | `80` | 单次观测最多输出的 mark 数 |
-| `PHONE_AGENT_MARKS_WINDOWED` | `auto`/`on`/`off` | `auto` | 窗口感知 marks（纯展示层）。`auto` 先试 `uiautomator dump --windows`，不支持则回退单根 dump；`on` 强制 `--windows`（不支持报错可见）；`off` 旧平铺渲染。仅影响分组/标注/渲染，寻址/执行/安全门/折叠/locate 不变，`op=blocked` 仅展示不拦截 |
+| `PHONE_AGENT_MARKS_WINDOWED` | `auto`/`on`/`off` | `auto` | 窗口感知 marks（纯展示层）。`auto` 先试 `uiautomator dump --windows`，不支持则回退 legacy 单根 dump；`on` 强制 `--windows`（不支持报错可见）；`off` 只跑 legacy 单根 dump。分组条件是出现多个不同窗口或存在真窗口证据（layer/type），否则平铺渲染——legacy 单根 dump 的多个顶层 node 会各生成一个弱窗口，因此同样按分组渲染并输出 `op=` 字段。仅影响分组/标注/渲染，寻址/执行/安全门/折叠/locate 不变，`op=blocked` 仅展示不拦截 |
 | `PHONE_AGENT_LOCATEANYTHING_MODEL` | path | `models/LocateAnything-3B-4bit` | 本地视觉定位模型路径；留空时按该默认路径加载，路径不存在时视觉定位不可用 |
 | `PHONE_AGENT_LOCATEANYTHING_MAX_SIZE` | int | `960` | 视觉定位 provider 自身输入图的最长边上限（模型侧档位）。与工具侧 `LOCATE_MAX_SIZE` 独立 |
 | `PHONE_AGENT_LOCATE_MAX_SIZE` | int | `0` | locate 工具输入图最长边；`0` = 原图 |
