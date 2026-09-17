@@ -91,7 +91,7 @@
 
 浏览器只接收投影后的事件，不发送 API key、认证头或完整配置。
 
-## 本地合成预览
+## 本地合成预览 {#local-preview}
 
 `scripts/fake_console_preview.py` 提供隔离的合成预览：只使用内存状态、生成的安卓风格画面与临时产物目录，
 不构造真实 bridge / runner / 设备 / 模型客户端 / 记忆存储；状态切换入口藏在小 badge 的菜单里，
@@ -100,6 +100,27 @@
 ```bash
 .venv/bin/python scripts/fake_console_preview.py --root /tmp/tw-console-preview --port 8091
 ```
+
+另见[回放面](#replay-surfaces)。
+
+## 回放面 {#replay-surfaces}
+
+同一次 run 的四个观侧面：
+
+- **trace**：每次 run 的脱敏事件流落 `.traces/<run_id>.jsonl`（64 字截断、敏感子串脱敏、base64 不落盘）；语义见 [Trace 与脱敏](architecture.md#trace-redaction)。
+- **经验 replay**：`phone_agent/v2/replay.py` 离线重放 episode 日志，评估先例通道三闸与过程卡指标：
+
+  ```bash
+  .venv/bin/python -m phone_agent.v2.replay --channel exemplar
+  ```
+
+  语义见[通道离线评估（replay）](evolution.md#replay)。
+- **合成控制台预览**：纯内存 FakeBridge 合成画面，不触设备/模型/记忆；命令见[本地合成预览](#local-preview)。
+- **真机诊断回放**：`.agents/skills/phone-agent-live-diagnosis/SKILL.md` 把真机 run 渲染为离线中文 HTML 回放与证据包；下列命令为离线冒烟入口（合成数据，不代表真机能力）：
+
+  ```bash
+  .venv/bin/python .agents/skills/phone-agent-live-diagnosis/scripts/run_diagnosis.py dry-run
+  ```
 
 ## 验收说明
 

@@ -115,7 +115,7 @@ resolved 的 App（≤2 个）在规划前就预取其卡+app 专属规则；**�
 成功 或 前台包检测，系统包过滤），进 App 即送该 App 的卡+规则。三个时机共享「每包每 run 至多一次」去重。蒸馏
 指引：跨 App 交接类课按涉及 App 各产一份候选（scope 各挂对应包名），保障链式任务每个 App 进场都能拿到交接纪律。
 
-## 通道离线评估（replay）
+## 通道离线评估（replay） {#replay}
 
 `phone_agent/v2/replay.py` 在内存 `VecIndex`（`:memory:`，不碰生产索引）里重放 `memory/experience/events.jsonl`，
 为"某条通道是否值得上线"提供离线证据。
