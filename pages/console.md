@@ -114,9 +114,9 @@
   .venv/bin/python -m phone_agent.v2.replay --channel exemplar
   ```
 
-  语义见[通道离线评估（replay）](evolution.md)。
+  语义见[通道离线评估（replay）](evolution.md#replay)。
 - **合成控制台预览**：纯内存 FakeBridge 合成画面，不触设备/模型/记忆；命令见[本地合成预览](#local-preview)。
-- **真机诊断回放**：`.agents/skills/phone-agent-live-diagnosis/SKILL.md` 把真机 run 渲染为离线中文 HTML 回放与证据包：
+- **真机诊断回放**：`.agents/skills/phone-agent-live-diagnosis/SKILL.md` 把真机 run 渲染为离线中文 HTML 回放与证据包；下列命令为离线冒烟入口（合成数据，不代表真机能力）：
 
   ```bash
   .venv/bin/python .agents/skills/phone-agent-live-diagnosis/scripts/run_diagnosis.py dry-run
