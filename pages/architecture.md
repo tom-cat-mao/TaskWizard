@@ -249,7 +249,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 
 ## 记忆
 
-三层结构：App-KB 事实库（已上线）、episode 经验档案（已上线）、RAG shadow 回想（已上线，默认不注入）。详见[记忆与自进化](memory.md)。
+三层结构：App-KB 事实库（已上线）、episode 经验档案（已上线）、RAG shadow 回想（已上线，默认不注入）。详见[记忆](memory.md)与[自进化](evolution.md)。
 
 ## 扩展性
 

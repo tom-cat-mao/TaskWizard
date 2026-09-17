@@ -69,4 +69,5 @@ Web 控制台（默认 `http://127.0.0.1:8080`）：
 - [配置参考](configuration.md)：调整预算、安全模式、记忆开关与模型路由
 - [Web 控制台](console.md)：界面各区说明
 - [安全模式](safety.md)：四档门控的选择
-- [记忆与自进化](memory.md)：App-KB、经验档案与受控回注
+- [记忆](memory.md)：App-KB 与经验档案
+- [自进化](evolution.md)：蒸馏分级与受控回注
