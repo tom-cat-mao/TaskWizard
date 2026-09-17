@@ -27,7 +27,9 @@ TaskWizard 是一个 LLM 驱动的安卓手机操作 Agent。模型通过工具�
 ## 入口
 
 - [快速开始](quickstart.md)：安装到跑通第一个任务
+- [操作手册](cookbook.md)：维护、插件、模型网关与诊断的编号操作序列
 - [配置参考](configuration.md)：全部 `PHONE_AGENT_*` 配置项（唯一详细手册）
+- [模型提供方](providers.md)：models.json、五角色路由、流式与 fallback
 - [架构](architecture.md)：thin-loop 循环、原子观测与约束
 - [Web 控制台](console.md)：界面说明与本轮改版方向
 - [安全模式](safety.md)：四档门控与 finish 验收
