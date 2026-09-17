@@ -58,7 +58,7 @@ sequenceDiagram
     end
 ```
 
-每次尝试都重新静置，最多两次。触发重试的条件有三类：截图或采样抛错、前后台组件变化，以及首次尝试遇到瞬时 marks 失败（抓取超时、provider 失败、AX 解析失败；窗口化采集不支持也归为 provider 失败）。空屏（无控件可交互）属于稳定结果，不是瞬时失败，直接提交零 marks 帧。第二次尝试无论结果如何都会提交，失败码随帧显式标注，不装成“本屏无控件”。
+每次尝试都重新静置，最多两次。触发重试的条件有三类：截图或采样抛错、前后台组件变化，以及首次尝试遇到瞬时 marks 失败（抓取超时、provider 失败、AX 解析失败；窗口化采集不支持也归为 provider 失败）。空屏（无控件可交互）属于稳定结果，不是瞬时失败，直接提交零 marks 帧。第二次尝试只在截图有效且前后台一致时提交，失败码随帧显式标注，不装成“本屏无控件”；第二次截图仍失败或前台再次漂移则作废整批 marks 并抛错，本次调用取得过的最后一张有效截图只降级为未验证参考图。
 
 每次成功观测使上一批 mark 全部过期；执行动作引用过期 mark 时在 `resolve_mark` 处拒绝。模型能寻址的始终是
 **当前已观测批次**的 mark；观测之后屏幕仍可能变化，动作是否生效以设备回执为准。
@@ -69,12 +69,12 @@ sequenceDiagram
 |---|---|---|
 | 提交成功 | 截图有效、前后台一致；瞬时 dump 失败重试一次后仍失败时提交标注过的零 marks 帧 | 当前帧 + 当前批次 marks（可能为 0，带 `marks (0) [accessibility:<code>]` 诊断） |
 | 未验证参考图 | 本次尝试取得过有效截图，但整个观测窗口最终失败 | 最近一张有效图，明确标注“较早采样、未验证、非当前可操作批次”；**不提交** epoch/`screen_seq`/几何，不铸 mark |
-| 纯失败文字 | 全程没有有效截图，或被 `secure_screenshot_blocked` 拦截 | 只有事实性错误文本，不伪造画面 |
+| 纯失败文字 | 全程没有有效截图（含被 `secure_screenshot_blocked` 拦截，该类失败不保留参考图） | 只有事实性错误文本，不伪造画面 |
 
 参考图是普通多模态图片（受历史图片剪除约束），永远不能用来寻址——旧 `ax_*@eN` 仍然 fail-closed。动作成功
 的回执也不会因为随后的观测失败而被降级成“动作没执行”。
 
-`PHONE_AGENT_BLACK_SCREEN_DETECT`（默认开）把全黑截图（各通道 RGB 最大值 ≤ 4）与系统截屏失败一并判为 `secure_screenshot_blocked`：这是 fail-closed，不返回黑图，也不保留参考图。
+`PHONE_AGENT_BLACK_SCREEN_DETECT`（默认开）把全黑截图（各通道 RGB 最大值 ≤ 4）判为 `secure_screenshot_blocked`：这是 fail-closed，不返回黑图，也不保留参考图。系统保护页是另一个来源——只有 screencap stdout 显式含 `Status: -1` / `Failed` 才走该码；非零返回码、pull 失败与其它异常分别是 `adb_screencap_failed` / `screenshot_pull_failed` / `screenshot_unavailable`，这些非 secure 失败在有有效截图时保留参考图。
 
 ### 批次与几何的状态转移
 
@@ -97,14 +97,14 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
   ax_3@e12 | ImageButton | 返回 | (58,35) | op=blocked | path=toolbar
 ```
 
-- 可操作性四档：confirmed（真窗口证据+未被覆盖）/ likely（默认）/ blocked（仅真 layer 证据：被高层弹窗覆盖）/ unknown；blocked 只展示不拦截；
+- 可操作性四档：confirmed（真窗口证据+未被覆盖）/ likely（默认）/ blocked（仅真 layer 证据：被高层弹窗覆盖）/ unknown（弱窗口中心被更高推断窗遮盖，`maybe_covered_by`，只是提示）；blocked 只展示不拦截；
 - `op` 标注只出现在窗口化渲染；回退到单根渲染时不输出该字段；
 - 分组条件是出现多个不同窗口，或存在真窗口证据（layer/type）；否则按平铺布局渲染；
 - 名额按窗口配额分配，顶层弹窗有保底；
 - 寻址语义不变：执行动作仍只认当前批次的 `ax_*@eN`；`op` 与窗口归属不参与 `resolve_mark` 判定，不是执行门控；
 - dump 失败（超时/解析错）触发一次重试，最终失败在观测文本显式标注，不装成“本屏无控件”。
 
-`PHONE_AGENT_MARKS_WINDOWED` 三档：`auto`（默认）先试窗口化 dump、设备不支持则回退单根；`on` 强制窗口化，采集不支持时可见失败；`off` 用平铺渲染。三档只影响分组、标注与渲染，不改寻址、执行、安全门、图片/摘要折叠与 `locate`。
+`PHONE_AGENT_MARKS_WINDOWED` 三档：`auto`（默认）先试窗口化 dump、设备不支持则回退单根；`on` 强制窗口化，采集不支持时可见失败；`off` 只跑 legacy 单根 dump。分组判定只看窗口集合：legacy dump 出现多个顶层 node 时每个 node 算一个弱窗口，仍判 grouped 并按窗口渲染、输出 `op=`；弱窗口没有真 layer/type，只可能落 likely 或 unknown（被更高推断窗遮盖即 unknown），到不了 confirmed 或 blocked。三档只影响分组、标注与渲染，不改寻址、执行、安全门、图片/摘要折叠与 `locate`。
 
 ## 单批执行 {#single-batch-execution}
 
@@ -164,26 +164,26 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 | 单条证据 | 500 |
 | 事实条数 / 单条 | 10 / 120 |
 | amendment 条数 / 单条 | 10 / 500 |
-| pin 块渲染长度 | 4000 |
+| TaskDoc 正文渲染（`TaskDoc.render()`） | 4000 |
 
-渲染超过 4000 字时按可截断段（amendment、事实）回删并留 `…(已截断)` 标记；`goal_base` 与路线项永不截断，因此保护内容自身超限时输出可以超过该值。
+渲染超过 4000 字时按可截断段（amendment、事实）回删并留 `…(已截断)` 标记；`goal_base` 与路线项永不截断，因此保护内容自身超限时输出可以超过该值。pin 进上下文的整块在正文之后还会拼上 `## 流程线`（最多 8 条流程条目），因此整块长度可以超过 4000。
 
 ## 流程线与输出契约 {#output-contract}
 
-每个工具调用都带 `intent`（本步目标，system prompt 要求必填）与可选的 `note`；两者在 schema 上是可选参数、缺省为空字符串。工具回执写实际发生了什么（如 `已点击「上海」(ax_3)`、`已输入 '…'`），流程线据此派生出真实账本。
+每个工具调用都带 `intent`（本步目标，system prompt 要求必填）与可选的 `note`；两者在 schema 上都是可选参数，缺省分别是空串与 `null`。工具回执写实际发生了什么（如 `已点击「上海」(ax_3)`、`已输入 '…'`），流程线据此派生出真实账本。
 
 流程线由 transcript **纯派生**，不持有 session 状态：取最近 8 步，格式为 `#N <intent> → <工具><目标> → <状态>｜note`，各字段有长度截断。停滞轻推不产生行为，`PHONE_AGENT_TASKDOC_NUDGE_STEPS` 是保留的 no-op。
 
 ## finish 两段式与验收 {#finish-two-step}
 
-1. **两段式**：首次 `finish` 返回复核包（目标、路线完成度、疑点），模型带 `confirm=true` 再次调用才定稿；声明 `completed` 的路线项必须带 `evidence_note`，缺证据的声明被拒。复核包记录当时提交的屏幕序号，`confirm` 时比较当前序号；序号已前进则重新出复核包。`PHONE_AGENT_FINISH_VERIFY=off` 退化为单段落定，不生成复核包、不做序号守卫。
+1. **两段式**：首次 `finish` 返回复核包（世界事实、路线状态、疑点、选项四节，目标只随 pinned 的任务板出现），模型带 `confirm=true` 再次调用才定稿；`finish` 的 `evidence` 参数必须非空，空列表被拒且不记录任何状态；声明 `completed` 的路线项必须带 `evidence_note`，缺证据的声明被拒。复核包记录当时提交的屏幕序号，`confirm` 时比较当前序号；序号已前进则重新出复核包。`PHONE_AGENT_FINISH_VERIFY=off` 退化为单段落定，不生成复核包、不做序号守卫。
 2. **终局**：被接受的 finish 立即终局——同轮后续 sibling 工具调用不再执行，收到 status 为 error 的 skipped 回执（`自动化已终止；该后续工具调用已跳过。`），且此后不再采样模型。被接受的 `take_over` 同样终局；被拒绝的 `take_over` 不设终局，run 继续。<!-- allow:不再 -->
 3. **独立验收器**（`PHONE_AGENT_FINISH_VERIFY`，默认 `auto`）：上下文独立于 actor，只看目标、证据路线与尾部截图，**绝不读 actor transcript**；TaskDoc 关闭时以 run 的原始目标为权威。`auto` 档在目标命中高风险词表，或复核发现硬矛盾（最后一步工具失败、观测无效、前台回到 Launcher）时触发；`always` 总是触发；`off` 关闭。验收器连续两次拒绝转为 `take_over`。
 4. **故障 fail-open**：验收器构建或调用失败时放行该 finish 并记审计状态 `skipped`，绝不记 `pass`。
 
 ## 产出物（deliverable） {#deliverable}
 
-`PHONE_AGENT_DELIVERABLE=on`（默认）时挂载 `write_document` / `update_document` 两个工具。模型给 `title` 与 `html`，**不给路径**：目标固定为 `PHONE_AGENT_DELIVERABLE_DIR/<run_id>.html`（UTF-8，上限 256 KiB，恰好 256 KiB 允许）。
+`PHONE_AGENT_DELIVERABLE=on`（默认）时挂载 `write_document` / `update_document` 两个工具。`write_document` 收 `title` 与 `html`，`update_document` 只收 `html`；模型绝不给路径：目标固定为 `PHONE_AGENT_DELIVERABLE_DIR/<run_id>.html`（UTF-8，上限 256 KiB，恰好 256 KiB 允许）。
 
 - create 拒绝已存在的文件；update 拒绝缺失、非普通文件与 symlink；
 - 任何失败返回错误字符串，并保证不改动先前写好的文档；
@@ -196,9 +196,9 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 
 - 文本字段先脱敏敏感子串，再按**字符**截断到 64 字符（超出补 `…`）；
 - 截图 base64 永不落盘：图片块替换为 `{type, screen_seq, bytes}`，`bytes` 是按 base64 长度估算的字节数；
-- 交付物的 HTML 正文作为工具参数时整段略去，只留 `{omitted: true, bytes: N}`（顶层参数；嵌套出现的同名参数按 64 字截断规则处理）；
+- 交付物的 HTML 正文作为工具参数时整段略去，只留 `{"type": "text", "omitted": true, "bytes": N}`（顶层参数；嵌套出现的同名参数按 64 字截断规则处理）；
 - context 请求观测只输出数字与有界标签（角色、尝试序号、消息数、容量判断、估算来源与覆盖范围、实际协议、缓存模式）。指纹口径是调用前的有序客户端消息，provider 仍可能提升 system 或合并块，因此不冒充服务端精确 token 前缀；`attempt_scope=handler_invoke` 只区分显式备用尝试，不声称观测到 SDK 或网关内部的每次 HTTP 重试；
-- usage 四元组（input / output / cache read / cache write）缺失记 `null`，与明确的 `0` 分开；缓存输入仍计入上下文与原 token 预算。
+- usage 四元组（input / output / cache read / cache write）缺失记 `null`，与明确的 `0` 分开；trace 的 `model_call` 调用失败时整键缺席这四个字段；缓存输入仍计入上下文与原 token 预算。
 
 ## 约束（P0） {#p0}
 
@@ -241,15 +241,16 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 不能拿它当服务端精确 token 前缀。`model_attempt_usage` 的 `attempt_scope=handler_invoke` 区分显式备用尝试，
 不声称已观察 SDK/网关内部每次 HTTP 重试。
 
-`model_call` / 模型事件新增可空 `input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`。
-缺失和明确 0 分开；兼容普通、priority、flex 的缓存明细。只输出数字，不输出 prompt、HTML、认证信息或截图。
-有完整数据时，输入加权命中率为 `Σcache_read_tokens / Σinput_tokens`；缓存输入仍计入上下文与原 token 预算。
-这些字段用于定位缓存行为，不引入金额预算或价格换算。
+`model_call` / 模型事件记录可空 `input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`：
+缺失和明确 0 分开；兼容普通、priority、flex 的缓存明细；trace 的 `model_call` 调用失败时这四个键整键缺席、
+只有 `error` 与延迟，Web 事件流的同名失败分支仍带四个 `null` 键。
+只输出数字，不输出 prompt、HTML、认证信息或截图。缓存 token 只在用量台账里按角色累计求和，没有命中率计算；
+缓存输入仍计入上下文与原 token 预算。这些字段用于定位缓存行为，不引入金额预算或价格换算。
 
 ## 记忆
 
-三层结构：App-KB 事实库（已上线）、episode 经验档案（已上线）、RAG shadow 回想（已上线，默认不注入）。详见[记忆与自进化](memory.md)。
+三层结构：App-KB 事实库（已上线）、episode 经验档案（已上线）、RAG shadow 回想（已上线，默认不注入）。详见[记忆](memory.md)与[自进化](evolution.md)。
 
 ## 扩展性
 
-策略层完全事件化：LangChain 中间件栈只剩 5 个桥接器，安全预警、上下文压缩、token 预算、trace、诊断全部是事件总线上的监听器（嵌套顺序 = 注册顺序，safety 恒居 `tool/execute` 最内层）。外部插件与内建能力共用同一装配层，可挂监听器、工具、提示块、run hooks 与 CLI 命令。详见[插件开发](plugins.md)。
+策略层完全事件化：LangChain 中间件栈只有 5 个桥接器，另有可选的 `extra_middleware` 观察者（控制台注入 Web 事件投影）。安全预警、上下文压缩、token 预算、trace、诊断全部是事件总线上的监听器（嵌套顺序 = 注册顺序；内建链里 safety 位于 `tool/execute` 最内，插件经 `ctx.on` 追加的监听器比 safety 更内）。外部插件与内建能力共用同一装配层，可挂监听器、工具、提示块、run hooks 与 CLI 命令。详见[插件开发](plugins.md)。
