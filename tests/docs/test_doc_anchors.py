@@ -17,9 +17,11 @@ file, ``architecture.md#coords`` from another page, ``../../pages/*.md#id``
 from a two-level subtree, ``pages/*.md#id`` from the repository root).
 
 Fenced code blocks are stripped first — an anchor shown inside a fence is an
-example, not a declaration or a link — and ``EXTERNAL_ANCHOR_OK`` below covers
-the rare pointer whose target deliberately lives outside the repository; the
-set is empty today and every entry needs a one-line reason.
+example, not a declaration or a link — and so are HTML comments, which render
+nowhere and so contract nothing (``<!-- allow:不再 -->`` exemptions are
+comments, not text).  ``EXTERNAL_ANCHOR_OK`` below covers the rare pointer
+whose target deliberately lives outside the repository; the set is empty today
+and every entry needs a one-line reason.
 
 Only the standard library and pytest may be imported here.  The ci.yml docs
 job installs nothing beyond ``pytest`` (no ``requirements.txt``), so importing
@@ -65,6 +67,10 @@ _FENCED_BLOCK_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 
+# HTML comments render nowhere, so neither their links nor their `{#id}`s count
+# (same stripping as test_doc_budgets.py).
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
 _ANCHOR_DECLARATION_RE = re.compile(r"\{#(?P<anchor>[a-z][a-z0-9-]*)\}")
 
 # Anchor links whose target a fresh clone deliberately does not contain — an
@@ -75,11 +81,11 @@ _ANCHOR_DECLARATION_RE = re.compile(r"\{#(?P<anchor>[a-z][a-z0-9-]*)\}")
 EXTERNAL_ANCHOR_OK: dict[str, str] = {}
 
 
-def _strip_fences(markdown: str) -> str:
-    """Drop fenced code blocks: their content is an example, not a contract."""
+def _body(markdown: str) -> str:
+    """The reading view of *markdown*: comments and fenced blocks removed."""
 
     text = markdown.replace("\r\n", "\n").replace("\r", "\n")
-    return _FENCED_BLOCK_RE.sub(" ", text)
+    return _FENCED_BLOCK_RE.sub(" ", _HTML_COMMENT_RE.sub(" ", text))
 
 
 def _anchor_fragment(token: str) -> tuple[str, str] | None:
@@ -100,7 +106,7 @@ def _anchor_fragment(token: str) -> tuple[str, str] | None:
 def anchors_in(markdown: str) -> list[tuple[str, str]]:
     """Every ``(target, anchor)`` reference in *markdown*, in reading order."""
 
-    body = _strip_fences(markdown)
+    body = _body(markdown)
     hits: list[tuple[int, tuple[str, str]]] = []
     for match in _BACKTICK_RE.finditer(body):
         fragment = _anchor_fragment(match.group("token"))
@@ -129,7 +135,7 @@ def resolve_target(document: str, target: str, *, root: Path = REPO_ROOT) -> Pat
 def declared_anchors(path: Path) -> set[str]:
     """Anchor ids declared by the document at *path* (``{#id}`` literals)."""
 
-    return set(_ANCHOR_DECLARATION_RE.findall(_strip_fences(path.read_text(encoding="utf-8"))))
+    return set(_ANCHOR_DECLARATION_RE.findall(_body(path.read_text(encoding="utf-8"))))
 
 
 def violations(
@@ -264,7 +270,24 @@ def test_markdown_links_and_backticks_are_both_read() -> None:
 def test_fenced_examples_are_not_links_or_declarations() -> None:
     markdown = "```markdown\n[示例](pages/architecture.md#coords)\n### 标题 {#coords}\n```\n"
     assert anchors_in(markdown) == []
-    assert _strip_fences("```\n### 标题 {#coords}\n```\n").strip() == ""
+    assert _body("```\n### 标题 {#coords}\n```\n").strip() == ""
+
+
+def test_html_comments_are_not_links_or_declarations() -> None:
+    """Comments render nowhere: their links and ids are outside the contract."""
+
+    markdown = "正文 <!-- [隐藏](pages/architecture.md#coords)、{#coords} --> 之后。"
+    assert anchors_in(markdown) == []
+    assert _body("<!-- {#coords} -->").strip() == ""
+
+
+def test_an_anchor_declared_only_in_a_comment_does_not_count(tmp_path: Path) -> None:
+    """A `{#id}` a reader cannot see is not a declaration the gate accepts."""
+
+    (tmp_path / "page.md").write_text("<!-- {#hidden} -->\n", encoding="utf-8")
+    assert dict(violations("page.md", "[x](page.md#hidden)", root=tmp_path)) == {
+        "page.md#hidden": "anchor not declared in page.md",
+    }
 
 
 def test_relative_targets_resolve_like_the_renderer() -> None:

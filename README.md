@@ -47,8 +47,8 @@ cp .env.example .env
 ```
 
 维护命令组（`--dream`、`--distill`、`--rebuild-vec`、`--learn-alias` 等）与 `plugin` 子命令
-（`list`/`add`/`remove`/`update`/`search`）的完整语义见 [记忆与自进化](pages/memory.md) 与
-[插件开发](pages/plugins.md)，本页只给入口。
+（`list`/`add`/`remove`/`update`/`search`）的完整语义见 [记忆](pages/memory.md)、[自进化](pages/evolution.md)
+与 [插件开发](pages/plugins.md)，本页只给入口。
 
 运行结束打印 `steps=… reason=…` 与 trace 路径；退出码 `0` 表示 run 报告 `success=true`，非零只是当前 CLI
 对失败/接管/熔断的粗略区分，具体以 `reason` 与 trace 为准。`reason` 由终局原因决定（成功时是模型的 finish

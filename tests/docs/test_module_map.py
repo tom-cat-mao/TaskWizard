@@ -97,8 +97,9 @@ def named_modules(text: str) -> tuple[set[str], set[str]]:
             add(match.group("prefix"), stem.strip())
     for match in _MIDDLEWARE_ROSTER_RE.finditer(body):
         for item in _ROSTER_SPLIT_RE.split(match.group("items")):
-            if item.strip():
-                middleware.add(item.strip() + ".py")
+            stem = item.strip()
+            if stem:
+                middleware.add(stem if stem.endswith(".py") else stem + ".py")
     return top_level, middleware
 
 
@@ -156,6 +157,13 @@ def test_a_top_level_mention_does_not_cover_a_middleware_module() -> None:
     top_level, middleware = named_modules("| 任务 | `v2/{taskdoc,resolver}.py` |")
     assert top_level == {"taskdoc.py", "resolver.py"}
     assert middleware == set()
+
+
+def test_roster_items_may_carry_the_py_extension() -> None:
+    """A roster written as `safety.py` names safety.py, not safety.py.py."""
+
+    _, middleware = named_modules("| 策略 | `v2/middleware/`（safety.py、images） |")
+    assert middleware == {"safety.py", "images.py"}
 
 
 def test_missing_modules_are_reported_not_silently_passed() -> None:

@@ -13,8 +13,8 @@ Status: implemented
 - **低危约 45**：口径与措辞级偏差，单条不致命，但读者每页都会撞见。
 
 与此同时，**机器门禁覆盖的那一层零漂移**：配置键三方一致、词预算、变迁词、bash 块可解析、引用路径存在性
-全绿（`pytest tests/docs -q` 当时 155 项通过）。结论很明确：漂移全部集中在机器还看不见的语义层，而其中两类
-本可被机器看见——锚点存在性与 Module Map 覆盖：
+全绿——基线 `main`（`bd454c1`）上 `pytest tests/docs -q` 实测 189 项全通过。结论很明确：漂移全部集中在机器
+还看不见的语义层，而其中两类本可被机器看见——锚点存在性与 Module Map 覆盖：
 
 - P0 表的 30 个锚点链接与页面内的互链（`#coords`、`architecture.md#app-name-resolution`、
   `../../pages/console.md#web-projection`）没有任何进程核对；`test_doc_references.py` 明确跳过含 `#` 的
