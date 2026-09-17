@@ -91,6 +91,10 @@ jobs:
           for path in sorted(root.rglob("*")):
               if not path.is_file():
                   continue
+              # Skip the derived search index: JSON escaping keeps `\"`/`\n` literal and glues `</code></pre>`
+              # onto code text, false-firing the pattern; site/*/index.html scans its source pages, so no coverage loss.
+              if path.relative_to(root).as_posix() == "search/search_index.json":
+                  continue
               if path.name == ".env" or path.suffix == ".env":
                   problems.append(f"env file in artifact: {path}")
                   continue
