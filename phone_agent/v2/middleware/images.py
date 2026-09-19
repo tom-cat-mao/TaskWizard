@@ -14,6 +14,12 @@ this middleware runs two independent, idempotent passes over the transcript:
    grounding requires the model to address the *latest* observation's mark ids,
    so folding stale digests is safe and reinforces that discipline.
 
+   The fold placeholder carries an optional suffix (``fold_hint``) that the
+   ``obs_archive`` capability installs while it is mounted — ``[可 recall_screen]``
+   teaches the model that the folded frame can be re-read through the read-only
+   recall tool.  The default is the empty string, so an off capability renders
+   the historic placeholder byte-identically.
+
 Both passes mutate message content in place and are idempotent: a placeholder
 carries no image block and a folded line carries no ``marks (`` marker, so a
 re-run leaves already-processed history byte-identical (stable prefix outside
@@ -116,15 +122,17 @@ def _prune_message_images(message: Any, screen_no: int) -> bool:
     return changed
 
 
-def _fold_message_marks(message: Any) -> bool:
+def _fold_message_marks(message: Any, hint: str = "") -> bool:
     """Collapse the ``marks (K): <digest>`` section of OBS text blocks in place.
 
-    Keeps the ``[OBS] app=X screen#N`` header and appends ``[marks 已折叠:K]``.
+    Keeps the ``[OBS] app=X screen#N`` header and appends ``[marks 已折叠:K]``
+    plus the optional ``hint`` suffix (empty by default => historic text).
     Returns ``True`` if the message was modified.
     """
     content = getattr(message, "content", None)
     if not isinstance(content, list):
         return False
+    suffix = f" {hint}" if hint else ""
     new_content: list[Any] = []
     changed = False
     for block in content:
@@ -133,7 +141,7 @@ def _fold_message_marks(message: Any) -> bool:
             head, _, rest = text.partition(_MARKS_MARKER)
             count = rest.split(")", 1)[0].strip() if rest else "?"
             new_content.append(
-                {"type": "text", "text": f"{head} [marks 已折叠:{count}]"}
+                {"type": "text", "text": f"{head} [marks 已折叠:{count}]{suffix}"}
             )
             changed = True
         else:
@@ -151,12 +159,19 @@ class ContextPrunerService:
     message content in place and returns the modified messages deduped by
     identity.  The keep_images/keep_marks contract is identical to the
     middleware's (P0 #3).
+
+    ``fold_hint`` is appended to the marks-fold placeholder; it stays empty by
+    default and is installed/removed by the ``obs_archive`` capability (its
+    presence changes only that placeholder line, never the pruning decisions).
     """
 
-    def __init__(self, keep_images: int = 2, keep_marks: int = 2) -> None:
+    def __init__(
+        self, keep_images: int = 2, keep_marks: int = 2, fold_hint: str = ""
+    ) -> None:
         # Never fully strip context: at least the newest bearer is retained.
         self.keep_images = max(1, int(keep_images))
         self.keep_marks = max(1, int(keep_marks))
+        self.fold_hint = str(fold_hint or "")
 
     def _prune_images(self, messages: list[Any]) -> list[Any]:
         image_indices = [
@@ -182,7 +197,7 @@ class ContextPrunerService:
         fold_indices = obs_indices[: -self.keep_marks]
         modified: list[Any] = []
         for idx in fold_indices:
-            if _fold_message_marks(messages[idx]):
+            if _fold_message_marks(messages[idx], self.fold_hint):
                 modified.append(messages[idx])
         return modified
 
@@ -235,13 +250,14 @@ class ContextPruningMiddleware(AgentMiddleware):
         keep_images: int = 2,
         keep_marks: int = 2,
         pruner: ContextPrunerService | None = None,
+        fold_hint: str = "",
     ) -> None:
         super().__init__()
         if pruner is not None:
             self._pruner = pruner
         else:
             self._pruner = ContextPrunerService(
-                keep_images=keep_images, keep_marks=keep_marks
+                keep_images=keep_images, keep_marks=keep_marks, fold_hint=fold_hint
             )
         self.keep_images = self._pruner.keep_images
         self.keep_marks = self._pruner.keep_marks
@@ -269,9 +285,13 @@ def build_context_pruning_middleware(
     keep_images: int = 2,
     keep_marks: int = 2,
     pruner: ContextPrunerService | None = None,
+    fold_hint: str = "",
 ) -> ContextPruningMiddleware:
     return ContextPruningMiddleware(
-        keep_images=keep_images, keep_marks=keep_marks, pruner=pruner
+        keep_images=keep_images,
+        keep_marks=keep_marks,
+        pruner=pruner,
+        fold_hint=fold_hint,
     )
 
 

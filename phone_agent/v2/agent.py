@@ -913,6 +913,29 @@ class ThinPhoneAgent:
                 placement="system_message",
             )
 
+        def obs_archive_factory():
+            """Build this run's text-only observation archive (fail-open).
+
+            Returns ``None`` unless ``PHONE_AGENT_OBS_ARCHIVE=on``; a build
+            failure records a trace-only diagnostic and degrades to off so the
+            optional archive can never block bring-up.
+            """
+
+            if not native_tool_assembly:
+                return None
+            try:
+                from phone_agent.v2.obs_archive import build_obs_archive
+
+                return build_obs_archive(config, self.run_id)
+            except Exception as exc:  # noqa: BLE001 - optional plane is fail-open
+                record = getattr(self._trace, "record_event", None)
+                if callable(record):
+                    try:
+                        record("obs_archive_error", error=type(exc).__name__)
+                    except Exception:  # noqa: BLE001 - diagnostics are observe-only
+                        return None
+                return None
+
         for name, value in {
             "event_bus": self.event_bus,
             "session": self.session,
@@ -926,6 +949,7 @@ class ThinPhoneAgent:
             "finish_verify_tool_factory": finish_verify_tool_factory,
             "deliverable_tools_factory": deliverable_tools_factory,
             "deliverable_prompt_provider": deliverable_prompt_provider,
+            "obs_archive_factory": obs_archive_factory,
             "app_kb_run_start": self._app_kb_run_start,
             "app_kb_prompt_provider": self._app_kb_prompt_block,
             "dream_run_end": self._dream_run_end,
