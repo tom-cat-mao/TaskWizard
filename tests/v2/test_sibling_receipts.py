@@ -33,9 +33,9 @@ from pydantic import Field
 
 from phone_agent.v2.agent import (
     _ExecutionAdmissionListener,
+    _non_final_observation_sibling,
     _SiblingReceiptListener,
     _ToolExecuteBridgeMiddleware,
-    _non_final_observation_sibling,
 )
 from phone_agent.v2.events import TOOL_EXECUTE, EventBus
 from phone_agent.v2.middleware.images import ContextPrunerService
