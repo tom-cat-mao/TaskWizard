@@ -144,7 +144,7 @@ prepare/usage 支持对象，缓存参数白名单见[模型提供方与路由](
 
 ## 装配契约 {#capability-mount}
 
-`phone_agent/v2/capabilities.py` 是唯一装配器：十一个内建能力（providers、taskdoc、safety、budget、compact、finish_verify、deliverable、app_kb、dream、experience、recall）经五条接缝挂载——`register_middleware`、`register_tool`、`add_prompt_block`、`add_run_hook`、`add_cli_command`；`register_service` 是第六接缝，把能力服务发布进 harness 服务命名空间。内建策略全部是事件总线监听器，因此策略顺序由注册顺序决定。
+`phone_agent/v2/capabilities.py` 是唯一装配器：十二个内建能力（providers、taskdoc、safety、budget、compact、finish_verify、deliverable、app_kb、dream、experience、recall、obs_archive）经五条接缝挂载——`register_middleware`、`register_tool`、`add_prompt_block`、`add_run_hook`、`add_cli_command`；`register_service` 是第六接缝，把能力服务发布进 harness 服务命名空间。内建策略全部是事件总线监听器，因此策略顺序由注册顺序决定。
 
 - **core 监听器顺序**：见上表；插件在能力链之后注册，因此插件的 `tool/execute` 监听器排在 safety 之内；
 - **归属与释放**：`ctx.on` / `ctx.on_dispose` 把订阅与清理绑定到当前 capability。`release` 先反序跑清理回调，再摘除该能力注册的中间件、工具、提示块、run hooks、CLI 命令与服务；正常模式变更在该 release 之后仍会 apply 新能力，只有在清理报错时才不再替换<!-- allow:不再 -->；

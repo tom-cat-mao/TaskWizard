@@ -223,6 +223,14 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | `PHONE_AGENT_LESSON_INJECT_TOKENS` | int | `800` | 注入内容的 token 上限 |
 | `PHONE_AGENT_FOREGROUND_EVENT_BLOCKED_PACKAGES` | csv | 空 | app/launched 进场注入的前台包过滤补充名单；叠加内建系统包名单 |
 
+### 观测存档与召回
+
+| 变量 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `PHONE_AGENT_OBS_ARCHIVE` | `off`/`on` | `off` | 观测存档能力：把每次提交成功观测的 `[OBS]` 文本（纯文本，无截图/base64）存到本地并挂载只读 `recall_screen` / `search_screens`；见[观测存档与召回](architecture.md#obs-archive) |
+| `PHONE_AGENT_OBS_ARCHIVE_DIR` | path | `memory/obs_archive` | 存档根目录；每 run 一个 `<run_id>.jsonl`（追加式真相）与可重建的 `<run_id>.db`（FTS5 索引） |
+| `PHONE_AGENT_OBS_ARCHIVE_KEEP_RUNS` | int | `20` | 保留的 run 数上限（≥ 1）；更老的 jsonl 与其索引在下次写入时删除 |
+
 ## 任务板与记录
 
 | 变量 | 类型 | 默认值 | 说明 |

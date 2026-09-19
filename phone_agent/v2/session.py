@@ -285,6 +285,12 @@ class PhoneSession:
         # Event bus for observe-only lifecycle notifications. Wired by the agent
         # after construction; absent in duck-typed test doubles.
         self.event_bus: EventBus | None = None
+        # Optional capability-installed observation sink (obs_archive): called by
+        # ``_commit_observation`` for every committed successful observation with
+        # ``(session, observation, foreground_package)``. The sink is fail-open
+        # and observe-only — it may never raise into the observation path and
+        # never receives screenshot bytes. Absent on duck-typed test doubles.
+        self.obs_archive_sink: Any | None = None
         # App-KB is an optional enhancement. Keep stable public slots but defer
         # imports and filesystem creation until sync or prompt lookup needs it.
         self.app_store: "AppKnowledgeStore | None" = None
@@ -837,6 +843,11 @@ class PhoneSession:
         it is never a batch — ``epoch``, ``screen_seq`` and display geometry stay
         frozen while ``marks`` are invalidated. A protected-screen failure
         (``secure_screenshot_blocked``) retains no frame.
+
+        A capability-installed ``obs_archive_sink`` (see the attribute doc in
+        ``__init__``) additionally receives every *committed* observation
+        (text-only archive; failed/reference-frame outcomes are never archived).
+        The sink is fail-open and cannot affect commit semantics.
         """
 
         # Even a failed observation supersedes the evidence underlying a
@@ -957,6 +968,18 @@ class PhoneSession:
                     },
                 )
             except Exception:  # noqa: BLE001 - event bus must never alter observation semantics
+                pass
+        # Optional obs-archive sink (capability-installed, fail-open): it receives
+        # the committed observation + foreground package and stores the
+        # model-facing [OBS] text (text only) for later recall. A sink failure can
+        # never invalidate the batch or change what the model sees.
+        sink = getattr(self, "obs_archive_sink", None)
+        if sink is not None:
+            try:
+                sink.on_committed_observation(
+                    self, observation, self._package_of(foreground)
+                )
+            except Exception:  # noqa: BLE001, S110 - archive is an observe-only side plane
                 pass
         # WP-WF4-A (scheme C): a foreground-package change visible in the
         # committed frame announces ``app/launched`` (source="foreground") —

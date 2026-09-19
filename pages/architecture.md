@@ -128,11 +128,23 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 | 图片剪除 | 最新 `PHONE_AGENT_IMAGE_KEEP`（默认 2）条含图消息的图片块 | `[screen#<n> 已剪除]` 文本占位 |
 | OBS marks 折叠 | 最新 `PHONE_AGENT_OBS_MARKS_KEEP`（默认 2）条观测的完整 `marks (K):` 摘要 | 一行 `[OBS] app=X screen#N [marks 已折叠:K]` 占位 |
 
-两趟都按“含图消息”/“含 marks 的观测”逐条计数，而不是按图片块计数；两个上限都钳到至少 1。占位符不带图片块、折叠行不带 `marks (` 标记，因此重跑不会再次改写已经处理过的历史（滚动窗口之外的稳定前缀不变）。
+两趟都按“含图消息”/“含 marks 的观测”逐条计数，而不是按图片块计数；两个上限都钳到至少 1。占位符不带图片块、折叠行不带 `marks (` 标记，因此重跑不会再次改写已经处理过的历史（滚动窗口之外的稳定前缀不变）。观测存档能力开启时，折叠占位会追加 `[可 recall_screen]` 后缀（[观测存档与召回](#obs-archive)）；能力关闭时占位文本逐字节保持本节口径。
 
 工具成功通常回传新截图；没有截图载荷时（安全保护屏、观测窗口最终失败且无有效截图、`locate` 无暂存帧）只回文本。
 
 **原生签名冲突**：若本会被剪除/折叠的块带原生重放元数据（签名、加密状态等，含标准 text/image 块嵌套 `extras` 内的键），micro 在修改任何消息**之前**全量预检，并以 `native_context_pruning_conflict` 明确失败——不丢签名、不搬签名、也不为签名多留旧图。同一消息里其它块的签名不阻止无签名旧块被清理。compact 开启时该 micro 随压缩一起跑；`PHONE_AGENT_COMPACT=off` 时仍有专用监听器执行同样的清理。
+
+## 观测存档与召回 {#obs-archive}
+
+`PHONE_AGENT_OBS_ARCHIVE=on`（默认 `off`）时，harness 把每次**提交成功**的观测的模型可见 `[OBS]` 文本原样存档到 `PHONE_AGENT_OBS_ARCHIVE_DIR`（默认 `memory/obs_archive`）：每个 run 一个 `<run_id>.jsonl` 追加式真相，外加一个可重建的 SQLite FTS5 索引 `<run_id>.db`（派生态，缺失、损坏或被外部追加时从 jsonl 重建）。每条记录带 `run_id`、`epoch`、`screen_seq`、前台包名与时间戳。
+
+- **纯文本**：截图与 base64 永不进入存档（与 [trace](#trace-redaction) 同一隐私边界，但存档与 trace 是两套落盘面）；
+- 观测失败（含未验证参考图）不存档；生产者仍是唯一的 `session.observe()`（[原子观测](#atomic-observation)），存档只是它的一个 fail-open 接收端，不新增观测路径；
+- 只挂两个只读工具：`recall_screen(screen_seq, offset, limit)` 按行分页回看某一帧，`search_screens(query, limit)` 在本 run 存档里做 FTS 检索、给出命中帧号与短摘要；
+- **召回不能绕过 marks-first**：回执里的历史 mark id 一律渲染为 `历史:ax_3@e12（已失效）`，工具说明与回执都明示这是历史证据、不能作为执行目标；要操作当前屏幕必须重新 `read_screen`（[mark 寻址](#marks-first)）；
+- 存档、索引与召回的任何失败都不影响 run：写入侧 fail-open（错误只进 trace 诊断），读取侧返回诚实的错误文本；
+- 保留最近 `PHONE_AGENT_OBS_ARCHIVE_KEEP_RUNS`（默认 20）个 run，更老的 jsonl 与其索引一并删除；
+- 存档是本机私有数据（默认目录在已忽略的 `memory/` 下），不投影到 Web 控制台，也不进 trace 正文。
 
 ## 工具回执与失败语义 {#tool-fail-closed}
 

@@ -266,6 +266,15 @@ class V2Config:
     # Starting point calibrated above the observed noise tail; deployment-tunable.
     recall_min_score: float = 0.50
     recall_decay_lambda: float = 0.02
+    # Text-only observation archive + rebuildable FTS5 recall (obs_archive
+    # capability). ``on`` stores the model-facing [OBS] text of every committed
+    # observation (never screenshots/base64) under obs_archive_dir/<run_id>.jsonl
+    # and mounts the read-only recall_screen / search_screens tools; ``off``
+    # (default) writes nothing and mounts nothing. Retention keeps the newest
+    # obs_archive_keep_runs runs (>= 1).
+    obs_archive: str = "off"
+    obs_archive_dir: str = "memory/obs_archive"
+    obs_archive_keep_runs: int = 20
     # loop
     max_model_calls: int = 100
     # HITL resume budget (S1 §3.3): outer-loop cap on human-in-the-loop resumes,
@@ -568,6 +577,13 @@ class V2Config:
             recall_decay_lambda=_env_float(
                 "PHONE_AGENT_RECALL_DECAY_LAMBDA", 0.02
             ),
+            obs_archive=_env_choice(
+                "PHONE_AGENT_OBS_ARCHIVE", "off", ("off", "on")
+            ),
+            obs_archive_dir=_env_str(
+                "PHONE_AGENT_OBS_ARCHIVE_DIR", "memory/obs_archive"
+            ),
+            obs_archive_keep_runs=_env_int("PHONE_AGENT_OBS_ARCHIVE_KEEP_RUNS", 20),
             max_model_calls=_env_int("PHONE_AGENT_MAX_STEPS", 100),
             max_hitl_resumes=_env_int("PHONE_AGENT_MAX_HITL_RESUMES", 20),
             budget_warn_ratio=_env_float("PHONE_AGENT_BUDGET_WARN_RATIO", 0.8),
@@ -756,6 +772,11 @@ class V2Config:
             raise ValueError("PHONE_AGENT_RECALL_MIN_SCORE must be between 0 and 1")
         if config.recall_decay_lambda < 0.0:
             raise ValueError("PHONE_AGENT_RECALL_DECAY_LAMBDA must be non-negative")
+        if config.obs_archive_keep_runs < 1:
+            raise ValueError(
+                "PHONE_AGENT_OBS_ARCHIVE_KEEP_RUNS must be positive "
+                "(a zero/negative value would delete the archive it writes)"
+            )
         if not config.alias_overwrite_notes:
             raise ValueError("PHONE_AGENT_ALIAS_OVERWRITE_NOTES must not be empty")
 
