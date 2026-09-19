@@ -99,7 +99,7 @@ Web 进程没有插件加载路径，决定是否激活的是 runner 装配阶�
 
 | 事件 | 类型 | 返回契约 |
 |---|---|---|
-| `run/start` / `run/end` / `observe` / `app/launched` / `model/post_request` / `agent/after` | emit | 忽略 |
+| `run/start` / `run/end` / `observe` / `app/launched` / `taskdoc/completed` / `model/post_request` / `agent/after` | emit | 忽略 |
 | `tool/pre_execute` | 洋葱 | 与 `tool/execute` 同形；已定义、保留并导出，当前没有生产代码 emit |
 | `tool/execute` | 洋葱 | `next(request)` 的结果，或返回 `REJECT` 短路（桥转成"已拦截"ToolMessage） |
 | `model/pre_request` | 洋葱 | 返回变换后的完整消息列表；插件**不得**返回 `RemoveMessage`，也不要用 `jump_to` 做流程控制。桥接器对历史形态（含 `jump_to:"end"` 的 dict）保持宽容兼容，`JUMP_END` 是 core 熔断用的哨兵——兼容不等于推荐用法 |
@@ -108,11 +108,14 @@ Web 进程没有插件加载路径，决定是否激活的是 runner 装配阶�
 `app/launched` payload 为 `{"package", "device_id", "source"}`：`source` 取 `launch_app`（设备确认的启动成功）或
 `foreground`（已提交观测里前台包变化到尚未播报的包，系统包不播报），每 run 每包至多发一次。
 
+`taskdoc/completed` payload 为 `{"item_ids", "screen_seq", "epoch"}`：一次提交的路线项
+`in_progress → completed` 迁移即发一次，fail-open，不改变工具回执。
+
 内建嵌套顺序（插件监听器装配期注册，居于 core 之内）：
 
 ```
 tool/execute:       trace → diagnostic → admission → control_hitl → budget → safety（最内）
-model/pre_request:  compact → taskdoc → budget → procedure → diagnostic → model_limit
+model/pre_request:  compact → taskdoc → budget → boundary_compact → procedure → diagnostic → model_limit
 model/request:      trace → diagnostic → budget（最内）
 ```
 
@@ -144,7 +147,7 @@ prepare/usage 支持对象，缓存参数白名单见[模型提供方与路由](
 
 ## 装配契约 {#capability-mount}
 
-`phone_agent/v2/capabilities.py` 是唯一装配器：十二个内建能力（providers、taskdoc、safety、budget、compact、finish_verify、deliverable、app_kb、dream、experience、recall、obs_archive）经五条接缝挂载——`register_middleware`、`register_tool`、`add_prompt_block`、`add_run_hook`、`add_cli_command`；`register_service` 是第六接缝，把能力服务发布进 harness 服务命名空间。内建策略全部是事件总线监听器，因此策略顺序由注册顺序决定。
+`phone_agent/v2/capabilities.py` 是唯一装配器：十三个内建能力（providers、taskdoc、safety、budget、compact、boundary_compact、finish_verify、deliverable、app_kb、dream、experience、recall、obs_archive）经五条接缝挂载——`register_middleware`、`register_tool`、`add_prompt_block`、`add_run_hook`、`add_cli_command`；`register_service` 是第六接缝，把能力服务发布进 harness 服务命名空间。内建策略全部是事件总线监听器，因此策略顺序由注册顺序决定。
 
 - **core 监听器顺序**：见上表；插件在能力链之后注册，因此插件的 `tool/execute` 监听器排在 safety 之内；
 - **归属与释放**：`ctx.on` / `ctx.on_dispose` 把订阅与清理绑定到当前 capability。`release` 先反序跑清理回调，再摘除该能力注册的中间件、工具、提示块、run hooks、CLI 命令与服务；正常模式变更在该 release 之后仍会 apply 新能力，只有在清理报错时才不再替换<!-- allow:不再 -->；

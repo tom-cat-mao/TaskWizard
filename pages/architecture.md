@@ -169,6 +169,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 - `[TASK_DOC]` 块每轮 pin 进上下文（作为 pinned 系统消息，带固定 id 去重替换），压缩时归入保护组、不参与折叠；
 - 有 open 路线项（`pending` / `in_progress`）时 `finish` fail-closed，回执列出未完成项并要求先完成、标 `blocked`（带原因）或修正路线；
 - 迁移规则：`pending` → `completed` 必须经 `in_progress`；单次提交把 ≥2 条 `pending` 直接标 `completed`（批量补标）被拒；新 id 直接以 `completed` 引入被拒；先前的 `pending` id 从板上消失被拒（只能迁移）；
+- 一次提交的 `in_progress → completed` 迁移同时是上下文折叠的**边界信号**：`update_task_doc` 提交后发 `taskdoc/completed`（fail-open，不影响回执），`boundary_compact` 能力据此判断是否把刚完成的这段折成交接摘要。计划由模型拥有，是否改写的决定由 harness 机械做出——契约见[压缩契约](configuration.md#auto-compact)；
 
 | 结构上限（字符） | 值 |
 |---|---|

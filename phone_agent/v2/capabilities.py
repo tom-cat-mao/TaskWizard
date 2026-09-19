@@ -655,6 +655,19 @@ def _apply_compact(ctx: CapabilityAssemblyContext) -> None:
     ctx.register_service("compact_instance", compact)
 
 
+def _apply_boundary_compact(ctx: CapabilityAssemblyContext) -> None:
+    """Mount the route-boundary fold trigger on top of the compact instance.
+
+    Inert (registers nothing) when there is no compact instance to fold through or
+    no bus to observe; the mode itself is resolved by the registry, so ``shadow``
+    and ``on`` both mount here and differ only inside the listener.
+    """
+
+    from phone_agent.v2.middleware.boundary_compact import apply_boundary_compact
+
+    apply_boundary_compact(ctx)
+
+
 def _apply_finish_verify(ctx: CapabilityAssemblyContext) -> None:
     _register_factory(ctx, "finish_verify_tool_factory", "register_tool")
 
@@ -998,6 +1011,14 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
             "on" if getattr(config, "compact_enabled", True) else "off",
             apply=_owned_apply("compact", _apply_compact),
             release=_owned_release("compact"),
+        ),
+        CapabilitySpec(
+            "boundary_compact",
+            "Boundary-aware compact",
+            getattr(config, "boundary_compact_mode", "shadow"),
+            deps=("compact",),
+            apply=_owned_apply("boundary_compact", _apply_boundary_compact),
+            release=_owned_release("boundary_compact"),
         ),
         CapabilitySpec(
             "finish_verify",

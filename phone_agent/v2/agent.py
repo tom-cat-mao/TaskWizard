@@ -1095,8 +1095,10 @@ class ThinPhoneAgent:
 
         ``model/pre_request`` (final order, completed across both phases)
           compact (prepended by the compact capability — or the prune-only
-          listener below when compact is off) -> taskdoc -> budget -> diagnostic
-          -> model-call limiter.
+          listener below when compact is off) -> taskdoc -> budget ->
+          boundary_compact -> procedure -> diagnostic -> model-call limiter. The
+          boundary listener sits inside compact on purpose: it only asks for a
+          fold at a checkpoint where the capacity fold found nothing to do.
 
         ``agent/after``
           ``trace`` (writes ``run_end``) then ``diagnostic``.

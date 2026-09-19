@@ -32,6 +32,16 @@ Payload contracts for the plugin events:
     rules — alongside the run-start general card and the mention prefetch,
     all three sharing one per-package per-run delivered set.
 
+``TASKDOC_ITEM_COMPLETED`` / ``"taskdoc/completed"``
+    Observed with :meth:`EventBus.emit` when a committed ``update_task_doc``
+    write moved at least one route item ``in_progress`` -> ``completed`` (the
+    only legal completion path, so the transition is the harness's route-boundary
+    signal). Payload is ``{"item_ids": [<completed ids>], "screen_seq": <int>,
+    "epoch": <int>}`` — ``screen_seq``/``epoch`` are the session counters at the
+    moment of the write. Emission is fail-open: it can never turn a successful
+    board write into a tool failure. Consumed by the ``boundary_compact``
+    capability, which treats each boundary as a candidate place to fold history.
+
 ``TOOL_PRE_EXECUTE`` / ``"tool/pre_execute"``
     Applied with :meth:`EventBus.waterfall`. Payload is the tool-call object
     seen by middleware: tool ``name``, ``args``, and session-facing request
@@ -89,6 +99,7 @@ RUN_START = "run/start"
 RUN_END = "run/end"
 OBSERVE = "observe"
 APP_LAUNCHED = "app/launched"
+TASKDOC_ITEM_COMPLETED = "taskdoc/completed"
 TOOL_PRE_EXECUTE = "tool/pre_execute"
 MODEL_PRE_REQUEST = "model/pre_request"
 MODEL_REQUEST = "model/request"
@@ -103,6 +114,7 @@ _RESERVED_EVENTS = frozenset(
         RUN_END,
         OBSERVE,
         APP_LAUNCHED,
+        TASKDOC_ITEM_COMPLETED,
         TOOL_PRE_EXECUTE,
         MODEL_PRE_REQUEST,
         MODEL_REQUEST,
@@ -253,6 +265,7 @@ __all__ = [
     "REJECT",
     "RUN_END",
     "RUN_START",
+    "TASKDOC_ITEM_COMPLETED",
     "TOOL_EXECUTE",
     "TOOL_PRE_EXECUTE",
     "WaterfallListener",
