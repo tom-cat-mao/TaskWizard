@@ -59,7 +59,7 @@ CI 门禁见 [.github/workflows/ci.yml](.github/workflows/ci.yml)：`lint` / `do
 | 16b | **Implicit App Alias** | unknown `launch_app` 失败回执里真实出现的包名才是 run 内证据；设备确认后才可写 `learned`。 | [#implicit-alias](pages/memory.md#implicit-alias) |
 | 16c | **Alias Correction** | dream 只对同 run 签名覆盖 `learned` 别名，绝不覆盖 `kind=user`。 | [#alias-correction](pages/memory.md#alias-correction) |
 | 17 | **Lesson Evolution** | 蒸馏/晋升写入保持离线；运行期只读 + 应急撤销；语义判断归模型自评，harness 只拒客观假话；撤销的 id 重提即降级。 | [#lesson-evolution](pages/evolution.md#lesson-evolution) |
-| 18 | **Capability Mount + Plugins** | 十一个能力经五接缝挂载（middleware / tool / prompt / hook / CLI，另有 `register_service`）；插件是外部代码，`plugin add` 即执行授权。 | [#capability-mount](pages/plugins.md#capability-mount)、[#plugin-authorization](pages/plugins.md#plugin-authorization) |
+| 18 | **Capability Mount + Plugins** | 十三个能力经五接缝挂载（middleware / tool / prompt / hook / CLI，另有 `register_service`）；插件是外部代码，`plugin add` 即执行授权。 | [#capability-mount](pages/plugins.md#capability-mount)、[#plugin-authorization](pages/plugins.md#plugin-authorization) |
 | 19 | **Run-bound Deliverable** | 模型只给 HTML、绝不给路径；目标固定 `<run_id>.html`；失败返回错误字符串且不改动旧文档。 | [#deliverable](pages/architecture.md#deliverable) |
 | 20 | **Typed App Name Resolution** | `v2/names.py` 唯一归属；弱证据永不单独 auto-resolve（`learned` 别名带成功计数除外）。 | [#app-name-resolution](pages/architecture.md#app-name-resolution) |
 | 21 | **Web Projection** | 控制台只是观察层，不拥有设备/工具/路由；被动读 App-KB 表不构造 store；只有终局事件推进状态。 | [#web-projection](pages/console.md#web-projection) |
@@ -76,9 +76,9 @@ CI 门禁见 [.github/workflows/ci.yml](.github/workflows/ci.yml)：`lint` / `do
 | 观测与设备状态 | `v2/session.py`（epoch/marks/参考图/locate）、`v2/{coords,locate_scope}.py`（相对→绝对换算唯一归属；scoped-locate 裁剪几何） |
 | 工具 | `v2/tools/`（感知、操作、TaskDoc、deliverable、finish、HITL） |
 | 事件总线与插件 | `v2/{events,plugins,pins}.py` |
-| 策略监听器 | `v2/middleware/`（safety、images、compact、budget、trace、procedure、taskdoc、context_request、context_admission、diagnostic、streaming） |
+| 策略监听器 | `v2/middleware/`（safety、images、compact、boundary_compact、budget、trace、procedure、taskdoc、context_request、context_admission、diagnostic、streaming） |
 | 任务/解析/验收 | `v2/{taskdoc,resolver,review,verify,names}.py` |
-| 经验与进化 | `v2/{experience,evolution,replay,recall}.py`（recall 是语义召回索引） |
+| 经验与进化 | `v2/{experience,evolution,replay,recall,obs_archive}.py`（recall 是语义召回索引；obs_archive 是观测存档） |
 | 模型与配置 | `v2/{model,config,prompts,usage,native_content}.py`、`v2/providers/` |
 | App 知识 | `v2/{appkb,dream}.py` |
 | Web runner | `v2/{runner,run_ipc,run_events}.py`、`phone_agent/web/` |

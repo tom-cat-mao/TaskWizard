@@ -266,6 +266,15 @@ class V2Config:
     # Starting point calibrated above the observed noise tail; deployment-tunable.
     recall_min_score: float = 0.50
     recall_decay_lambda: float = 0.02
+    # Text-only observation archive + rebuildable FTS5 recall (obs_archive
+    # capability). ``on`` stores the model-facing [OBS] text of every committed
+    # observation (never screenshots/base64) under obs_archive_dir/<run_id>.jsonl
+    # and mounts the read-only recall_screen / search_screens tools; ``off``
+    # (default) writes nothing and mounts nothing. Retention keeps the newest
+    # obs_archive_keep_runs runs (>= 1).
+    obs_archive: str = "off"
+    obs_archive_dir: str = "memory/obs_archive"
+    obs_archive_keep_runs: int = 20
     # loop
     max_model_calls: int = 100
     # HITL resume budget (S1 §3.3): outer-loop cap on human-in-the-loop resumes,
@@ -306,9 +315,36 @@ class V2Config:
     # ratio comparison so compaction fires before the real request overflows.
     compact_schema_reserve: int = 3000
     compact_output_reserve: int = 2000
+    # Boundary-aware online compact. The model owns the plan, so its own
+    # ``in_progress -> completed`` route transitions are the fold boundary; this
+    # capability only decides whether folding the finished span repays the summary
+    # call. ``shadow`` (default) computes and logs the decision with zero context
+    # change; ``on`` may request one fold per boundary through the same fold path
+    # the capacity trigger uses. Capacity-triggered T1/T2 stays the backstop.
+    boundary_compact_mode: str = "shadow"
+    # Conservative prior for steps-per-completed-item, used until enough
+    # completions make the run-local mean trustworthy.
+    boundary_compact_steps_per_item: int = 4
+    boundary_compact_sample_guard_items: int = 2
+    # Expected remaining steps below which a fold cannot pay for itself.
+    boundary_compact_min_horizon_steps: int = 2
+    # Smallest foldable span worth a summariser call.
+    boundary_compact_min_span_tokens: int = 1500
+    # benefit/cost must clear this factor, so only clearly net-positive folds act.
+    boundary_compact_min_net_ratio: float = 1.5
     # context hygiene (S1 §1.4/§2): rolling image + OBS-marks pruning windows
     image_keep: int = 2
     obs_marks_keep: int = 2
+    # Sibling receipts (work item D, presentation only). A multi-tool turn can
+    # hold several observation tools; a non-final one returns a compact text
+    # receipt (screen_seq + foreground + marks count + one-line structural diff)
+    # instead of a fresh screenshot + marks digest, because a later sibling's
+    # observe() re-mints the batch (P0 #2) and pushes the image out of the
+    # image-keep window unseen (P0 #3). Sampling is untouched: observe() still
+    # runs in full for every action (P0 #15) and the turn's final observation
+    # sibling keeps the full shape (P0 #5 keeps failure text as-is). ``off``
+    # restores the pre-change transcript byte-for-byte.
+    sibling_receipts_enabled: bool = True
     # grounding
     grounding_provider: str = "hybrid"
     accessibility_timeout: float = 3.0
@@ -568,6 +604,13 @@ class V2Config:
             recall_decay_lambda=_env_float(
                 "PHONE_AGENT_RECALL_DECAY_LAMBDA", 0.02
             ),
+            obs_archive=_env_choice(
+                "PHONE_AGENT_OBS_ARCHIVE", "off", ("off", "on")
+            ),
+            obs_archive_dir=_env_str(
+                "PHONE_AGENT_OBS_ARCHIVE_DIR", "memory/obs_archive"
+            ),
+            obs_archive_keep_runs=_env_int("PHONE_AGENT_OBS_ARCHIVE_KEEP_RUNS", 20),
             max_model_calls=_env_int("PHONE_AGENT_MAX_STEPS", 100),
             max_hitl_resumes=_env_int("PHONE_AGENT_MAX_HITL_RESUMES", 20),
             budget_warn_ratio=_env_float("PHONE_AGENT_BUDGET_WARN_RATIO", 0.8),
@@ -598,8 +641,30 @@ class V2Config:
             compact_output_reserve=_env_int(
                 "PHONE_AGENT_COMPACT_OUTPUT_RESERVE", 2000
             ),
+            boundary_compact_mode=_env_choice(
+                "PHONE_AGENT_BOUNDARY_COMPACT", "shadow", ("off", "shadow", "on")
+            ),
+            boundary_compact_steps_per_item=_env_int(
+                "PHONE_AGENT_BOUNDARY_COMPACT_STEPS_PER_ITEM", 4
+            ),
+            boundary_compact_sample_guard_items=_env_int(
+                "PHONE_AGENT_BOUNDARY_COMPACT_SAMPLE_GUARD_ITEMS", 2
+            ),
+            boundary_compact_min_horizon_steps=_env_int(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_HORIZON_STEPS", 2
+            ),
+            boundary_compact_min_span_tokens=_env_int(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_SPAN_TOKENS", 1500
+            ),
+            boundary_compact_min_net_ratio=_env_float(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_NET_RATIO", 1.5
+            ),
             image_keep=_env_int("PHONE_AGENT_IMAGE_KEEP", 2),
             obs_marks_keep=_env_int("PHONE_AGENT_OBS_MARKS_KEEP", 2),
+            sibling_receipts_enabled=(
+                _env_choice("PHONE_AGENT_SIBLING_RECEIPTS", "on", ("on", "off"))
+                == "on"
+            ),
             grounding_provider=_env_str("PHONE_AGENT_GROUNDING_PROVIDER", "hybrid"),
             accessibility_timeout=_env_float("PHONE_AGENT_ACCESSIBILITY_TIMEOUT", 3.0),
             accessibility_max_marks=_env_int("PHONE_AGENT_ACCESSIBILITY_MAX_MARKS", 80),
@@ -756,6 +821,11 @@ class V2Config:
             raise ValueError("PHONE_AGENT_RECALL_MIN_SCORE must be between 0 and 1")
         if config.recall_decay_lambda < 0.0:
             raise ValueError("PHONE_AGENT_RECALL_DECAY_LAMBDA must be non-negative")
+        if config.obs_archive_keep_runs < 1:
+            raise ValueError(
+                "PHONE_AGENT_OBS_ARCHIVE_KEEP_RUNS must be positive "
+                "(a zero/negative value would delete the archive it writes)"
+            )
         if not config.alias_overwrite_notes:
             raise ValueError("PHONE_AGENT_ALIAS_OVERWRITE_NOTES must not be empty")
 
@@ -769,4 +839,24 @@ class V2Config:
             raise ValueError("PHONE_AGENT_COMPACT_MIN_REDUCTION_TOKENS must be non-negative")
         if not 0.0 <= config.compact_min_reduction_ratio < 1.0:
             raise ValueError("PHONE_AGENT_COMPACT_MIN_REDUCTION_RATIO must be between 0 (inclusive) and 1 (exclusive)")
+        if config.boundary_compact_steps_per_item <= 0:
+            raise ValueError(
+                "PHONE_AGENT_BOUNDARY_COMPACT_STEPS_PER_ITEM must be positive"
+            )
+        if config.boundary_compact_sample_guard_items <= 0:
+            raise ValueError(
+                "PHONE_AGENT_BOUNDARY_COMPACT_SAMPLE_GUARD_ITEMS must be positive"
+            )
+        if config.boundary_compact_min_horizon_steps < 0:
+            raise ValueError(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_HORIZON_STEPS must be non-negative"
+            )
+        if config.boundary_compact_min_span_tokens < 0:
+            raise ValueError(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_SPAN_TOKENS must be non-negative"
+            )
+        if config.boundary_compact_min_net_ratio < 0:
+            raise ValueError(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_NET_RATIO must be non-negative"
+            )
         return config

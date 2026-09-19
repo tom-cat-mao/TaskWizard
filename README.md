@@ -66,6 +66,8 @@ cp .env.example .env
 | 成本控制 | token 阈值与一次有效 finish 确认续办；独立 32k 软工作目标与有界成组压缩 | [配置参考](https://tom-cat-mao.github.io/TaskWizard/configuration/) |
 | 应用记忆 | App-KB 别名与启动事实；隐式纠正、dream 整理、用户纠正入口 | [记忆](https://tom-cat-mao.github.io/TaskWizard/memory/) |
 | 经验与回注 | episode 档案（固定 schema、隐私白名单）+ 离线蒸馏自判分级 + `MEMORY_RAG=on` 受控注入 | [记忆](https://tom-cat-mao.github.io/TaskWizard/memory/) · [自进化](https://tom-cat-mao.github.io/TaskWizard/evolution/) |
+| 观测存档（可选） | `PHONE_AGENT_OBS_ARCHIVE=on` 把每次提交观测的 `[OBS]` 文本本地存档（纯文本、无截图），并提供只读 `recall_screen` / `search_screens`；历史 mark 永久失效 | [架构](https://tom-cat-mao.github.io/TaskWizard/architecture/) |
+| 同轮中间步骤回执 | 一轮多个连续动作时，非最后的观测 sibling 只回文本回执（screen_seq/前台包/marks 计数/一行结构差异），最后一个观测照旧带全图；采样与安全语义不变，`PHONE_AGENT_SIBLING_RECEIPTS=off` 可关 | [架构](https://tom-cat-mao.github.io/TaskWizard/architecture/) |
 | 产出物 | `write_document` / `update_document` 写成本 run 的单页 HTML | [Web 控制台](https://tom-cat-mao.github.io/TaskWizard/console/) |
 | 模型提供方 | 默认零配置走 `.env` 网关；多提供方用单层 `models.json` + 角色 `provider:model` 路由；可选 `PHONE_AGENT_FALLBACK_MODEL` 在首选构建/调用失败时降级一次并写审计；可选 `PHONE_AGENT_STREAMING` 让模型流式接收并聚合完整消息（headless/各角色/控制台一致，控制台另可增量观察正文） | [配置参考](https://tom-cat-mao.github.io/TaskWizard/configuration/) |
 | 插件系统 | 策略层全事件化；插件经 entry points 或 `plugin add` 挂入同一装配层 | [插件开发](https://tom-cat-mao.github.io/TaskWizard/plugins/) |

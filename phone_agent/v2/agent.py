@@ -218,6 +218,109 @@ class _ExecutionAdmissionListener:
             return result
 
 
+def _current_batch_position(request: Any) -> tuple[list[str], int] | None:
+    """Return ``(sibling tool names, index of this call)`` for the current turn.
+
+    LangGraph's ``ToolNode`` executes every ``tool_calls`` entry of one AI
+    message as one batch and hands each call the *same* pre-batch state, so the
+    batch composition and this call's position in it are readable from the
+    state's last message carrying the call id. Fail-open: an unreadable state
+    (Send payload without a state channel, duck-typed request, call id not
+    found) returns ``None`` and the caller keeps today's behavior.
+    """
+
+    tool_call = getattr(request, "tool_call", None) or {}
+    if isinstance(tool_call, dict):
+        call_id = str(tool_call.get("id") or "")
+    else:
+        call_id = str(getattr(tool_call, "id", "") or "")
+    if not call_id:
+        return None
+    state = getattr(request, "state", None)
+    messages = (
+        state.get("messages")
+        if isinstance(state, dict)
+        else getattr(state, "messages", None)
+    )
+    if not messages:
+        return None
+    for message in reversed(list(messages)):
+        calls = getattr(message, "tool_calls", None)
+        if calls is None and isinstance(message, dict):
+            calls = message.get("tool_calls")
+        if not calls:
+            continue
+        ids: list[str] = []
+        names: list[str] = []
+        for call in calls:
+            if isinstance(call, dict):
+                ids.append(str(call.get("id") or ""))
+                names.append(str(call.get("name") or ""))
+            else:
+                ids.append(str(getattr(call, "id", "") or ""))
+                names.append(str(getattr(call, "name", "") or ""))
+        if call_id in ids:
+            return names, ids.index(call_id)
+    return None
+
+
+def _non_final_observation_sibling(request: Any) -> bool:
+    """Whether this call attaches an observation that a later sibling supersedes.
+
+    True for an observation tool (``tools/_obs.py::OBSERVATION_TOOLS``) that is
+    followed by another observation tool in the same batch — exactly the case
+    whose fresh screenshot + marks the next ``observe()`` re-mints out from under
+    it (P0 #2) and the image-keep window then prunes unseen (P0 #3). A final
+    observation sibling, a single-action turn, a trailing TaskDoc/finish/
+    deliverable call and every unreadable state keep the full observation.
+    """
+
+    from phone_agent.v2.tools._obs import OBSERVATION_TOOLS
+
+    parsed = _current_batch_position(request)
+    if parsed is None:
+        return False
+    names, index = parsed
+    if names[index] not in OBSERVATION_TOOLS:
+        return False
+    return any(name in OBSERVATION_TOOLS for name in names[index + 1 :])
+
+
+class _SiblingReceiptListener:
+    """Presentation fence: hint a non-final observation sibling's tool body.
+
+    ``PHONE_AGENT_SIBLING_RECEIPTS`` (default ``on``) only affects what the tool
+    result *presents*: the hint makes ``tools/_obs.py::auto_observation`` render
+    a compact text receipt instead of a fresh screenshot + marks digest for that
+    one sibling. Sampling is untouched — ``session.observe()`` still runs in full
+    for every action (P0 #15) — and a failed observation keeps its explicit
+    failure text (P0 #5). ``off`` short-circuits before the batch is read, so no
+    hint is ever set and the transcript is byte-identical to the pre-change
+    shape.
+
+    Registered innermost on ``tool/execute``: it sees only calls that will really
+    execute (a rejection or a terminal skip short-circuits outside it) and clears
+    the hint in ``finally`` so a raising terminal never leaks it to the next
+    sibling.
+    """
+
+    def __init__(self, session: Any, *, enabled: bool = True) -> None:
+        self._session = session
+        self.enabled = bool(enabled)
+        from phone_agent.v2.tools._obs import set_sibling_receipt_hint
+
+        self._set_hint = set_sibling_receipt_hint
+
+    def __call__(self, request: Any, next: Callable[[Any], Any]) -> Any:
+        if not self.enabled or not _non_final_observation_sibling(request):
+            return next(request)
+        self._set_hint(self._session, True)
+        try:
+            return next(request)
+        finally:
+            self._set_hint(self._session, False)
+
+
 class _ModelPreRequestBridgeMiddleware(AgentMiddleware):
     """Bridge ``model/pre_request`` event listeners into the middleware stack.
 
@@ -913,6 +1016,29 @@ class ThinPhoneAgent:
                 placement="system_message",
             )
 
+        def obs_archive_factory():
+            """Build this run's text-only observation archive (fail-open).
+
+            Returns ``None`` unless ``PHONE_AGENT_OBS_ARCHIVE=on``; a build
+            failure records a trace-only diagnostic and degrades to off so the
+            optional archive can never block bring-up.
+            """
+
+            if not native_tool_assembly:
+                return None
+            try:
+                from phone_agent.v2.obs_archive import build_obs_archive
+
+                return build_obs_archive(config, self.run_id)
+            except Exception as exc:  # noqa: BLE001 - optional plane is fail-open
+                record = getattr(self._trace, "record_event", None)
+                if callable(record):
+                    try:
+                        record("obs_archive_error", error=type(exc).__name__)
+                    except Exception:  # noqa: BLE001 - diagnostics are observe-only
+                        return None
+                return None
+
         for name, value in {
             "event_bus": self.event_bus,
             "session": self.session,
@@ -926,6 +1052,7 @@ class ThinPhoneAgent:
             "finish_verify_tool_factory": finish_verify_tool_factory,
             "deliverable_tools_factory": deliverable_tools_factory,
             "deliverable_prompt_provider": deliverable_prompt_provider,
+            "obs_archive_factory": obs_archive_factory,
             "app_kb_run_start": self._app_kb_run_start,
             "app_kb_prompt_provider": self._app_kb_prompt_block,
             "dream_run_end": self._dream_run_end,
@@ -986,6 +1113,12 @@ class ThinPhoneAgent:
         self.evidence_path = getattr(self._diagnostic, "evidence_path", None)
 
         self._execution_admission = _ExecutionAdmissionListener(self.session)
+        # Work item D: presentation-only receipts for non-final observation
+        # siblings. ``off`` keeps the listener inert (no batch read, no hint).
+        self._sibling_receipts = _SiblingReceiptListener(
+            self.session,
+            enabled=bool(getattr(config, "sibling_receipts_enabled", True)),
+        )
         extra_observers = list(extra_middleware or [])
         self._capability_ctx.register_core_middleware(
             _ToolExecuteBridgeMiddleware(self.event_bus),
@@ -1071,8 +1204,10 @@ class ThinPhoneAgent:
 
         ``model/pre_request`` (final order, completed across both phases)
           compact (prepended by the compact capability — or the prune-only
-          listener below when compact is off) -> taskdoc -> budget -> diagnostic
-          -> model-call limiter.
+          listener below when compact is off) -> taskdoc -> budget ->
+          boundary_compact -> procedure -> diagnostic -> model-call limiter. The
+          boundary listener sits inside compact on purpose: it only asks for a
+          fold at a checkpoint where the capacity fold found nothing to do.
 
         ``agent/after``
           ``trace`` (writes ``run_end``) then ``diagnostic``.
@@ -1104,7 +1239,12 @@ class ThinPhoneAgent:
 
         Registered after static capability assembly and prepended in reverse,
         the final order is trace, diagnostic, admission, control HITL, then the
-        original capability chain. Capability-local ordering remains unchanged.
+        original capability chain.
+
+        ``_sibling_receipts`` is appended *without* ``prepend`` on purpose: it
+        must be the innermost listener, i.e. run only when the call will really
+        reach the tool terminal (a rejection or a terminal skip never sets the
+        one-shot hint), with the terminal itself as its ``next``.
         """
 
         self.event_bus.on(TOOL_EXECUTE, self._control_hitl, prepend=True)
@@ -1114,6 +1254,7 @@ class ThinPhoneAgent:
                 TOOL_EXECUTE, self._diagnostic.on_tool_execute, prepend=True
             )
         self.event_bus.on(TOOL_EXECUTE, self._trace.on_tool_execute, prepend=True)
+        self.event_bus.on(TOOL_EXECUTE, self._sibling_receipts)
 
     def _register_event_chain_post_assembly(self) -> None:
         """Register the core listeners that must sit INSIDE the capabilities.

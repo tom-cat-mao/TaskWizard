@@ -18,6 +18,21 @@ explicitly earlier/unverified reference image (``reference``/``screen_ref``
 metadata, never a fresh batch); with no valid frame it degrades to a single
 text block. An actuation success is never lost to an observation hiccup and no
 fake image is ever emitted.
+
+**Sibling receipts (work item D, presentation only).** A model turn can hold
+several observation tools (``OBSERVATION_TOOLS``); the admission fence
+(``v2/agent.py``) sets ``session.sibling_receipt_pending`` around a sibling
+whose batch is *not* the turn's last one, and the success path below then
+renders a compact text receipt — action echo stays in the preceding ``OK.``
+block, the receipt adds ``screen_seq``/foreground/marks count plus a cheap
+structural diff against the previous observation. No image block and no marks
+digest are attached because a later sibling's ``observe()`` re-mints the batch
+anyway (P0 #2/#15), so the picture could never be addressed and the keep window
+(``PHONE_AGENT_IMAGE_KEEP``) would prune it unseen (P0 #3). Sampling is
+untouched: ``session.observe()`` still runs in full, and an observation failure
+keeps its existing explicit failure text — a failed observation is never
+downgraded into a receipt (P0 #5). ``PHONE_AGENT_SIBLING_RECEIPTS=off`` never
+sets the hint, which restores the image+digest shape byte-for-byte.
 """
 
 from __future__ import annotations
@@ -181,6 +196,153 @@ _REFERENCE_NOTE = (
     "当前画面未验证，不是当前可操作的标记批次，不能据它使用 mark 或坐标。"
 )
 
+# --- sibling receipts (work item D, presentation only) -----------------------
+#
+# The admission fence sets ``session.sibling_receipt_pending`` around a
+# non-final observation sibling's tool body; the success path of
+# :func:`auto_observation` reads it here. Both names are duck-typed session
+# attributes: a session double without them simply never gets a receipt.
+SIBLING_RECEIPT_HINT = "sibling_receipt_pending"
+_FRAME_SUMMARY_ATTR = "_obs_frame_summary"
+
+OBSERVATION_TOOLS = frozenset(
+    {
+        "tap",
+        "long_press",
+        "type_text",
+        "scroll",
+        "swipe",
+        "back",
+        "home",
+        "wait",
+        "launch_app",
+        "read_screen",
+    }
+)
+"""Tool names whose success path attaches a fresh atomic observation.
+
+Every one of them funnels through :func:`auto_observation`. ``locate`` is
+deliberately absent (it ships the same-frame locate image, never a fresh batch)
+and so are the TaskDoc / finish / deliverable / control tools (no observation
+at all): a sibling outside this set neither receives a receipt nor counts as
+the "another execution tool" that gives the previous one one.
+"""
+
+_SIBLING_RECEIPT_NOTE = (
+    "同轮中间步骤回执：本步观测已提交，不附截图与 marks 摘要；"
+    "观测批次已推进（此前 mark id 失效），需要 target_mark_id 寻址时先 read_screen。"
+)
+
+
+def set_sibling_receipt_hint(session, pending: bool) -> None:
+    """Set/clear the phrase-2 presentation hint on a (possibly duck-typed) session.
+
+    Best-effort: a session double that rejects attribute writes must never break
+    a tool call — the receipt is presentation sugar, not execution semantics.
+    """
+
+    try:
+        setattr(session, SIBLING_RECEIPT_HINT, bool(pending))
+    except Exception:  # noqa: BLE001 - presentation hint only, never block a tool
+        return
+
+
+def sibling_receipt_requested(session) -> bool:
+    """Return whether the current tool body is a non-final observation sibling."""
+
+    return bool(getattr(session, SIBLING_RECEIPT_HINT, False))
+
+
+def _frame_summary(obs) -> dict[str, Any]:
+    """Cheap structural fingerprint of one committed observation (counts only).
+
+    No pixels, no mark ids, no device IO — just what the receipt's one-line
+    diff needs. ``windows`` stays ``None`` when the frame carries no window
+    sidecar (legacy flat dump / test double), so the diff never invents one.
+    """
+
+    marks = getattr(obs, "marks", None)
+    if marks is None or not hasattr(marks, "__len__"):
+        marks_count = 0
+    else:
+        marks_count = len(marks)
+    windows = getattr(obs, "windows", None)
+    return {
+        "screen_seq": int(getattr(obs, "screen_seq", 0) or 0),
+        "app": str(getattr(obs, "current_app", None) or "?"),
+        "marks": marks_count,
+        "windows": len(windows) if isinstance(windows, list) else None,
+    }
+
+
+def _previous_frame_summary(session) -> dict[str, Any] | None:
+    """Return the last committed frame's fingerprint, or ``None`` with no baseline."""
+
+    summary = getattr(session, _FRAME_SUMMARY_ATTR, None)
+    return summary if isinstance(summary, dict) else None
+
+
+def _remember_frame_summary(session, summary: dict[str, Any]) -> None:
+    """Record this frame's fingerprint for the next receipt's diff (best-effort)."""
+
+    try:
+        setattr(session, _FRAME_SUMMARY_ATTR, dict(summary))
+    except Exception:  # noqa: BLE001 - presentation baseline only
+        return
+
+
+def _format_frame_diff(
+    previous: dict[str, Any] | None, current: dict[str, Any]
+) -> str:
+    """One-line ``较上次观测：…`` structural diff, or ``""`` without a baseline.
+
+    Compares counts and the foreground label only — the honest, cheap subset of
+    "what changed". Equal counters render ``结构无变化`` instead of an empty
+    line, which is itself the useful signal that the action had no structural
+    effect yet.
+    """
+
+    if not isinstance(previous, dict):
+        return ""
+    parts: list[str] = []
+    if previous.get("marks") != current.get("marks"):
+        parts.append(f"marks {previous.get('marks')}→{current.get('marks')}")
+    if (
+        previous.get("windows") is not None
+        and current.get("windows") is not None
+        and previous.get("windows") != current.get("windows")
+    ):
+        parts.append(f"窗口 {previous.get('windows')}→{current.get('windows')}")
+    if previous.get("app") != current.get("app"):
+        parts.append(f"前台 {previous.get('app')}→{current.get('app')}")
+    if not parts:
+        return "较上次观测：结构无变化"
+    return "较上次观测：" + "；".join(parts)
+
+
+def format_sibling_receipt_text(
+    obs,
+    *,
+    previous: dict[str, Any] | None,
+    current: dict[str, Any],
+) -> str:
+    """Render the compact receipt that replaces image + full marks for a sibling.
+
+    Header keeps the ``[OBS] app=… screen#N marks (K)`` shape the model already
+    reads (``diagnostic``'s parser finds the same fields), then states what was
+    withheld and how to get it back. The second line is omitted without a
+    previous-frame baseline, so the text never claims a comparison it cannot
+    make.
+    """
+
+    app = str(current.get("app") or "?")
+    seq = int(current.get("screen_seq") or 0)
+    count = int(current.get("marks") or 0)
+    annotation = _marks_failure_annotation(obs)
+    head = f"[OBS] app={app} screen#{seq} marks ({count}){annotation}｜{_SIBLING_RECEIPT_NOTE}"
+    diff = _format_frame_diff(previous, current)
+    return f"{head}\n{diff}" if diff else head
+
 
 def _reference_frame(session) -> dict[str, Any] | None:
     """Pull the session's unverified reference frame; missing accessor -> None."""
@@ -248,6 +410,14 @@ def auto_observation(session, settle_ms: int | None = None) -> list[dict]:
     observation retained a valid earlier frame, adds it as an explicitly
     earlier/unverified ``reference`` image. With no valid frame — or on a
     protected screen — the result is text only; a fake image is never emitted.
+
+    Sibling receipt: with ``session.sibling_receipt_pending`` set — the tool
+    body is a non-final observation sibling of the current turn — a successful
+    observation returns one compact text block instead (``screen_seq``,
+    foreground, marks count, one-line structural diff); see
+    :func:`format_sibling_receipt_text`. The observation itself still ran in
+    full, and the failure branches above are unchanged: a failed observation is
+    never downgraded into a receipt.
     """
 
     effective_settle_ms = settle_ms
@@ -289,6 +459,20 @@ def auto_observation(session, settle_ms: int | None = None) -> list[dict]:
         return observation_failure_blocks(
             session, f"[OBS] (re-observation failed: {exc}){suffix}"
         )
+
+    # Sibling receipt (work item D, presentation only). The fingerprint is
+    # recorded for every committed frame — receipt or not — so the next receipt
+    # has a baseline; sampling itself already happened above, untouched.
+    previous_frame = _previous_frame_summary(session)
+    current_frame = _frame_summary(obs)
+    _remember_frame_summary(session, current_frame)
+    if sibling_receipt_requested(session):
+        receipt = format_sibling_receipt_text(
+            obs, previous=previous_frame, current=current_frame
+        )
+        if clamp_note:
+            receipt += f"\n{clamp_note}"
+        return [{"type": "text", "text": receipt}]
 
     if clamp_note:
         text += f"\n{clamp_note}"

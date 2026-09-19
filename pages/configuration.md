@@ -105,10 +105,17 @@
 | `PHONE_AGENT_COMPACT_MIN_REDUCTION_RATIO` | float | `0.1` | 普通工作压缩至少释放原输入的比例；不得大于等于 1 |
 | `PHONE_AGENT_COMPACT_SCHEMA_RESERVE` | int | `3000` | T1/T2 比较时为随每轮请求发送的序列化工具 schema 预留的 token 数（估算不可见部分） |
 | `PHONE_AGENT_COMPACT_OUTPUT_RESERVE` | int | `2000` | T1/T2 比较时为下一轮回复预留的 token 数 |
+| `PHONE_AGENT_BOUNDARY_COMPACT` | `off`/`shadow`/`on` | `shadow` | 边界感知折叠档位：路线项 `in_progress → completed` 即一个折叠边界。`shadow` 只计算并记录决策、上下文一字不改；`on` 才允许每个边界请求一次折叠；`off` 不装配该能力。T1/T2 容量触发始终优先。依赖 compact 实例；compact 关闭时本能力静默不装配（状态按 deps 推导为 `pending`、`missing_deps=compact`，自身取 `off` 时为 `off`） |
+| `PHONE_AGENT_BOUNDARY_COMPACT_STEPS_PER_ITEM` | int | `4` | 每条路线项平均步数的保守先验，只在完成项样本不足时使用；小样本判据见 `PHONE_AGENT_BOUNDARY_COMPACT_SAMPLE_GUARD_ITEMS` |
+| `PHONE_AGENT_BOUNDARY_COMPACT_SAMPLE_GUARD_ITEMS` | int | `2` | 完成项数达到该值才改用本 run 实测均值代替先验 |
+| `PHONE_AGENT_BOUNDARY_COMPACT_MIN_HORIZON_STEPS` | int | `2` | 预计剩余步数低于此值就不折叠（没有足够步数摊平改写成本） |
+| `PHONE_AGENT_BOUNDARY_COMPACT_MIN_SPAN_TOKENS` | int | `1500` | 可折叠区间的最低 token 估算，低于它就省不掉一次摘要调用 |
+| `PHONE_AGENT_BOUNDARY_COMPACT_MIN_NET_RATIO` | float | `1.5` | 收益/成本达到此倍数即触发折叠（`≥`，等于也算达到）；倍数大于 1 时「刚好不亏」仍不折 |
 | `PHONE_AGENT_CONTEXT_WINDOW` | int | 按实际构建的 actor 推断，兜底 `256000` | 用于窗口规划；最终请求准入只能收紧已知实际模型的窗口声明，不能放大。未设置时按**实际构建**的 actor（含构建降级目标）推断；旧自定义 Provider 没有新 support 时也保留 ModelSpec 的已知窗口，备用模型按自己的声明检查 |
 | `PHONE_AGENT_MEMORY_MODEL` | str | 主模型 | compact 摘要与 `--distill` 的两次调用（候选抽取 + 自评分）共用的模型；缺省回落到主模型，`roles.distill.model` 优先于本键 |
 | `PHONE_AGENT_IMAGE_KEEP` | int | `2` | 历史中保留的含图消息数 |
 | `PHONE_AGENT_OBS_MARKS_KEEP` | int | `2` | 历史中保留完整 marks 摘要的观测数 |
+| `PHONE_AGENT_SIBLING_RECEIPTS` | `on`/`off` | `on` | 同一轮多个观测类工具时，非最后一个只回紧凑文本回执（`screen#N` + marks 数 + 结构差分），不附图与 marks 摘要；该轮最后一个观测仍附完整截图与摘要。只改呈现，不跳过观测；`off` 时每条观测都附完整截图与 marks 摘要（见[同轮中间步骤回执](architecture.md#sibling-receipts)） |
 
 ### 预算契约 {#token-budget}
 
@@ -129,6 +136,12 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 原生签名可位于标准 text/image block 的嵌套 `extras` 中，估算与保护会递归识别。普通 SDK function-call id 对照表不因此永久占住压缩边界。若自定义 Provider 把原生签名放在必须移除的旧图片或 OBS marks 块上，当前没有可验证的合法重放投影：micro 在改任何消息前预检并报告 `native_context_pruning_conflict`，不会搬动签名或保留额外旧图。最新 K 的签名块保持原样；同消息其他文本块有签名不妨碍无签名旧图清理。
 
 未识别的非空 `additional_kwargs` 默认作为可能的 Provider 续接载荷保留，并作非零序列化估算。只有已经被结构化调用表示覆盖的 `tool_calls` / `function_call` 和已确认的 `__openai_function_call_ids__` 对照表属于例外；不能因为某个字段不在已知签名列表中，就认为可以丢弃。
+
+**边界触发的折叠**（`PHONE_AGENT_BOUNDARY_COMPACT`，默认 `shadow`）：模型拥有计划，所以它的路线项迁移就是折叠边界——一次提交的 `in_progress → completed`（P0 #11 保证的唯一完成路径）发 `taskdoc/completed`，`boundary_compact` 能力在下一个 `model/pre_request` 检查点做机械判断：horizon = 未完成路线项数 × 每条路线项平均步数（完成项样本不足时用保守先验），收益 = (可折叠估算 token − 摘要 token) × horizon，成本 = 一次摘要调用（区间 token + `PHONE_AGENT_COMPACT_SUMMARY_TOKENS`）；只有收益清晰超过成本的倍数才请求折叠，否则记录推迟原因。判断归 harness，编计划归模型：harness 不猜计划，模型也不决定何时改写历史。
+
+折叠走 T2 同一条提交路径，因此全部闸门照旧：保护组（含 TaskDoc pin、最新完整观测、原生签名）、最小折叠规模、摘要预算、净缩减阈值、失败保留基线；差异只在接受规则——边界折叠是经济赌注而非容量修复，必须放得下且确实净缩减，但不要求达到容量路径的低水位目标。切点按边界对齐：边界之后的步数逐字保留，只折叠刚完成的这段。窗口压力仍归 T2：本能力只在容量折叠无事可做的检查点上动作，一个边界至多一次决策；若本 pass 的容量折叠已经提交，该 armed boundary 直接作废（不记决策，只记 `boundary_compact_skipped`），`shadow` 与 `on` 判定同一件事、只差是否落地。
+
+**摘要逐字命中影子指标**：每次成功折叠在提交前机械统计摘要里的实质行（归一化后 ≥ 12 字符、非 `#` 开头、至多 40 条）有多少能在被折叠的历史中逐字命中，落 `compact_summary_quote_check` trace 事件（计数、命中率与有界样本，遵守截断与脱敏）。纯观察：任何闸门都不读它，指标自身报错也不影响折叠；折叠被既有原因中止时不发事件。**标定口径**：迭代折叠时上一份 `[COMPACT_SUMMARY]` 的原文不在本次 haystack 里，忠实搬运的句子因此计为 miss——`hit_rate` 读作「逐字搬运率」而非幻觉计量；样本字段是 `miss_samples`（未命中样本）。
 
 **消息协议契约**：`model/pre_request` 监听器是纯的全消息列表变换——**不得**返回 `RemoveMessage`，也不返回 `jump_to` 做流程控制。监听器改动了列表时，由桥接中间件统一铸出唯一合法的 `[RemoveMessage(REMOVE_ALL), *result]` 形态交给下游。
 
@@ -222,6 +235,14 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | `PHONE_AGENT_LESSON_INJECT_MAX` | int | `3` | 单次注入的经验条数上限 |
 | `PHONE_AGENT_LESSON_INJECT_TOKENS` | int | `800` | 注入内容的 token 上限 |
 | `PHONE_AGENT_FOREGROUND_EVENT_BLOCKED_PACKAGES` | csv | 空 | app/launched 进场注入的前台包过滤补充名单；叠加内建系统包名单 |
+
+### 观测存档与召回
+
+| 变量 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `PHONE_AGENT_OBS_ARCHIVE` | `off`/`on` | `off` | 观测存档能力：把每次提交成功观测的 `[OBS]` 文本（纯文本，无截图/base64）存到本地并挂载只读 `recall_screen` / `search_screens`；见[观测存档与召回](architecture.md#obs-archive) |
+| `PHONE_AGENT_OBS_ARCHIVE_DIR` | path | `memory/obs_archive` | 存档根目录；每 run 一个 `<run_id>.jsonl`（追加式真相）与可重建的 `<run_id>.db`（FTS5 索引） |
+| `PHONE_AGENT_OBS_ARCHIVE_KEEP_RUNS` | int | `20` | 保留的 run 数上限（≥ 1，总计含当前 run：当前 run 永不删除，更早的按 mtime 淘汰）；更老的 jsonl 与其索引在下次写入时删除 |
 
 ## 任务板与记录
 

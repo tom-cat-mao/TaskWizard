@@ -143,6 +143,8 @@ def test_mini_run_writes_same_capability_snapshot_to_trace_and_episode(
         "safety": "off",
         "budget": "active",
         "compact": "off",
+        # Mounted on the compact fold path, so a compact-off run keeps it pending.
+        "boundary_compact": "pending",
         "finish_verify": "off",
         "deliverable": "active",
         "app_kb": "active",
@@ -150,6 +152,7 @@ def test_mini_run_writes_same_capability_snapshot_to_trace_and_episode(
         "experience": "active",
         "providers": "active",
         "recall": "off",
+        "obs_archive": "off",
     }
     assert snapshot["memory_generation"] == {
         "source": "kb.json.mtime_ns",

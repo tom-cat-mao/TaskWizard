@@ -655,6 +655,19 @@ def _apply_compact(ctx: CapabilityAssemblyContext) -> None:
     ctx.register_service("compact_instance", compact)
 
 
+def _apply_boundary_compact(ctx: CapabilityAssemblyContext) -> None:
+    """Mount the route-boundary fold trigger on top of the compact instance.
+
+    Inert (registers nothing) when there is no compact instance to fold through or
+    no bus to observe; the mode itself is resolved by the registry, so ``shadow``
+    and ``on`` both mount here and differ only inside the listener.
+    """
+
+    from phone_agent.v2.middleware.boundary_compact import apply_boundary_compact
+
+    apply_boundary_compact(ctx)
+
+
 def _apply_finish_verify(ctx: CapabilityAssemblyContext) -> None:
     _register_factory(ctx, "finish_verify_tool_factory", "register_tool")
 
@@ -753,6 +766,50 @@ def _warmup_recall_embedder(ctx: CapabilityAssemblyContext, observers: Any) -> N
     if factory is None:
         return
     warmup_embedder(factory, observers=observers)
+
+
+def _apply_obs_archive(ctx: CapabilityAssemblyContext) -> None:
+    """Mount the text-only observation archive + read-only recall tools.
+
+    The archive object comes from the harness factory ``obs_archive_factory``
+    (it owns the run_id) and is installed on the session as the fail-open
+    observation sink — P0 #15 keeps ``session.observe()`` the single producer;
+    the sink only *receives* committed observations.  The two recall tools are
+    read-only evidence (marks-first is never bypassed).  The images-middleware
+    fold placeholder gains the ``[可 recall_screen]`` suffix only while this
+    capability is mounted, and every failure here degrades open: a missing
+    session/factory or a failed build leaves the capability inert.
+    """
+
+    factory = ctx.service("obs_archive_factory")
+    session = ctx.service("session")
+    if session is None or not callable(factory):
+        return
+    try:
+        archive = factory()
+    except Exception:  # noqa: BLE001 - optional archive never blocks assembly
+        return
+    if archive is None:
+        return
+    from phone_agent.v2.obs_archive import RECALL_HINT
+
+    pruner = ctx.service("context_pruner")
+    if pruner is not None:
+        try:
+            pruner.fold_hint = RECALL_HINT
+            ctx.on_dispose(lambda: setattr(pruner, "fold_hint", ""))
+        except Exception:  # noqa: BLE001, S110 - hint is cosmetic; mounting continues
+            pass
+    try:
+        session.obs_archive_sink = archive
+        ctx.on_dispose(lambda: setattr(session, "obs_archive_sink", None))
+    except Exception:  # noqa: BLE001, S110 - duck-typed sessions may reject writes
+        pass
+    ctx.on_dispose(archive.close)
+    from phone_agent.v2.tools.obs_archive import make_obs_archive_tools
+
+    for tool in make_obs_archive_tools(session, archive):
+        ctx.register_tool(tool)
 
 
 def _apply_recall(ctx: CapabilityAssemblyContext) -> None:
@@ -916,7 +973,7 @@ def assemble_capabilities(
 
 
 def build_capability_registry(config: Any) -> CapabilityRegistry:
-    """Build the eleven-capability composition shared by agent and runner."""
+    """Build the thirteen-capability composition shared by agent and runner."""
 
     registry = CapabilityRegistry()
     for spec in (
@@ -954,6 +1011,14 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
             "on" if getattr(config, "compact_enabled", True) else "off",
             apply=_owned_apply("compact", _apply_compact),
             release=_owned_release("compact"),
+        ),
+        CapabilitySpec(
+            "boundary_compact",
+            "Boundary-aware compact",
+            getattr(config, "boundary_compact_mode", "shadow"),
+            deps=("compact",),
+            apply=_owned_apply("boundary_compact", _apply_boundary_compact),
+            release=_owned_release("boundary_compact"),
         ),
         CapabilitySpec(
             "finish_verify",
@@ -998,6 +1063,13 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
             deps=("experience",),
             apply=_owned_apply("recall", _apply_recall),
             release=_owned_release("recall"),
+        ),
+        CapabilitySpec(
+            "obs_archive",
+            "Observation archive",
+            getattr(config, "obs_archive", "off"),
+            apply=_owned_apply("obs_archive", _apply_obs_archive),
+            release=_owned_release("obs_archive"),
         ),
     ):
         registry.register(spec)
