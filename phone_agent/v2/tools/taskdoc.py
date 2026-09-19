@@ -5,13 +5,47 @@ Per ``AGENTS.md`` §2.2. The tool full-replaces the
 and only commits when valid (fail-closed: a validation failure returns an error
 string and writes nothing). ``goal_base`` is never accepted here — only the
 harness seeds it.
+
+A committed write that moves a route item ``in_progress`` -> ``completed`` emits
+``taskdoc/completed`` on the session's event bus (payload contract in
+:mod:`phone_agent.v2.events`). That transition is the only legal completion path,
+so the event is the harness's route-boundary signal; emission is fail-open and
+never changes the receipt.
 """
 
 from __future__ import annotations
 
 from langchain_core.tools import StructuredTool
 
+from phone_agent.v2.events import TASKDOC_ITEM_COMPLETED
 from phone_agent.v2.taskdoc import TaskDoc, TaskItem
+
+
+def _emit_completed_boundaries(session, previous: TaskDoc, committed: TaskDoc) -> None:
+    """Announce ``in_progress`` -> ``completed`` transitions; fail-open."""
+
+    bus = getattr(session, "event_bus", None)
+    if bus is None:
+        return
+    prior = {item.id: item.status for item in previous.items}
+    completed = [
+        item.id
+        for item in committed.items
+        if item.status == "completed" and prior.get(item.id) == "in_progress"
+    ]
+    if not completed:
+        return
+    try:
+        bus.emit(
+            TASKDOC_ITEM_COMPLETED,
+            {
+                "item_ids": completed,
+                "screen_seq": int(getattr(session, "screen_seq", 0) or 0),
+                "epoch": int(getattr(session, "epoch", 0) or 0),
+            },
+        )
+    except Exception:  # noqa: BLE001 - a boundary event must never fail the write
+        return
 
 
 def _coerce_item(raw: object) -> TaskItem:
@@ -97,6 +131,7 @@ def make_update_task_doc_tool(session, lang: str) -> StructuredTool:
             return f"未写入（校验失败）：{error}"
 
         session.task_doc = candidate
+        _emit_completed_boundaries(session, current, candidate)
 
         parts = ["已更新任务板。"]
         rendered = candidate.render(lang)

@@ -28,6 +28,21 @@ context window:
   Retries never silently discard source groups. Failed, oversized or useless
   summaries leave the already-pruned baseline intact.
 
+A third entry point, :meth:`CompactMiddleware.request_semantic_fold`, is a
+service seam for the ``boundary_compact`` capability: the model's own route-item
+completion says *where* a fold would be cheap, this middleware decides *whether*
+it is. It runs the same commit path as T2 — same protected groups, same
+net-reduction, summary-budget and admission gates — with the cut aligned to the
+completed subtask instead of to a token count, and it returns a plain rebuilt
+list because it is called from inside the ``model/pre_request`` waterfall. T1/T2
+capacity-triggered folding is unchanged and always wins: a boundary fold only
+happens at checkpoints where the capacity fold had nothing to do.
+
+Every committed fold also measures its own summary: how many of the summary's
+substantive lines are verbatim carry-over from the segment it replaced, logged as
+``compact_summary_quote_check``. Observation only — no gate reads it, and an
+aborted fold emits nothing.
+
 The production full-input work target is independent of physical model capacity.
 Every summary invoke checks the existing run token budget. Final admission also
 belongs at dispatch after pins and at each actual fallback model; this listener
@@ -147,6 +162,44 @@ _SUMMARY_SECTIONS = {
         "## Errors and fixes\n## User additions\n## Current screen\n## Next steps"
     ),
 }
+
+
+# Quote-hit shadow metric (observe-only): how much of a committed hand-off
+# summary is literal carry-over from the segment it replaced.
+_QUOTE_MIN_CHARS = 12  # skip headings / filler shorter than this
+_QUOTE_MAX_LINES = 40  # bound the work per fold
+_QUOTE_SAMPLE_CHARS = 60  # local clip, on top of the recorder's own cap
+_QUOTE_SAMPLE_MAX = 3
+_QUOTE_LEADING_MARKDOWN = "-*•·># \t"
+
+
+def _quote_normalize(text: str) -> str:
+    """Collapse whitespace runs so wrapping differences do not hide a quote."""
+
+    return " ".join((text or "").split())
+
+
+def _quote_candidates(summary_text: str) -> list[str]:
+    """Extract the summary's substantive lines as verbatim probes (bounded)."""
+
+    candidates: list[str] = []
+    for raw in (summary_text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue  # section scaffolding is structure, not a claim to quote
+        quote = _quote_normalize(line.lstrip(_QUOTE_LEADING_MARKDOWN).strip())
+        if len(quote) < _QUOTE_MIN_CHARS:
+            continue
+        candidates.append(quote)
+        if len(candidates) >= _QUOTE_MAX_LINES:
+            break
+    return candidates
+
+
+def _quote_haystack(ancient: list[Any]) -> str:
+    """The folded segment as the summariser saw it, whitespace-normalised."""
+
+    return _quote_normalize(" ".join(_render_line(message) for message in ancient))
 
 
 def infer_context_window(model_name: str | None, override: int | None) -> int:
@@ -505,12 +558,8 @@ class CompactMiddleware(AgentMiddleware):
         if self._budget_exhausted():
             self._record("skipped", "token_budget_exhausted", before_tokens=before.input_tokens)
             return None
-        signature = self._signature(messages)
-        if signature == self._last_failed_signature:
+        if not self._begin_fold_attempt(messages, before):
             return None
-        self._last_failed_signature = signature
-        self.last_result = None
-        self._summary_invokes = 0
         head, pinned, conversation, prior_summary = self._partition(messages)
         fixed = self._measure([*head, *pinned, SystemMessage(content=self._fresh_obs_text())])
         window = before.context_window or self.window
@@ -541,6 +590,113 @@ class CompactMiddleware(AgentMiddleware):
                 max(physical_target, protected.input_tokens + self.summary_tokens),
             )
             cut, protected = plan_tail(target, physical=True)
+        return self._commit_fold(
+            before=before, head=head, pinned=pinned, conversation=conversation,
+            prior_summary=prior_summary, cut=cut, protected=protected,
+            target=target, hard_risk=hard_risk, trigger="capacity",
+        )
+
+    # -- boundary-triggered fold (public seam for ``boundary_compact``) -----
+    def request_semantic_fold(
+        self, messages: list[Any], *, span_hint: int | None = None
+    ) -> list[Any] | None:
+        """Fold the span that ends at a TaskDoc route boundary, if it pays off.
+
+        Service seam for the ``boundary_compact`` capability. Unlike the
+        capacity-triggered fold in :meth:`before_model`, the caller supplies a
+        *semantic* reason to fold: ``span_hint`` is how many newest conversation
+        turns the completed route item's work is followed by, i.e. the verbatim
+        tail that must survive. The fold candidate is everything older, so the
+        cut lands on the subtask boundary instead of a token count.
+
+        Semantics:
+
+        * ``span_hint`` — trailing turn count to keep verbatim; ``None`` keeps
+          only the newest turn. Values below 1 are clamped to 1, so the newest
+          turn is never folded and the protected groups (pinned TaskDoc, latest
+          observation, images, marks, native signatures, unclosed tool groups)
+          always stay in the tail: the requested cut is clamped to the earliest
+          protected turn, never past it.
+        * Every gate of the capacity fold applies unchanged — the same
+          :meth:`_commit_fold` runs budget, repeated-failure signature, minimum
+          fold size, protected-context admission, summary budget and
+          net-reduction checks. Only the accept rule differs: a boundary fold is
+          an economic bet, so it must fit the window and actually shrink the
+          transcript, but it is not required to reach the capacity path's
+          low-water target.
+        * Returns the rebuilt full message list (never a ``RemoveMessage``, per
+          the ``model/pre_request`` contract) when a fold committed, else
+          ``None`` — including when a gate refused, in which case the already
+          pruned transcript stays untouched.
+        """
+
+        messages = list(messages or [])
+        if not messages:
+            return None
+        before = self._measure(messages)
+        if self._budget_exhausted():
+            self._record(
+                "skipped", "token_budget_exhausted", before_tokens=before.input_tokens
+            )
+            return None
+        if not self._begin_fold_attempt(messages, before):
+            return None
+        head, pinned, conversation, prior_summary = self._partition(messages)
+        cut = self._boundary_cut(conversation, keep_recent_turns=span_hint)
+        if cut <= 0:
+            self._record(
+                "skipped", "boundary_nothing_to_fold", before_tokens=before.input_tokens
+            )
+            return None
+        protected = self._measure([
+            *head, *conversation[cut:], *pinned,
+            SystemMessage(content=self._fresh_obs_text()),
+        ])
+        update = self._commit_fold(
+            before=before, head=head, pinned=pinned, conversation=conversation,
+            prior_summary=prior_summary, cut=cut, protected=protected,
+            target=before.input_tokens, hard_risk=False, trigger="boundary",
+        )
+        if update is None:
+            return None
+        rebuilt = list(update["messages"])
+        # Strip the reducer sentinel: a boundary fold is requested from inside
+        # the pre-request waterfall, whose contract is a plain full list out.
+        return rebuilt[1:] if rebuilt and isinstance(rebuilt[0], RemoveMessage) else rebuilt
+
+    def _begin_fold_attempt(self, messages: list[Any], before: Any) -> bool:
+        """Shared per-attempt bookkeeping; ``False`` when the fold must not run."""
+
+        signature = self._signature(messages)
+        if signature == self._last_failed_signature:
+            return False
+        self._last_failed_signature = signature
+        self.last_result = None
+        self._summary_invokes = 0
+        return True
+
+    def _commit_fold(
+        self,
+        *,
+        before: Any,
+        head: list[Any],
+        pinned: list[Any],
+        conversation: list[Any],
+        prior_summary: str | None,
+        cut: int,
+        protected: Any,
+        target: int,
+        hard_risk: bool,
+        trigger: str,
+    ) -> dict[str, Any] | None:
+        """The one fold commit path: summarise, gate, rebuild.
+
+        Shared verbatim by the capacity trigger (``trigger="capacity"``) and the
+        boundary trigger (``trigger="boundary"``), so no gate can drift between
+        the two. ``target`` is the low-water mark the capacity path must reach;
+        the boundary path only has to net-reduce (see ``target_met``).
+        """
+
         ancient = conversation[:cut]
         tail = conversation[cut:]
         if len(ancient) < self.min_fold_messages:
@@ -564,6 +720,9 @@ class CompactMiddleware(AgentMiddleware):
             if self.last_result is None or self.last_result.get("status") != "skipped":
                 self._record("skipped", "summary_failed", before_tokens=before.input_tokens)
             return None  # fail-open: summariser failed -> skip the fold this turn
+        # The quote metric measures what the model wrote; the deterministic memory
+        # suffix below is harness bookkeeping that no transcript line ever carries.
+        llm_summary = summary_text
         summary_text += self._memory_state_section()
 
         summary_msg = SystemMessage(
@@ -582,7 +741,12 @@ class CompactMiddleware(AgentMiddleware):
         reduction = before.input_tokens - after.input_tokens
         minimum = max(self.min_reduction_tokens, int(before.input_tokens * self.min_reduction_ratio))
         repairs_capacity = before.exceeds_capacity and after.allowed and reduction > 0
-        target_met = after.input_tokens <= target or (hard_risk and after.allowed and reduction > 0)
+        if trigger == "boundary":
+            target_met = after.allowed and reduction > 0
+        else:
+            target_met = after.input_tokens <= target or (
+                hard_risk and after.allowed and reduction > 0
+            )
         useful = reduction >= minimum or repairs_capacity
         if not after.allowed or not target_met or not useful:
             self._record(
@@ -590,20 +754,30 @@ class CompactMiddleware(AgentMiddleware):
                 before_tokens=before.input_tokens, after_tokens=after.input_tokens,
             )
             return None
+        self._quote_hit_check(llm_summary, ancient)
         self.generation += 1
         self._last_failed_signature = None
-        soft_unattainable = bool(self.work_target and after.input_tokens > soft_target)
+        soft_target = int(self.work_target * self.target_ratio)
+        soft_unattainable = bool(
+            self.work_target and trigger == "capacity" and after.input_tokens > soft_target
+        )
+        if trigger == "boundary":
+            reason = "boundary_compacted"
+        else:
+            reason = "soft_target_unattainable" if soft_unattainable else "compacted"
         self._record(
-            "completed", "soft_target_unattainable" if soft_unattainable else "compacted",
+            "completed", reason,
             before_tokens=before.input_tokens, after_tokens=after.input_tokens,
             soft_target_unattainable=soft_unattainable,
             capacity_repair=repairs_capacity,
+            trigger=trigger,
         )
         # Legacy reducer delta for the LangChain-middleware path. The
         # ``model/pre_request`` adapter (``on_pre_request``) strips this
         # sentinel head and forwards the full rebuilt list downstream; the
         # pre-request bridge alone mints the LangGraph update.
         return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *rebuilt]}
+
 
     def _partition(
         self, messages: list[Any]
@@ -650,13 +824,16 @@ class CompactMiddleware(AgentMiddleware):
             conversation.append(msg)
         return head, pinned, conversation, prior_summary
 
-    def _choose_cut(self, conversation: list[Any], budget: int | None = None) -> int:
-        """Index into ``conversation``: keep the newest tail under the keep budget."""
+    def _first_protected_turn(self, groups: list[list[Any]]) -> int:
+        """Earliest turn index that must stay in the verbatim tail.
 
-        if not conversation:
-            return 0
-        budget = int(self.window * self.keep_ratio) if budget is None else budget
-        groups = _group_turns(conversation)
+        A group is protected when it is unclosed (a dangling ``tool_use``),
+        carries the original user goal, an image, OBS marks, native/opaque
+        content, or an id the model pins. Both cut selectors clamp to this index
+        so neither can fold a protected group into a summary.
+        """
+
+        conversation = [message for group in groups for message in group]
         protected_ids = model_protected_message_ids(self._main_model, conversation)
         first_protected = len(groups) - 1  # Always keep the newest whole unit.
         for index, group in enumerate(groups):
@@ -669,6 +846,16 @@ class CompactMiddleware(AgentMiddleware):
                 for message in group
             ):
                 first_protected = min(first_protected, index)
+        return first_protected
+
+    def _choose_cut(self, conversation: list[Any], budget: int | None = None) -> int:
+        """Index into ``conversation``: keep the newest tail under the keep budget."""
+
+        if not conversation:
+            return 0
+        budget = int(self.window * self.keep_ratio) if budget is None else budget
+        groups = _group_turns(conversation)
+        first_protected = self._first_protected_turn(groups)
         start = len(groups)
         kept = 0
         for index in range(len(groups) - 1, -1, -1):
@@ -679,6 +866,29 @@ class CompactMiddleware(AgentMiddleware):
             start = index
         start = min(start, first_protected)
         return sum(len(group) for group in groups[:start])
+
+    def _boundary_cut(self, conversation: list[Any], *, keep_recent_turns: int | None) -> int:
+        """Index into ``conversation`` for a boundary-triggered fold.
+
+        ``keep_recent_turns`` is how many newest turns the caller needs verbatim
+        (everything after the route boundary); the fold candidate is everything
+        older, so the cut lands on the boundary rather than on a token count. The
+        request is clamped two ways: never below one trailing turn (the newest
+        unit always survives) and never past the earliest protected turn, so a
+        boundary can only widen the fold within what the protection rules allow.
+        Returns ``0`` when nothing may be folded.
+        """
+
+        if not conversation:
+            return 0
+        groups = _group_turns(conversation)
+        if len(groups) < 2:
+            return 0
+        keep = 1 if keep_recent_turns is None else max(1, int(keep_recent_turns))
+        ancient_turns = min(len(groups) - keep, self._first_protected_turn(groups))
+        if ancient_turns < 1:
+            return 0
+        return sum(len(group) for group in groups[:ancient_turns])
 
     # -- summariser --------------------------------------------------------
     def _summary_admission(self, model: Any, messages: list[Any]):
@@ -903,6 +1113,41 @@ class CompactMiddleware(AgentMiddleware):
         # Fall back to the main model (no tools bound when invoked directly).
         self._memory_model = self._main_model
         return self._memory_model
+
+    # -- shadow metrics ----------------------------------------------------
+    def _quote_hit_check(self, summary_text: str, ancient: list[Any]) -> None:
+        """Log how much of a committed summary is verbatim carry-over.
+
+        Observation only: no gate reads the result, and a broken recorder cannot
+        affect the fold. Called once a fold has passed every gate, so an aborted
+        fold emits no event. The payload is counts plus locally clipped samples;
+        the trace recorder applies the P0 #6 redaction boundary on top.
+        """
+
+        recorder = self._trace_recorder
+        if recorder is None:
+            return
+        haystack = _quote_haystack(ancient)
+        candidates = _quote_candidates(summary_text)
+        misses = [quote for quote in candidates if quote not in haystack]
+        try:
+            recorder(
+                "compact_summary_quote_check",
+                quotes_total=len(candidates),
+                quotes_hit=len(candidates) - len(misses),
+                quotes_missed=len(misses),
+                hit_rate=(
+                    round((len(candidates) - len(misses)) / len(candidates), 3)
+                    if candidates
+                    else None
+                ),
+                folded_messages=len(ancient),
+                miss_samples=[
+                    quote[:_QUOTE_SAMPLE_CHARS] for quote in misses[:_QUOTE_SAMPLE_MAX]
+                ],
+            )
+        except Exception:  # noqa: BLE001 - a shadow metric never changes the fold
+            return
 
     # -- text --------------------------------------------------------------
     def _warn_text(self) -> str:

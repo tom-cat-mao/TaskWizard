@@ -306,6 +306,23 @@ class V2Config:
     # ratio comparison so compaction fires before the real request overflows.
     compact_schema_reserve: int = 3000
     compact_output_reserve: int = 2000
+    # Boundary-aware online compact. The model owns the plan, so its own
+    # ``in_progress -> completed`` route transitions are the fold boundary; this
+    # capability only decides whether folding the finished span repays the summary
+    # call. ``shadow`` (default) computes and logs the decision with zero context
+    # change; ``on`` may request one fold per boundary through the same fold path
+    # the capacity trigger uses. Capacity-triggered T1/T2 stays the backstop.
+    boundary_compact_mode: str = "shadow"
+    # Conservative prior for steps-per-completed-item, used until enough
+    # completions make the run-local mean trustworthy.
+    boundary_compact_steps_per_item: int = 4
+    boundary_compact_sample_guard_items: int = 2
+    # Expected remaining steps below which a fold cannot pay for itself.
+    boundary_compact_min_horizon_steps: int = 2
+    # Smallest foldable span worth a summariser call.
+    boundary_compact_min_span_tokens: int = 1500
+    # benefit/cost must clear this factor, so only clearly net-positive folds act.
+    boundary_compact_min_net_ratio: float = 1.5
     # context hygiene (S1 §1.4/§2): rolling image + OBS-marks pruning windows
     image_keep: int = 2
     obs_marks_keep: int = 2
@@ -598,6 +615,24 @@ class V2Config:
             compact_output_reserve=_env_int(
                 "PHONE_AGENT_COMPACT_OUTPUT_RESERVE", 2000
             ),
+            boundary_compact_mode=_env_choice(
+                "PHONE_AGENT_BOUNDARY_COMPACT", "shadow", ("off", "shadow", "on")
+            ),
+            boundary_compact_steps_per_item=_env_int(
+                "PHONE_AGENT_BOUNDARY_COMPACT_STEPS_PER_ITEM", 4
+            ),
+            boundary_compact_sample_guard_items=_env_int(
+                "PHONE_AGENT_BOUNDARY_COMPACT_SAMPLE_GUARD_ITEMS", 2
+            ),
+            boundary_compact_min_horizon_steps=_env_int(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_HORIZON_STEPS", 2
+            ),
+            boundary_compact_min_span_tokens=_env_int(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_SPAN_TOKENS", 1500
+            ),
+            boundary_compact_min_net_ratio=_env_float(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_NET_RATIO", 1.5
+            ),
             image_keep=_env_int("PHONE_AGENT_IMAGE_KEEP", 2),
             obs_marks_keep=_env_int("PHONE_AGENT_OBS_MARKS_KEEP", 2),
             grounding_provider=_env_str("PHONE_AGENT_GROUNDING_PROVIDER", "hybrid"),
@@ -769,4 +804,24 @@ class V2Config:
             raise ValueError("PHONE_AGENT_COMPACT_MIN_REDUCTION_TOKENS must be non-negative")
         if not 0.0 <= config.compact_min_reduction_ratio < 1.0:
             raise ValueError("PHONE_AGENT_COMPACT_MIN_REDUCTION_RATIO must be between 0 (inclusive) and 1 (exclusive)")
+        if config.boundary_compact_steps_per_item <= 0:
+            raise ValueError(
+                "PHONE_AGENT_BOUNDARY_COMPACT_STEPS_PER_ITEM must be positive"
+            )
+        if config.boundary_compact_sample_guard_items <= 0:
+            raise ValueError(
+                "PHONE_AGENT_BOUNDARY_COMPACT_SAMPLE_GUARD_ITEMS must be positive"
+            )
+        if config.boundary_compact_min_horizon_steps < 0:
+            raise ValueError(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_HORIZON_STEPS must be non-negative"
+            )
+        if config.boundary_compact_min_span_tokens < 0:
+            raise ValueError(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_SPAN_TOKENS must be non-negative"
+            )
+        if config.boundary_compact_min_net_ratio < 0:
+            raise ValueError(
+                "PHONE_AGENT_BOUNDARY_COMPACT_MIN_NET_RATIO must be non-negative"
+            )
         return config
