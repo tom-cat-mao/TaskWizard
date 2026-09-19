@@ -258,6 +258,9 @@ def test_boundary_listener_tracks_span_and_completed_count():
         "item_ids": ["2"],
         "span_steps": 4,
         "seq": 9,
+        # Arm-time latch key: no compact instance is mounted here, so the
+        # generation cannot be read and the boundary carries ``None``.
+        "compact_generation": None,
     }
 
 
@@ -431,6 +434,53 @@ def test_on_mode_survives_a_raising_fold_seam():
     _arm_boundary(listener, at_seq=5, span_from=0)
     messages = _transcript(12)
     assert listener.on_pre_request(messages, next=lambda m: m) is messages
+
+
+def test_boundary_is_dropped_when_a_fold_committed_after_arming():
+    """M1: one fold per waterfall pass — a committed fold voids an armed boundary."""
+
+    class GenCompact(StubCompact):
+        def __init__(self) -> None:
+            super().__init__(result=["folded"])
+            self.generation = 0
+
+    compact = GenCompact()
+    listener, events = _listener(mode="on", compact=compact)
+    listener.session.screen_seq = 9
+    _arm_boundary(listener, at_seq=5, span_from=0)
+    assert listener._pending["compact_generation"] == 0  # noqa: SLF001 - armed at the pre-fold generation
+    # A capacity fold commits in the same waterfall pass, before the boundary
+    # listener runs: the shared compact generation moves.
+    compact.generation = 1
+    messages = _transcript(12)
+
+    out = listener.on_pre_request(messages, next=lambda m: m)
+
+    assert out is messages, "no second fold after one already committed"
+    assert compact.calls == [], "the seam is never called for a voided boundary"
+    assert listener._pending is None  # noqa: SLF001 - the boundary is consumed
+    skips = [payload for event, payload in events if event == "boundary_compact_skipped"]
+    assert skips and skips[0]["reason"] == "fold_already_committed"
+    assert skips[0]["item_ids"] == ["1"]
+
+
+def test_boundary_proceeds_when_generation_is_unchanged():
+    """The latch is transparent when no fold intervened between arm and decide."""
+
+    class GenCompact(StubCompact):
+        def __init__(self) -> None:
+            super().__init__(result=[SystemMessage(content="rebuilt", id="s0")])
+            self.generation = 7
+
+    compact = GenCompact()
+    listener, _ = _listener(mode="on", compact=compact)
+    listener.session.screen_seq = 9
+    _arm_boundary(listener, at_seq=5, span_from=0)
+
+    out = listener.on_pre_request(_transcript(12), next=lambda m: m)
+
+    assert len(compact.calls) == 1
+    assert isinstance(out, list) and out[0].content == "rebuilt"
 
 
 def test_one_decision_per_boundary_and_reset_clears_counters():

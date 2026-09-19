@@ -1121,7 +1121,12 @@ class CompactMiddleware(AgentMiddleware):
         Observation only: no gate reads the result, and a broken recorder cannot
         affect the fold. Called once a fold has passed every gate, so an aborted
         fold emits no event. The payload is counts plus locally clipped samples;
-        the trace recorder applies the P0 #6 redaction boundary on top.
+        the trace recorder applies the P0 #6 redaction boundary on top. One
+        calibration caveat: on iterative folds the summariser input includes the
+        prior ``[COMPACT_SUMMARY]`` but the haystack is only the segment being
+        folded, so lines faithfully carried over from the previous summary count
+        as misses — read ``hit_rate`` as literal carry-over, not as a
+        hallucination meter.
         """
 
         recorder = self._trace_recorder

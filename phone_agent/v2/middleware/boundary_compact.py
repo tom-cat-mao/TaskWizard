@@ -18,7 +18,9 @@ reason is logged; the capacity trigger keeps the last word either way.
 Mounting is the usual capability seam (:mod:`phone_agent.v2.capabilities`): one
 observer on ``taskdoc/completed``, one listener on ``model/pre_request`` (inside
 the compact listener, so a fold that capacity already paid for is never
-double-folded), and one ``run/start`` hook that clears per-run counters.
+double-folded — enforced by a generation latch: a boundary armed before a fold
+commit is dropped, not folded again), and one ``run/start`` hook that clears
+per-run counters.
 
 Modes (``PHONE_AGENT_BOUNDARY_COMPACT``, default ``shadow``):
 
@@ -216,6 +218,11 @@ class BoundaryCompactListener:
             "item_ids": [str(item) for item in item_ids],
             "span_steps": span_steps,
             "seq": screen_seq,
+            # Generation at arm time: if the shared compact middleware commits a
+            # fold (capacity T2 in the same waterfall pass, or an earlier
+            # boundary fold) before this boundary's decision, the transcript was
+            # already paid for — the decision latch in ``on_pre_request`` drops it.
+            "compact_generation": getattr(self._compact(), "generation", None),
         }
 
     # -- decision checkpoint ----------------------------------------------
@@ -231,6 +238,23 @@ class BoundaryCompactListener:
 
         pending = self._pending
         if pending is None:
+            return next(messages)
+        armed_generation = pending.get("compact_generation")
+        current_generation = getattr(self._compact(), "generation", None)
+        if (
+            armed_generation is not None
+            and current_generation is not None
+            and current_generation != armed_generation
+        ):
+            # A fold committed after this boundary was armed: capacity already
+            # paid for this transcript. Enforces "one fold per waterfall pass —
+            # T1/T2 wins" in code, not just in docs; drop the boundary.
+            self._pending = None
+            self._record_trace(
+                "boundary_compact_skipped",
+                reason="fold_already_committed",
+                item_ids=list(pending.get("item_ids") or []),
+            )
             return next(messages)
         decision = self._decide(messages, pending)
         if decision is None:
@@ -279,7 +303,16 @@ class BoundaryCompactListener:
         return next(folded)
 
     def _turns_since_boundary(self, pending: dict) -> int:
-        """Trailing turns that post-date the boundary and must stay verbatim."""
+        """Trailing turns that post-date the boundary and must stay verbatim.
+
+        Derived from ``screen_seq`` deltas, so a multi-sibling turn (one group,
+        several observations) overestimates the turn count — the tail kept
+        verbatim is wider than the design's "steps after the boundary". That
+        is the safe direction (folds less, never more), and the matching
+        ``span_steps × 2`` span-token estimate is slightly optimistic in the
+        other direction; both biases are deliberate and documented here rather
+        than tuned away.
+        """
 
         return max(1, int(self._steps_total()) - int(pending.get("seq") or 0))
 
@@ -319,6 +352,17 @@ class BoundaryCompactListener:
 
     def _compact(self) -> Any:
         return self._compact_provider() if callable(self._compact_provider) else None
+
+    def _record_trace(self, event: str, **payload: Any) -> None:
+        """Log a non-decision event (e.g. the fold-already-committed latch)."""
+
+        recorder = self._trace_recorder
+        if recorder is None:
+            return
+        try:
+            recorder(event, mode=self.mode, **payload)
+        except Exception:  # noqa: BLE001 - diagnostics never change the request
+            return
 
     def _record(
         self, decision: BoundaryDecision, pending: dict, *, event: str | None = None, extra: dict | None = None

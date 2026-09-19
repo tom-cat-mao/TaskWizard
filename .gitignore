@@ -122,3 +122,6 @@ tests/test_grounding_bench_*.py
 
 # MkDocs build output
 site/
+
+# Local pi project state (SoL-Pi install)
+.pi/

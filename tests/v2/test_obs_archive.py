@@ -386,7 +386,10 @@ def test_tool_archive_failure_returns_error_text_not_an_exception(tmp_path):
     recall = _tool_by_name(session, BrokenArchive(), "recall_screen")
     receipt = recall.invoke({"screen_seq": 1})
     assert receipt.startswith("error: recall_screen")
-    assert "db locked" in receipt
+    # Foreign exceptions expose only their type name, never raw text that may
+    # carry local paths; the archive's own ObsArchiveError text stays verbatim.
+    assert "RuntimeError" in receipt
+    assert "db locked" not in receipt
 
 
 # --------------------------------------------------------------------------

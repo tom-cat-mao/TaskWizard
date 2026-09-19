@@ -33,10 +33,20 @@ _READ_ONLY_NOTE = (
 
 
 def _error_text(tool: str, exc: BaseException) -> str:
-    """Honest failure receipt (P0 #5) for an archive read that could not run."""
+    """Honest failure receipt (P0 #5) for an archive read that could not run.
 
+    The archive's own :class:`ObsArchiveError` messages are curated, path-free
+    text ("未找到 screen#7…") and are shown verbatim; foreign exceptions
+    (sqlite/os) may carry local paths, so only their type name is exposed.
+    """
+
+    detail = (
+        f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, ObsArchiveError)
+        else type(exc).__name__
+    )
     return (
-        f"error: {tool} 失败（{type(exc).__name__}: {exc}）。"
+        f"error: {tool} 失败（{detail}）。"
         f"{_READ_ONLY_NOTE}存档读取失败不影响当前屏幕状态。"
     )
 

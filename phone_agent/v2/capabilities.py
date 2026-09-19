@@ -973,7 +973,7 @@ def assemble_capabilities(
 
 
 def build_capability_registry(config: Any) -> CapabilityRegistry:
-    """Build the twelve-capability composition shared by agent and runner."""
+    """Build the thirteen-capability composition shared by agent and runner."""
 
     registry = CapabilityRegistry()
     for spec in (
