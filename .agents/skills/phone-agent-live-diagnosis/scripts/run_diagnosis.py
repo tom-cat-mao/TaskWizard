@@ -73,10 +73,16 @@ DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "live-diagnosis"
 _ARTIFACT_GLOBS = ("summary.json", "report.html", "evidence.jsonl", "status.json", "case.json", "launch.json", "*.evidence.jsonl")
 
 # Terminal harness states that mean "the run ended" (real run_end event).
+# Mirrors the producer's vocabulary (``run_events.terminal_status``) plus the
+# reader-derived ``stopped``.  ``token_budget_exhausted`` is a defensive alias:
+# the reader already normalizes both spellings to ``budget_exhausted``, so the
+# key is unreachable and dropping it would not change behavior.
+# Contract-tested in ``tests/skill/test_runner_protocol_offline.py``.
 _TERMINAL_STATES = {
     "succeeded",
     "takeover",
     "stopped",
+    "budget_exhausted",
     "token_budget_exhausted",
     "loop_fuse",
     "error",

@@ -9,7 +9,8 @@ append-only / atomically-replaced files under ``<runs_dir>/<run_id>/``
   output: ``model_request`` / ``model_call`` / ``tool_call`` / ``tool_result`` /
   ``screen`` / ``taskdoc_snapshot`` / ``pending_hitl`` / ``safety_warning`` /
   ``stopping`` / ``memory_generation_drift`` / ``capability_snapshot`` /
-  ``run_end``;
+  ``model_stream_start`` / ``model_stream_delta`` / ``model_stream_end``
+  (observe-only streaming projection, P0 #22) / ``run_end``;
 * ``control.jsonl`` — the human/stop channel the driver appends to
   (``{"type": "stop"}`` / ``{"type": "hitl", "answer": ...}``);
 * ``run.json`` — the atomic terminal *summary* (a recorded artifact).

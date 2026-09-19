@@ -295,6 +295,46 @@ def test_explicit_failed_state_is_failed():
     assert summary["verdict"] == "failed"
 
 
+def test_budget_exhausted_state_maps_to_verdict_and_budget_flag():
+    """The normalized IPC state must be handled by both analyzer surfaces.
+
+    The reader normalizes ``run_end`` status/reason to ``budget_exhausted``
+    before analyze sees it, so a mapping that only knows the old spelling left
+    the verdict at ``uncertain`` and ``budget.exhausted`` at False while the
+    report showed ``state=budget_exhausted``.
+    """
+
+    view = RunnerEventsView(
+        events=[
+            {
+                "event": "run_end",
+                "status": "budget_exhausted",
+                "result": {"success": False, "reason": "token_budget_exhausted", "steps": 7},
+            }
+        ],
+    )
+    summary = build_summary({}, EvidenceView(events=[]), run_id="t1", created_at="t", target="g", events=view)
+    assert summary["harness_terminal"]["state"] == "budget_exhausted"
+    assert summary["harness_terminal"]["source"] == "runner_ipc"
+    assert summary["verdict"] == "budget_exhausted"
+    assert summary["budget"]["exhausted"] is True
+
+
+def test_legacy_budget_state_alias_is_defensive_only():
+    """Directly-built harness blocks with the old key keep mapping.
+
+    ``harness_terminal()`` never produces ``token_budget_exhausted`` anymore;
+    the alias exists only so an out-of-band harness block cannot fall through
+    to ``uncertain``.
+    """
+
+    from analyze import build_budget, classify_verdict
+
+    harness = {"source": "runner_ipc", "state": "token_budget_exhausted", "finished": False}
+    assert classify_verdict({}, EvidenceView(events=[]), harness) == "budget_exhausted"
+    assert build_budget(EvidenceView(events=[]), None, harness)["exhausted"] is True
+
+
 def test_running_has_steps_from_events():
     view = RunnerEventsView(events=[{"event": "model_call", "step": 4}])
     summary = build_summary({}, EvidenceView(events=[]), run_id="t1", created_at="t", target="g", events=view)

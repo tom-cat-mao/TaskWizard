@@ -36,10 +36,18 @@ Marks-first: `tap` binds a unique mark (`target_mark_id` or a unique
 ## Three judgments — never collapse them
 
 1. **Harness terminal (fact).** Did the run *end*, and how? Derived only from
-   real events (`run_end` / `run.json`): `succeeded | takeover | stopped |
-   token_budget_exhausted | loop_fuse | error | failed | uncertain`. Only the IPC
-   `run_end` **event** is terminal; a `run.json` is a recorded summary shown
-   separately and is never reported as `run_end_seen`. A *requested* stop
+   real events (`run_end` / `run.json`). The IPC status vocabulary is the one
+   `run_events.terminal_status()` emits — `succeeded | takeover |
+   budget_exhausted | loop_fuse | error | failed` — plus the reader-derived
+   `stopped` (console stop). The launcher's accept set is that vocabulary plus a
+   **defensive** `token_budget_exhausted` alias — unreachable through the reader,
+   which already normalizes both spellings
+   (`run_diagnosis.py::_TERMINAL_STATES`), pinned by the contract test
+   `tests/skill/test_runner_protocol_offline.py`. `uncertain` is only the
+   *report verdict* for a run with no terminal event — never a `run_end`
+   status. Only the IPC `run_end` **event** is terminal; a `run.json` is a
+   recorded summary shown separately and is never reported as
+   `run_end_seen`. A *requested* stop
    (`control.jsonl {"type":"stop"}`) is **not** an ended run. The runner process
    exit code is never treated as success.
 2. **Case acceptance (objective evidence).** The Case's checkpoints are judged
@@ -106,6 +114,24 @@ answer while a previous one is submitted-but-not-yet-consumed. `monitor` and
 `status` re-derive state live from the IPC files (shared derivation), so an ended
 run never keeps reporting `running`.
 
+Flags: `start`/`case`/`run` accept the run-flag family (`--device-id`,
+`--max-steps`, `--token-budget`, `--base-url`, `--model`, `--apikey`,
+`--model-timeout`, `--model-max-retries`, `--grounding-provider`,
+`--accessibility-timeout`, `--accessibility-max-marks`,
+`--locateanything-model`, `--locateanything-max-size`, `--lang`, `--no-taskdoc`,
+`--output-dir`, `--quiet`); `wait`/`case`/`run` also take `--timeout`, `wait`
+and `monitor` take `--interval` (`monitor` also `--follow`), `report` takes
+`--evidence` / `--output`. Full list: `run_diagnosis.py <sub> -h` and
+`references/run-and-monitor.md`.
+
+**Diagnostic evidence comes only from this launcher.** `python main_v2.py
+"<task>"` runs the same agent, but its CLI never turns the diagnostic evidence
+stream on (production default `off`), so it writes no `<run_id>.evidence.jsonl`
+or `screenshots/` and cannot back a replay or a Case verdict. Live acceptance
+must go through `run_diagnosis.py`, whose spec overrides set
+`diagnostic_evidence` + `diagnostic_unredacted`
+(`phone_agent/v2/agent.py` consumes the latter).
+
 Exit codes for `case`/`run`/`wait` follow the harness, not the worker process:
 `0` succeeded, `2` ended non-success, `3` timeout (still running), `4` process
 died without a `run_end`, `5` still running. The runner process exit code is
@@ -132,7 +158,10 @@ with `confirm_irreversible=true`. `ask_user` / `take_over` always interrupt.
   spec.json                 # RunSpec (resolved config + fingerprint snapshot)
   events.jsonl              # runner IPC event stream (state authority)
   control.jsonl             # stop / hitl channel (submitted, not consumed)
-  run.json                  # recorded summary (NOT a run_end event)
+  run.json                  # recorded summary + per-role ledger usage (NOT a run_end event)
+  launch.json               # launcher startup descriptor: subcommand + case/target arg + pid (flags not recorded)
+  runner.pid                # runner-owned liveness pid (removed on terminal)
+  runner.log                # detached runner stdout/stderr
   <run_id>.evidence.jsonl   # producer diagnostic stream (replay authority)
   evidence.jsonl            # derived stable copy of the producer stream
   screenshots/screen-<n>.png  # decoded frames; reference frames use ref ids
@@ -161,8 +190,14 @@ artifacts are `0600`.
   receipt does not prove the verifier ran/passed; fail-open outage is `skipped`,
   never displayed as `pass`.
 - **Budget vs ledger.** `visible_used_tokens` is only the actor's provider-
-  reported usage; the harness `UsageLedger` (aux + estimates) is not exported, so
-  `ledger_used_tokens` is `unknown`.
+  reported usage parsed from `events.jsonl`. The harness `UsageLedger` **is**
+  exported: `run.json["usage"]` carries `UsageLedger.by_role()` per role (actor
+  / compact / verifier / reviewer / distill; provider-reported when available,
+  otherwise estimated), and the summary surfaces it as `run_summary.usage`
+  (`scripts/events.py::run_summary_block`). The budget card keeps
+  `ledger_used_tokens` at `unknown` **by choice** — the ledger total must not be
+  equated with the visible actor usage — so read the per-role numbers from
+  `run_summary`, not from the budget block.
 - **`dry-run` is synthetic and isolated.** It always uses the built-in synthetic
   Case and a unique new directory; it never deletes existing data or reads local
   config / global memory.
