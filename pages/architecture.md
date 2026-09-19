@@ -110,6 +110,8 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 
 同一轮模型给出的多个工具调用由 execution-admission 监听器**串行**执行：整个调用期间持有可重入锁，并按 provider 的并发上限 1 保证声明顺序。进入终局转换（finish 被接受或 takeover 被接受）后，同轮剩余 sibling 不再执行，只收到 status 为 error 的 skipped 回执。`PHONE_AGENT_PARALLEL_TOOL_CALLS` 只是 provider hint（默认下发 `parallel_tool_calls=false`；设 `true` 则不发送该 hint），不解除串行。<!-- allow:不再 -->
 
+同轮里非最后的观测类工具只回紧凑文本回执（见[同轮中间步骤回执](#sibling-receipts)），其观测仍逐步完整执行；串行与 skipped 语义不变。
+
 ## App 名解析 {#app-name-resolution}
 
 `launch_app("哔哩哔哩")` 的名字→包名解析分四层：归一化 → 多路候选生成（精确别名 / 词汇 / 拼音 / 嵌入向量）→ 先验排序 → 证据分型三态决策（resolved / ambiguous / unknown）。这一归属唯一在 `phone_agent/v2/names.py`，包括归一化、包名去重、先验排序与三态判定。
@@ -129,6 +131,8 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 | OBS marks 折叠 | 最新 `PHONE_AGENT_OBS_MARKS_KEEP`（默认 2）条观测的完整 `marks (K):` 摘要 | 一行 `[OBS] app=X screen#N [marks 已折叠:K]` 占位 |
 
 两趟都按“含图消息”/“含 marks 的观测”逐条计数，而不是按图片块计数；两个上限都钳到至少 1。占位符不带图片块、折叠行不带 `marks (` 标记，因此重跑不会再次改写已经处理过的历史（滚动窗口之外的稳定前缀不变）。
+
+同一轮里非最后的观测工具只回紧凑文本回执（见[同轮中间步骤回执](#sibling-receipts)），不产生图片块：剪除规则本身不变（仍是保留最新 K 条**含图**消息），变的是同一轮里含图消息的条数——该轮动作前的画面与本轮最后一个观测可以同时留在窗口内，而不是被中间帧挤掉。回执文本不带 `marks (` 摘要标记，OBS marks 折叠不会改写它。
 
 工具成功通常回传新截图；没有截图载荷时（安全保护屏、观测窗口最终失败且无有效截图、`locate` 无暂存帧）只回文本。
 
@@ -173,6 +177,15 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 每个工具调用都带 `intent`（本步目标，system prompt 要求必填）与可选的 `note`；两者在 schema 上都是可选参数，缺省分别是空串与 `null`。工具回执写实际发生了什么（如 `已点击「上海」(ax_3)`、`已输入 '…'`），流程线据此派生出真实账本。
 
 流程线由 transcript **纯派生**，不持有 session 状态：取最近 8 步，格式为 `#N <intent> → <工具><目标> → <状态>｜note`，各字段有长度截断。停滞轻推不产生行为，`PHONE_AGENT_TASKDOC_NUDGE_STEPS` 是保留的 no-op。
+
+### 同轮中间步骤回执 {#sibling-receipts}
+
+同一轮给出多个观测类工具调用（`tap` / `long_press` / `type_text` / `scroll` / `swipe` / `back` / `home` / `wait` / `launch_app` / `read_screen`）时，除该轮最后一个观测工具外，每个成功动作的观测部分改为紧凑文本回执：`OK. …` 动作回执不变，观测块只给 `app=`、`screen#N`、`marks (K)` 与一行结构差分（如 `较上次观测：marks 41→34；窗口 3→2；前台 a→b`）。`PHONE_AGENT_SIBLING_RECEIPTS`（默认 `on`）只改呈现：`session.observe()` 对每个动作照常完整执行、批次照常推进（[原子观测](#atomic-observation) 不变）。
+
+- 轮次内最后一个观测工具、单动作轮、以及后面只跟 TaskDoc / finish / deliverable 等无观测调用的轮次不受影响：成功时照旧附完整截图与 marks 摘要，寻址基准（最新批次）在下一次模型调用前完整出现；
+- 若最后一个观测工具失败，失败文本照旧（[工具回执与失败语义](#tool-fail-closed)）；中间回执仍指向它提交的 `screen#N` 并提示用 `read_screen` 取回最新批次的完整摘要；
+- `locate` 不在回执范围内：它回的是视觉定位使用的那一帧，不是新批次；
+- `off` 时不设回执提示，每条观测都附完整截图与 marks 摘要。
 
 ## finish 两段式与验收 {#finish-two-step}
 

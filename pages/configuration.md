@@ -109,6 +109,7 @@
 | `PHONE_AGENT_MEMORY_MODEL` | str | 主模型 | compact 摘要与 `--distill` 的两次调用（候选抽取 + 自评分）共用的模型；缺省回落到主模型，`roles.distill.model` 优先于本键 |
 | `PHONE_AGENT_IMAGE_KEEP` | int | `2` | 历史中保留的含图消息数 |
 | `PHONE_AGENT_OBS_MARKS_KEEP` | int | `2` | 历史中保留完整 marks 摘要的观测数 |
+| `PHONE_AGENT_SIBLING_RECEIPTS` | `on`/`off` | `on` | 同一轮多个观测类工具时，非最后一个只回紧凑文本回执（`screen#N` + marks 数 + 结构差分），不附图与 marks 摘要；该轮最后一个观测仍附完整截图与摘要。只改呈现，不跳过观测；`off` 时每条观测都附完整截图与 marks 摘要（见[同轮中间步骤回执](architecture.md#sibling-receipts)） |
 
 ### 预算契约 {#token-budget}
 
