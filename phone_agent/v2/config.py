@@ -335,6 +335,16 @@ class V2Config:
     # context hygiene (S1 §1.4/§2): rolling image + OBS-marks pruning windows
     image_keep: int = 2
     obs_marks_keep: int = 2
+    # Sibling receipts (work item D, presentation only). A multi-tool turn can
+    # hold several observation tools; a non-final one returns a compact text
+    # receipt (screen_seq + foreground + marks count + one-line structural diff)
+    # instead of a fresh screenshot + marks digest, because a later sibling's
+    # observe() re-mints the batch (P0 #2) and pushes the image out of the
+    # image-keep window unseen (P0 #3). Sampling is untouched: observe() still
+    # runs in full for every action (P0 #15) and the turn's final observation
+    # sibling keeps the full shape (P0 #5 keeps failure text as-is). ``off``
+    # restores the pre-change transcript byte-for-byte.
+    sibling_receipts_enabled: bool = True
     # grounding
     grounding_provider: str = "hybrid"
     accessibility_timeout: float = 3.0
@@ -651,6 +661,10 @@ class V2Config:
             ),
             image_keep=_env_int("PHONE_AGENT_IMAGE_KEEP", 2),
             obs_marks_keep=_env_int("PHONE_AGENT_OBS_MARKS_KEEP", 2),
+            sibling_receipts_enabled=(
+                _env_choice("PHONE_AGENT_SIBLING_RECEIPTS", "on", ("on", "off"))
+                == "on"
+            ),
             grounding_provider=_env_str("PHONE_AGENT_GROUNDING_PROVIDER", "hybrid"),
             accessibility_timeout=_env_float("PHONE_AGENT_ACCESSIBILITY_TIMEOUT", 3.0),
             accessibility_max_marks=_env_int("PHONE_AGENT_ACCESSIBILITY_MAX_MARKS", 80),
