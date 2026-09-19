@@ -3,6 +3,31 @@
 Two append-only planes plus a terminal summary. The analyze layer reads all of
 them; each is fail-open (a torn final line is skipped).
 
+## Run dir layout
+
+```text
+<output_dir>/<run_id>/
+  spec.json                 # RunSpec (resolved overrides + fingerprint snapshot)
+  events.jsonl              # runner IPC event stream (state authority)
+  control.jsonl             # stop / hitl channel (submitted, not consumed)
+  run.json                  # recorded summary + per-role ledger usage
+  launch.json               # launcher startup descriptor: run_id/task/case_id/command/pid
+  runner.pid                # runner-owned liveness pid (written at start, removed on terminal)
+  runner.log                # detached runner stdout/stderr (0600)
+  <run_id>.evidence.jsonl   # producer diagnostic stream (replay authority)
+  evidence.jsonl            # derived stable copy of the producer stream
+  screenshots/screen-<n>.png  # decoded frames; reference frames use ref ids
+  traces/<run_id>.jsonl     # P0 #6 production trace
+  case.json summary.json report.html status.json
+```
+
+`launch.json` is written by the launcher **before** the spawn and records the
+startup descriptor — subcommand + case/target arg + pid; run flags are not
+recorded there (a later `analyze`/`wait` must never overwrite it). Its `pid` is
+the liveness anchor only until `runner.pid` appears, and after that the runner
+owns liveness. A dead process without a `run_end` is `unknown_terminated`, never
+success.
+
 ## Runner IPC — `events.jsonl` (state authority)
 
 Emitted by `phone_agent.v2.run_events.WebEventMiddleware`. Events observed by the
@@ -19,6 +44,7 @@ analysis:
 | `safety_warning` | a `wary` warning was returned in place of execution |
 | `stopping` | the soft-stop jump fired |
 | `capability_snapshot` / `memory_generation_drift` | assembly facts |
+| `model_stream_start` / `model_stream_delta` / `model_stream_end` | observe-only streaming projection (P0 #22; present only when streaming is resolved on): `attempt`, redacted/bounded `text`/`reasoning`, terminal `ok`/`error` |
 | `run_end` | terminal `status` + `result{success, reason, steps}` + `tokens_total` |
 
 `control.jsonl` carries `{"type":"stop"}` / `{"type":"hitl","answer":...}`. A
@@ -64,17 +90,32 @@ event yields `unknown_terminated` (`run_end_seen=false`,
 | `succeeded` | `run_end` `result.success` true (finish accepted) |
 | `takeover` | `run_end` status `takeover` (not a console stop) |
 | `stopped` | takeover reason == `用户从 Web 控制台停止` |
-| `token_budget_exhausted` | status / reason |
+| `budget_exhausted` | status `budget_exhausted` / reason `token_budget_exhausted` |
 | `loop_fuse` | status / reason |
 | `error` / `failed` | status `error` / `failed` |
 | `running` / `stopping` | no `run_end`; stop requested or not |
 | `unknown_terminated` | no `run_end` but a `run.json` summary exists |
 
+The producer's `run_events.terminal_status()` emits `succeeded | takeover |
+budget_exhausted | loop_fuse | error | failed`; the reader adds the derived
+`stopped`. The launcher's `run_diagnosis.py::_TERMINAL_STATES` accepts that
+vocabulary plus a **defensive** `token_budget_exhausted` alias — the reader
+normalizes both spellings, so the alias is unreachable through `harness_terminal`
+— and `tests/skill/test_runner_protocol_offline.py` fails if either side renames
+a status (it does not catch a newly added producer branch). The analyzer
+(`analyze.py::classify_verdict`, `build_budget`) maps the same normalized
+vocabulary, so a verdict is never left at `uncertain` for a terminal
+`budget_exhausted` run.
+
 Usage totals report `null` for any missing field. Completeness is judged
 **per call** (not by unioning fields across calls): ``total_tokens`` exists only
 when every call reported both input and output; a partially-reported cache stays
 ``None`` even if other calls reported a cache value. A ``coverage`` block reports
-how many calls carried each field.
+how many calls carried each field. The harness ``UsageLedger`` is exported
+separately as `run.json["usage"]` per role (``UsageLedger.by_role()``), surfaced
+in the summary as `run_summary.usage`; the `budget` block deliberately keeps
+`ledger_used_tokens` at `unknown` rather than equating visible actor usage with
+the ledger total.
 
 ``status`` / ``monitor`` re-derive the above live from the IPC files (shared
 derivation): a dead process without a ``run_end`` becomes ``unknown_terminated``;
@@ -87,7 +128,8 @@ the persisted ``status.json`` is only a derived cache (``status_source`` says
 
 - `harness_terminal` — state / finished / finish_summary / takeover_reason /
   reason / stop_requested / run_end_seen / run_summary_present / steps;
-- `run_summary` — the recorded `run.json` summary, shown separately;
+- `run_summary` — the recorded `run.json` summary, shown separately (includes
+  per-role ledger `usage`);
 - `data_issues[]` — bounded JSONL parse issues;
 - `case` + `case_acceptance` — Case definition and per-checkpoint status;
 - `diagnosis` — inference caveat;

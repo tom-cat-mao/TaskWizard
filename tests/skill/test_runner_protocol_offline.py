@@ -13,9 +13,20 @@ from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage, ToolMessage
 
-from events import RunnerEventsView, read_jsonl_with_issues
+from case import STOP_TAKEOVER_REASON
+from events import (
+    TERMINAL_BUDGET,
+    TERMINAL_ERROR,
+    TERMINAL_FAILED,
+    TERMINAL_LOOP_FUSE,
+    TERMINAL_SUCCEEDED,
+    TERMINAL_TAKEOVER,
+    RunnerEventsView,
+    read_jsonl_with_issues,
+)
 from phone_agent.v2.agent import RunResult
 from phone_agent.v2.run_events import WebEventMiddleware, terminal_status
+from run_diagnosis import _TERMINAL_STATES, _exit_code_from_summary
 
 
 class _Sink:
@@ -127,3 +138,85 @@ def test_real_tool_result_event_shape_round_trips():
     result = next(e for e in sink.events if e.get("event") == "tool_result")
     assert result["tool"] == "read_screen"
     assert "screen#1" in result["text"]
+
+
+# Every reason ``RunResult`` can carry out of ``ThinPhoneAgent._build_result``
+# (plus the runner's own ``error:`` path), the session takeover marker, and the
+# status the real ``terminal_status`` produces for it.  The launcher's
+# ``_TERMINAL_STATES`` must accept all of them; it is the one protocol surface
+# without a contract test, and the ``token_budget_exhausted`` ->
+# ``budget_exhausted`` rename slipped through it once already.
+_TERMINAL_STATUS_CASES = [
+    (RunResult(True, "已确认完成", 4), None, "succeeded"),
+    (RunResult(False, "token_budget_exhausted", 7), None, "budget_exhausted"),
+    (RunResult(False, "loop_fuse", 100), None, "loop_fuse"),
+    (RunResult(False, "error: RuntimeError: boom", 3), None, "error"),
+    (RunResult(False, "model_stopped", 5), None, "failed"),
+    (RunResult(False, "hitl_resume_exhausted", 9), None, "failed"),
+    (RunResult(False, "需要验证码", 2), "需要验证码", "takeover"),
+]
+
+
+def test_terminal_status_vocabulary_is_terminal_for_launcher():
+    """Producer statuses must be terminal for ``run_diagnosis``.
+
+    Regression pin: when the launcher still listed only the old
+    ``token_budget_exhausted`` name, a budget-exhausted run's IPC status
+    ``budget_exhausted`` was not in ``_TERMINAL_STATES``, so
+    ``_status_from_harness`` fell through to ``state_class = "incomplete"`` and
+    ``_exit_code_from_summary`` therefore returned 5 ("still running") instead
+    of 2 ("ended non-success") for ``wait``/``case``. ``_wait_loop`` itself
+    always converges on the real ``run_end`` and is unaffected.
+    """
+
+    for result, takeover_reason, expected_status in _TERMINAL_STATUS_CASES:
+        session = SimpleNamespace(takeover_reason=takeover_reason)
+        status = terminal_status(result, _agent(session))
+        assert status == expected_status, (result, status)
+        assert status in _TERMINAL_STATES, status
+
+    # Defensive alias: the reader normalizes old spellings away, so this key is
+    # unreachable through real events — pinned so it is not dropped silently.
+    assert "token_budget_exhausted" in _TERMINAL_STATES
+
+
+def test_reader_harness_states_are_terminal_for_launcher():
+    """Real ``run_end`` events round-trip into launcher-terminal states."""
+
+    for result, takeover_reason, status in _TERMINAL_STATUS_CASES:
+        sink = _Sink()
+        WebEventMiddleware(sink).emit_run_end(result, status=status)
+        derived = RunnerEventsView(events=sink.events).harness_terminal()
+        assert derived["state"] in _TERMINAL_STATES, (status, derived)
+
+    # A console stop is published as ``takeover`` with the stop reason; the
+    # reader derives ``stopped``, which must be terminal for the launcher too.
+    sink = _Sink()
+    WebEventMiddleware(sink).emit_run_end(
+        RunResult(False, STOP_TAKEOVER_REASON, 3), status="takeover"
+    )
+    derived = RunnerEventsView(events=sink.events).harness_terminal()
+    assert derived["state"] == "stopped"
+    assert derived["state"] in _TERMINAL_STATES
+
+
+def test_reader_exported_terminal_constants_are_terminal_for_launcher():
+    """The reader's exported vocabulary stays inside the launcher's set."""
+
+    for status in (
+        TERMINAL_SUCCEEDED,
+        TERMINAL_BUDGET,
+        TERMINAL_LOOP_FUSE,
+        TERMINAL_TAKEOVER,
+        TERMINAL_ERROR,
+        TERMINAL_FAILED,
+        "stopped",  # reader-derived, not a producer status
+    ):
+        assert status in _TERMINAL_STATES, status
+
+
+def test_budget_exhausted_run_exits_two_not_five():
+    """Exit-code consequence: a budget-exhausted run ended non-success."""
+
+    summary = {"harness_terminal": {"state": TERMINAL_BUDGET}}
+    assert _exit_code_from_summary(summary) == 2

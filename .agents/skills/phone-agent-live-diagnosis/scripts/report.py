@@ -562,7 +562,7 @@ function renderDimensions() {
       <h3>预算</h3><table>
         ${row('token 预算', b.token_budget)}
         ${row('visible_used（actor 上报）', b.visible_usage_reported ? (b.visible_used_tokens ?? 'partial') : '未上报')}
-        ${row('ledger（含 aux/估算）', b.ledger_available ? (b.ledger_used_tokens ?? '—') : 'unknown（未导出）')}
+        ${row('ledger（含 aux/估算）', b.ledger_available ? (b.ledger_used_tokens ?? '—') : 'unknown（按 role 见 run_summary.usage）')}
         ${row('预算耗尽 / 保险丝', `${b.exhausted} / ${b.loop_fuse_hit}`)}</table>
       ${fb.length ? `<h3>模型降级（真实 model_fallback 事件）</h3><table><tr><th>stage</th><th>role</th><th>requested→actual</th><th>reason</th><th>outcome</th></tr>${fb.map(f=>`<tr><td class="mono">${esc(f.stage)}</td><td class="mono">${esc(f.role)}</td><td class="mono wrap">${esc(f.requested)}→${esc(f.actual)}</td><td class="mono wrap">${esc(f.reason)}</td><td>${esc(f.outcome)}</td></tr>`).join('')}</table>` : '<div class="muted" style="margin-top:6px">无 model_fallback 事件。</div>'}</div>
     <div class="card"><h2>上下文卫生</h2><table>

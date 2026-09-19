@@ -5,8 +5,13 @@ a reviewer knows where to look first. `path:line` anchors mark where a symbol
 lives, not where a bug was proven. Treat every mapping as a candidate; confirm it
 against the cited step evidence before calling anything a root cause.
 
-The machine-readable table is `scripts/sourcemap.py::V2_SOURCE_RULES`; the
-contract test `tests/skill/test_sourcemap.py` keeps it honest.
+The machine-readable table is `scripts/sourcemap.py::V2_SOURCE_RULES`. The
+contract test `tests/skill/test_sourcemap.py` covers only **selected**
+categories (resolver / deliverable / secure_screenshot / recall / capabilities,
+plus the `launch` and `resolver` receipt cases): it pins their candidate files
+and checks that every listed path exists with at least one anchor. It is *not*
+a full-table contract — a row outside those categories can drift without
+failing the test.
 
 | Category | Layer | Candidate v2 files |
 |---|---|---|

@@ -115,6 +115,9 @@ def classify_verdict(
             "succeeded": "success",
             "takeover": "takeover",
             "stopped": "stopped",
+            "budget_exhausted": "budget_exhausted",
+            # Defensive only: the reader normalizes both spellings to
+            # ``budget_exhausted`` before this mapping sees them.
             "token_budget_exhausted": "budget_exhausted",
             "loop_fuse": "loop_fuse",
             "error": "error",
@@ -480,9 +483,10 @@ def build_budget(
 
     ``visible_used_tokens`` is only the *actor's provider-reported* usage seen in
     the event stream. It is **not** the harness ``UsageLedger`` total (which also
-    includes aux/verifier calls and estimates). No ledger is exported to the
-    diagnosis artifacts, so the ledger total is ``unknown`` and must not be
-    equated with the visible usage.
+    includes aux/verifier calls and estimates). The ledger **is** exported per
+    role in ``run.json["usage"]`` (``UsageLedger.by_role()``, surfaced as
+    ``run_summary.usage``); this block deliberately keeps ``ledger_used_tokens``
+    ``unknown`` instead of folding two different quantities together.
     """
 
     usage = events.usage_totals() if events is not None else None
@@ -497,13 +501,16 @@ def build_budget(
         "visible_usage_partial": bool(usage.get("partial")) if usage else False,
         "ledger_available": False,
         "ledger_used_tokens": None,
-        "exhausted": state == "token_budget_exhausted",
+        # The reader normalizes the legacy spelling away; the old name is kept
+        # here as a defensive alias for directly-constructed harness blocks.
+        "exhausted": state in {"budget_exhausted", "token_budget_exhausted"},
         "warn_remaining": config.get("token_warn_remaining"),
         "max_model_calls": config.get("max_model_calls"),
         "loop_fuse_hit": state == "loop_fuse",
         "note": (
             "token 预算在调用边界达到即停；max_model_calls 是独立的 runaway-loop 保险丝。"
-            "visible_used_tokens 仅为 actor 上报用量，不等于 harness UsageLedger（含 aux/估算，未导出→unknown）。"
+            "visible_used_tokens 仅为 actor 上报用量，不等于 harness UsageLedger（含 aux/估算）；"
+            "ledger 按 role 见 run_summary.usage，本块刻意不把两者合并。"
         ),
     }
 

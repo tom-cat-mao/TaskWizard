@@ -29,6 +29,39 @@ can answer HITL. The runtime owns ``runner.pid`` (written at start, removed on
 terminal); the launcher never writes it, and a dead process without a `run_end`
 is detected so `wait` does not spin for the full timeout.
 
+**Diagnostic evidence is launcher-only.** `python main_v2.py "<task>"` runs the
+same agent but its CLI never enables the diagnostic evidence stream
+(production default `off`), so it writes no producer `<run_id>.evidence.jsonl`
+or `screenshots/` and cannot back a replay or a Case verdict. Live acceptance
+goes through `run_diagnosis.py`, whose spec overrides set `diagnostic_evidence`
++ `diagnostic_unredacted` (consumed by `phone_agent/v2/agent.py`).
+
+### Flags
+
+Run flags on `start` / `case` / `run` (pass-through to `V2Config`; unset flags
+are dropped, so env / `.env` still apply):
+
+| flag | meaning |
+|---|---|
+| `--device-id` | ADB serial (blank = auto) |
+| `--max-steps` | runaway-loop fuse: max model calls |
+| `--token-budget` | token cost ceiling |
+| `--base-url` / `--model` / `--apikey` | model endpoint / name / key (resolved config lands in the owner-private `spec.json`; never in `launch.json`'s command) |
+| `--model-timeout` / `--model-max-retries` | transport limits |
+| `--grounding-provider` | grounding provider name |
+| `--accessibility-timeout` / `--accessibility-max-marks` | a11y dump limits |
+| `--locateanything-model` / `--locateanything-max-size` | visual locate provider |
+| `--lang cn\|en` | prompt language |
+| `--no-taskdoc` | disable the TaskDoc board |
+| `--output-dir` | run root (default `outputs/live-diagnosis`) |
+| `--quiet` | suppress the JSON payload on stdout (`dry-run` too) |
+
+Other subcommands: `wait --timeout S --interval S --quiet`; `monitor --follow
+--interval S`; `report --evidence <file> --output <path>` (explicit evidence
+stream for the raw tab; output path for `report.html`); `analyze --quiet`;
+`dry-run --output-dir D --quiet`. Ground truth is argparse itself:
+`run_diagnosis.py::_run_flags` / `build_parser` (`<sub> -h`).
+
 Exit codes for `case`/`run`/`wait`: `0` harness succeeded, `2` ended
 non-success, `3` timeout (still running), `4` process died without `run_end`,
 `5` still running. The runner's **process exit code is never used as harness or
@@ -79,7 +112,13 @@ answer only records that a human **submitted** a reply; only the runner's
 - any answer when there is no currently pending prompt (no pre-queuing).
 
 **The skill never auto-approves** — an unanswered prompt stays unresolved in the
-report.
+report. The runtime fallback is deny, not approve: if the control channel is
+closed while the runner is blocked in HITL, `ControlChannel.wait_for_hitl()`
+returns `"reject"` (`phone_agent/v2/runner.py`), and a `stop` request also
+unblocks a pending prompt with `"reject"` before the soft stop. That fallback is
+a runner-side clearing event, not a human answer — `control.jsonl` never records
+an answer for it, so `hitl_submitted` stays 0 while `hitl_consumed` counts the
+cleared prompt.
 
 In `wary` mode most risky calls do not interrupt at all: they return a warning
 and the model must resend with `confirm_irreversible=true`. In `hard` mode a
