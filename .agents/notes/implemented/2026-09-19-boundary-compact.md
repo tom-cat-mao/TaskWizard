@@ -30,6 +30,10 @@ Status: implemented
   （即一次摘要调用的输入加输出，摘要上限取 `PHONE_AGENT_COMPACT_SUMMARY_TOKENS`）；
 - 只有 `benefit ≥ MIN_NET_RATIO × cost`（默认 1.5）且区间、horizon 各自过下限才折叠，否则记录
   推迟原因。估算全部走 `middleware/_tokens.py`，不引入第二套计量。
+- 同一 waterfall pass 内已有折叠提交（容量 T2 或更早的边界折叠）时，armed boundary 直接作废，
+  只记 `boundary_compact_skipped`（`reason=fold_already_committed`）、不再产生决策事件，因此
+  一 pass 至多一折：这是评审后补的 generation latch（`middleware/boundary_compact.py` 的
+  `on_pre_request`，arm 时记下 compact 的 generation、检查点比对）。
 
 明确不做：不新增计划工具，不猜工作流，不因为「看起来像边界」就折；窗口压力与物理容量折叠
 （T2）始终优先且完全不属于本能力的管辖——监听器注册在 compact 之内，容量折叠刚折过的检查点上

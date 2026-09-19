@@ -132,7 +132,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 
 两趟都按“含图消息”/“含 marks 的观测”逐条计数，而不是按图片块计数；两个上限都钳到至少 1。占位符不带图片块、折叠行不带 `marks (` 标记，因此重跑不会再次改写已经处理过的历史（滚动窗口之外的稳定前缀不变）。观测存档能力开启时，折叠占位会追加 `[可 recall_screen]` 后缀（[观测存档与召回](#obs-archive)）；能力关闭时占位文本逐字节保持本节口径。
 
-同一轮里非最后的观测工具只回紧凑文本回执（见[同轮中间步骤回执](#sibling-receipts)），不产生图片块：剪除规则本身不变（仍是保留最新 K 条**含图**消息），变的是同一轮里含图消息的条数——该轮动作前的画面与本轮最后一个观测可以同时留在窗口内，而不是被中间帧挤掉。回执文本不带 `marks (` 摘要标记，OBS marks 折叠不会改写它。
+同一批（同一 AI 消息的 `tool_calls`）里非最后的观测工具只回紧凑文本回执（见[同轮中间步骤回执](#sibling-receipts)），不产生图片块：剪除规则本身不变（仍是保留最新 K 条**含图**消息），变的是同批含图消息的条数——该批动作前的画面与本批最后一个观测可以同时留在窗口内，而不是被中间帧挤掉。回执文本不带 `marks (` 摘要标记，OBS marks 折叠不会改写它。
 
 工具成功通常回传新截图；没有截图载荷时（安全保护屏、观测窗口最终失败且无有效截图、`locate` 无暂存帧）只回文本。
 
@@ -140,11 +140,11 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 
 ## 观测存档与召回 {#obs-archive}
 
-`PHONE_AGENT_OBS_ARCHIVE=on`（默认 `off`）时，harness 把每次**提交成功**的观测的模型可见 `[OBS]` 文本原样存档到 `PHONE_AGENT_OBS_ARCHIVE_DIR`（默认 `memory/obs_archive`）：每个 run 一个 `<run_id>.jsonl` 追加式真相，外加一个可重建的 SQLite FTS5 索引 `<run_id>.db`（派生态，缺失、损坏或被外部追加时从 jsonl 重建）。每条记录带 `run_id`、`epoch`、`screen_seq`、前台包名与时间戳。
+`PHONE_AGENT_OBS_ARCHIVE=on`（默认 `off`）时，harness 把每次**提交成功**的观测的模型可见 `[OBS]` 文本原样存档到 `PHONE_AGENT_OBS_ARCHIVE_DIR`（默认 `memory/obs_archive`）：每个 run 一个 `<run_id>.jsonl` 追加式真相，外加一个可重建的 SQLite FTS5 索引 `<run_id>.db`（派生态；重建由 jsonl 字节数校验触发、每进程一次，覆盖缺失/损坏/被外部追加）。每条记录带 `run_id`、`epoch`、`screen_seq`、前台包名与时间戳。
 
 - **纯文本**：截图与 base64 永不进入存档（与 [trace](#trace-redaction) 同一隐私边界，但存档与 trace 是两套落盘面）；
 - 观测失败（含未验证参考图）不存档；生产者仍是唯一的 `session.observe()`（[原子观测](#atomic-observation)），存档只是它的一个 fail-open 接收端，不新增观测路径；
-- 只挂两个只读工具：`recall_screen(screen_seq, offset, limit)` 按行分页回看某一帧，`search_screens(query, limit)` 在本 run 存档里做 FTS 检索、给出命中帧号与短摘要；
+- 只挂两个只读工具：`recall_screen`（帧号 + 分页）按行回看某一帧，`search_screens`（检索词 + 名额）在本 run 存档里做 FTS 检索、给出命中帧号与短摘要；
 - **召回不能绕过 marks-first**：回执里的历史 mark id 一律渲染为 `历史:ax_3@e12（已失效）`，工具说明与回执都明示这是历史证据、不能作为执行目标；要操作当前屏幕必须重新 `read_screen`（[mark 寻址](#marks-first)）；
 - 存档、索引与召回的任何失败都不影响 run：写入侧 fail-open（错误只进 trace 诊断），读取侧返回诚实的错误文本；
 - 保留最近 `PHONE_AGENT_OBS_ARCHIVE_KEEP_RUNS`（默认 20）个 run，更老的 jsonl 与其索引一并删除；
@@ -197,6 +197,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 
 - 轮次内最后一个观测工具、单动作轮、以及后面只跟 TaskDoc / finish / deliverable 等无观测调用的轮次不受影响：成功时照旧附完整截图与 marks 摘要，寻址基准（最新批次）在下一次模型调用前完整出现；
 - 若最后一个观测工具失败，失败文本照旧（[工具回执与失败语义](#tool-fail-closed)）；中间回执仍指向它提交的 `screen#N` 并提示用 `read_screen` 取回最新批次的完整摘要；
+- 若最后一个观测 sibling 因安全预警、预算拒绝或终局转换而未执行，中间回执即该批唯一证据：回执已写明帧号与 `read_screen` 取回路径（契约允许的代价，不是静默丢失）；
 - `locate` 不在回执范围内：它回的是视觉定位使用的那一帧，不是新批次；
 - `off` 时不设回执提示，每条观测都附完整截图与 marks 摘要。
 
