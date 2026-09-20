@@ -101,6 +101,8 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 - `op` 标注只出现在窗口化渲染；回退到单根渲染时不输出该字段；
 - 分组条件是出现多个不同窗口，或存在真窗口证据（layer/type）；否则按平铺布局渲染；
 - 名额按窗口配额分配，顶层弹窗有保底；
+- 软键盘窗口（`TYPE_INPUT_METHOD`）只有动作键（搜索/完成/发送/确定/前往/下一步/GO/Search/Done/Enter/Next，或带真实 IME action 者）成为 mark；其余键位不占配额、也不合成假 mark。折叠时 marks 摘要上一行给 `keyboard: open (N keys collapsed)` 计数注解，不含可寻址 id；
+- 节点标签以 `text` 为准，`content-desc` 只作无 `text` 节点的标签，resource-id 状的长 desc 不挤占 32 字展示预算；
 - 寻址语义不变：执行动作仍只认当前批次的 `ax_*@eN`；`op` 与窗口归属不参与 `resolve_mark` 判定，不是执行门控；
 - dump 失败（超时/解析错）触发一次重试，最终失败在观测文本显式标注，不装成“本屏无控件”。
 
