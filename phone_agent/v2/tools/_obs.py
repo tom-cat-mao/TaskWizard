@@ -33,6 +33,12 @@ untouched: ``session.observe()`` still runs in full, and an observation failure
 keeps its existing explicit failure text — a failed observation is never
 downgraded into a receipt (P0 #5). ``PHONE_AGENT_SIBLING_RECEIPTS=off`` never
 sets the hint, which restores the image+digest shape byte-for-byte.
+
+**Keyboard note (WP1, presentation only).** When the parser collapsed a
+``TYPE_INPUT_METHOD`` window, the OBS text carries one extra line above the
+marks summary — ``keyboard: open (N keys collapsed)`` — built from the
+``parse_summary`` counts. It explains a smaller ``marks (K)`` than the raw dump
+would suggest, and it is not an address: no mark id is minted here (P0 #2).
 """
 
 from __future__ import annotations
@@ -154,8 +160,29 @@ def format_observation_text(session, obs) -> str:
     annotation = _marks_failure_annotation(obs)
     return (
         f"[OBS] app={current_app} screen#{seq}\n"
+        f"{_keyboard_collapse_note(parse_summary)}"
         f"marks ({count_field}){retained_note}{annotation}: {digest}"
     )
+
+
+def _keyboard_collapse_note(parse_summary) -> str:
+    """One display-only line when the parser collapsed a soft-keyboard window.
+
+    WP1: the keyboard's key nodes never become marks (``accessibility.py``
+    drops them before the per-window quota), so the ``marks (K)`` count is
+    smaller than the raw dump suggests — otherwise a shrinking count reads as
+    "controls vanished". The line sits above the marks summary, carries counts
+    only, and is never an address: nothing in it is a mark id (P0 #2). Without
+    a collapse (no keyboard, legacy dump, or an IME window whose keys are all
+    action keys) the observations render byte-for-byte as before.
+    """
+
+    if not isinstance(parse_summary, dict):
+        return ""
+    collapsed = parse_summary.get("ime_collapsed_key_count")
+    if not isinstance(collapsed, int) or isinstance(collapsed, bool) or collapsed <= 0:
+        return ""
+    return f"keyboard: open ({collapsed} keys collapsed)\n"
 
 
 def _obs_text(session, settle_ms: int | None = None) -> tuple[str, object]:
