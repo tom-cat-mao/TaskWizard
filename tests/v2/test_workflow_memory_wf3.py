@@ -236,7 +236,11 @@ def _launch_session(tmp_path: Path):
     bus = EventBus()
     # ``vec_db=""`` keeps the resolver's embedding route from touching any
     # derived index (S3 test hygiene: never the repo's real memory/).
-    config = SimpleNamespace(device_id="serial-1", app_kb_enabled=True, vec_db="")
+    # ``observe_settle_ms=0``: this is a real PhoneSession, so the launch path
+    # must not pay the production settle.
+    config = SimpleNamespace(
+        device_id="serial-1", app_kb_enabled=True, vec_db="", observe_settle_ms=0
+    )
     device = FakeDeviceFactory(installed=frozenset({WECHAT}))
     session = PhoneSession(config, device_factory=device)
     session.event_bus = bus

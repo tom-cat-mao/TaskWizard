@@ -76,6 +76,7 @@ def _implicit_session(
         app_kb_enabled=True,
         implicit_alias_enabled=enabled,
         resolver_embed=False,
+        observe_settle_ms=0,  # real PhoneSession: never pay the production settle
     )
     device = FakeDeviceFactory(installed=frozenset({TRAVEL_PACKAGE}))
     session = PhoneSession(config, device_factory=device)

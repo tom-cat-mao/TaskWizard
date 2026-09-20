@@ -53,11 +53,27 @@ _BASE_DIRS = (
     REPO_ROOT / "phone_agent" / "v2",
 )
 
-# Never walked when resolving a bare module name: private runtime state, build
-# output and VCS metadata.
-_WALK_SKIP_DIRS = frozenset(
-    {".git", ".venv", "site", "node_modules", "memory", "outputs"}
+# Never walked when resolving a bare module name.  Two classes, because they
+# need different matching: local state a working copy grows but a fresh clone
+# does not have sits at the repository root; a virtualenv can be nested at any
+# depth (the isolated worktree under `.external-agent/` carries its own `.venv`).
+_ROOT_SKIP_DIRS = frozenset(
+    {".external-agent", ".git", ".pi", ".qoder", ".wt", "memory", "outputs", "site"}
 )
+
+_ANY_DEPTH_SKIP_DIRS = frozenset(
+    {".git", ".venv", "__pycache__", "node_modules", "venv"}
+)
+
+
+def _skipped(path: Path) -> bool:
+    """True when *path* is inside a directory that must not be resolved against."""
+
+    parts = path.relative_to(REPO_ROOT).parts
+    if parts and parts[0] in _ROOT_SKIP_DIRS:
+        return True
+    return any(part in _ANY_DEPTH_SKIP_DIRS for part in parts)
+
 
 _FENCED_BLOCK = re.compile(r"```.*?```", re.DOTALL)
 _BACKTICK = re.compile(r"`([^`\n]+)`")
@@ -171,8 +187,7 @@ def _bare_files() -> dict[str, str]:
 
     found: dict[str, str] = {}
     for path in REPO_ROOT.rglob("*"):
-        parts = path.relative_to(REPO_ROOT).parts
-        if not parts or parts[0] in _WALK_SKIP_DIRS:
+        if _skipped(path):
             continue
         if path.is_file():
             found.setdefault(path.name, path.relative_to(REPO_ROOT).as_posix())

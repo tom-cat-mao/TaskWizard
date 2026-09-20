@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import re
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -35,11 +36,39 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CONFIG_PAGE = "pages/configuration.md"
 _ENV_TEMPLATE = ".env.example"
 
-# Directories never walked: private runtime state, build output, tool caches and
-# the test suite itself (a key exercised only by tests is not a shipped key).
-_WALK_SKIP_DIRS = frozenset(
-    {".git", ".venv", "site", "node_modules", "memory", "outputs", "tests"}
+# Directories never walked.  Two classes, because they need different matching:
+# local state that a working copy grows but a fresh clone never has sits at the
+# repository root; a virtualenv (or a directory that is one) can be nested at any
+# depth, e.g. the isolated worktree under `.external-agent/` that carries a whole
+# `.venv` of its own.  Skipping these keeps the scan cheap *and* keeps the local
+# answer equal to CI's — the venv also ships sources whose keys are not ours.
+_ROOT_SKIP_DIRS = frozenset(
+    {
+        ".external-agent",  # agent worktree container: each worktree has a venv
+        ".git",
+        ".pi",
+        ".qoder",
+        ".wt",
+        "memory",
+        "outputs",
+        "site",
+        "tests",  # a key exercised only by tests is not a shipped key
+    }
 )
+
+_ANY_DEPTH_SKIP_DIRS = frozenset(
+    {".git", ".venv", "__pycache__", "node_modules", "venv"}
+)
+
+
+def _skipped(path: Path) -> bool:
+    """True when *path* is inside a directory the scan must not enter."""
+
+    parts = path.relative_to(_REPO_ROOT).parts
+    if parts and parts[0] in _ROOT_SKIP_DIRS:
+        return True
+    return any(part in _ANY_DEPTH_SKIP_DIRS for part in parts)
+
 
 _KEY_RE = re.compile(r"PHONE_AGENT_[A-Z0-9_]+")
 
@@ -90,16 +119,20 @@ def config_plane_keys() -> set[str]:
     return keys
 
 
-def repository_keys() -> set[str]:
-    """Keys read anywhere in shipped sources (the whole-tree superset)."""
+@lru_cache(maxsize=1)
+def repository_keys() -> frozenset[str]:
+    """Keys read anywhere in shipped sources (the whole-tree superset).
+
+    Memoised: the page gate below asks once per page, and re-walking the tree
+    for every page is the whole cost of this file.
+    """
 
     keys: set[str] = set()
     for path in sorted(_REPO_ROOT.rglob("*.py")):
-        parts = path.relative_to(_REPO_ROOT).parts
-        if parts and parts[0] in _WALK_SKIP_DIRS:
+        if _skipped(path):
             continue
         keys |= keys_read_in(path)
-    return keys
+    return frozenset(keys)
 
 
 def documented_keys() -> set[str]:
