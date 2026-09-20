@@ -227,7 +227,8 @@ def test_fake_run_launches_static_unknown_alias_through_app_kb(tmp_path, monkeyp
 
     from phone_agent.config.apps import DEFAULT_APP_REGISTRY
     from phone_agent.v2.appkb import AppKnowledge, AppKnowledgeStore
-    from tests.v2._doubles import FakeDeviceFactory, FakePhoneSession
+    from tests.v2.doubles.device import FakeDeviceFactory
+    from tests.v2.doubles.session import FakePhoneSession
 
     assert DEFAULT_APP_REGISTRY.resolve_term("哔哩哔哩").status == "unknown"
 

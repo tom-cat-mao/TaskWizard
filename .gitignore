@@ -94,8 +94,10 @@ Untitled
 openautoglm-vs-deepagents.html
 .wt/
 
-# Agent long-term memory (runtime state, never commit)
-memory/
+# Agent long-term memory (runtime state, never commit). Anchored on purpose:
+# only the repository-root memory/ is private runtime state — tests/v2/memory/
+# is test code that must stay tracked.
+/memory/
 
 # Local model provider registry (S4): may contain $ENV-resolved key material
 .taskwizard.models.json
