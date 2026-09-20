@@ -209,7 +209,12 @@ def test_build_registry_skips_unknown_api_provider_with_warning(isolated):
 
 def test_user_level_files_are_not_read(isolated):
     """P2 single-level: ~/.taskwizard/models.json AND the old
-    ~/.config/taskwizard/models.json are both ignored; project wins."""
+    ~/.config/taskwizard/models.json are both ignored; project wins.
+
+    Same-named sibling: ``test_provider_roles_section.py`` watches the ``roles``
+    half of the rule; this one watches the ``providers`` half. Keep both — the
+    two files pin different sections of the same file format.
+    """
     user_old = isolated / "home" / ".config" / "taskwizard" / "models.json"
     _write(
         user_old,

@@ -368,7 +368,12 @@ def test_roles_schema_failure_degrades_with_warning(isolated):
 
 
 def test_user_level_files_are_not_read(isolated):
-    """Both legacy user-level locations are dead; roles there never apply."""
+    """Both legacy user-level locations are dead; roles there never apply.
+
+    Same-named sibling: ``test_provider_loader.py`` watches the ``providers``
+    half of the rule; this one watches the ``roles`` half. Keep both — the two
+    files pin different sections of the same file format.
+    """
     _write(
         isolated / "home" / ".config" / "taskwizard" / "models.json",
         {
