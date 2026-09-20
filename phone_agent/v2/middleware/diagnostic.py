@@ -382,12 +382,6 @@ class DiagnosticEvidenceWriter:
         except Exception:  # noqa: BLE001 - observability must never crash the loop
             return None
 
-    @property
-    def screenshots_dir(self) -> str:
-        """``<run_dir>/screenshots`` — run_dir is the evidence dir (skill sets it)."""
-
-        return os.path.join(self.evidence_dir, "screenshots")
-
     def _write_screenshot(self, seq: Any, url: str) -> str | None:
         """Decode a data-url screenshot to ``screenshots/screen-<seq>.png``.
 
