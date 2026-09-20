@@ -6,7 +6,7 @@ from phone_agent.grounding.fake import FakeGroundingProvider
 from phone_agent.v2.tools.actuation import build_actuation_tools
 from phone_agent.v2.tools.perception import build_perception_tools
 
-from tests.v2.test_locate_upgrade import _config, _session
+from tests.v2.locate.test_locate_upgrade import _config, _session
 
 
 def _tool(tools, name: str):
