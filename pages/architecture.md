@@ -33,6 +33,8 @@ harness 不做流程编排：没有节点、没有路由，任务规划由模型
 | `type_text` | 目标可选；缺省时向当前焦点输入框输入 |
 | `swipe` | 唯一接受裸相对坐标（`start` / `end`）的执行工具 |
 
+`target_description` 只写控件上可见的短原文（如「沈阳市」）：解析对当前屏 marks 做精确 → 包含 → 归一化三级**文本**匹配，位置/外观长句结构性必然落空，那类描述属于 `locate`。文本零命中退回深度视觉定位（`session.locate`，一次额外视觉模型调用）：命中即执行并在回执里写明这次兜底，仍无命中则按描述问题拒绝执行。system prompt 与工具 schema 给出同一条规则（双语）。
+
 mark id 带批次徽章 `ax_1@e12`。每次成功观测使 epoch 前进并整体重铸 marks，上一批 id 全部失效；`resolve_mark` 对徽章 epoch 不等于当前 epoch 的 id 直接拒绝（提示重新观测），无徽章的 id 只查当前批次表。命中失败与描述歧义同样 fail-closed。成功 `locate` 同样开启新批次：epoch 前进、旧 marks 清空、只铸入命中的 mark。
 
 ## 原子观测 {#atomic-observation}
@@ -161,6 +163,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 | 设备命令可能已下发但结果不明 | `error: {动作} 的设备命令失败；命令可能已发送，设备结果无法确认。`（只说明结果未知，不声称未执行） |
 | 文本输入命令可能已发送但无法确认 | `error: 文本输入命令可能已发送，输入结果无法确认` |
 | 文本已发送、键盘恢复失败 | 保留 `已输入 …；输入已发送；键盘恢复失败` |
+| 描述未命中 mark 文本 | 成功回执在动作行后追加一行提示，描述类失败（视觉定位也没命中）在 `ambiguous: …` 后追加同一句：`文本未匹配：target_description 只写控件上的短原文（如「沈阳市」）；位置/外观描述改用 locate，可用 scope 圈定区域后再操作。` 视觉服务故障与瞬时失败分支不带这句 |
 
 文本输入的 base64 负载在派发前经 shell-quote；ADB Keyboard 的 warm-up 参数以真实空串送达。当输入法已确认切换但 warm-up 失败时，device helper 先尝试恢复一次已知原 IME，再分开报告“用户文本未发送”与恢复结果（已恢复 / 恢复命令失败且键盘状态未知 / 未执行需要恢复的切换）。工具失败与错误文本留在 transcript，不会被静默吞掉。成功回执通常带新的 `[OBS]` 观测块（多模态内容列表），错误回执是纯文本。
 
@@ -209,6 +212,7 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 2. **终局**：被接受的 finish 立即终局——同轮后续 sibling 工具调用不再执行，收到 status 为 error 的 skipped 回执（`自动化已终止；该后续工具调用已跳过。`），且此后不再采样模型。被接受的 `take_over` 同样终局；被拒绝的 `take_over` 不设终局，run 继续。<!-- allow:不再 -->
 3. **独立验收器**（`PHONE_AGENT_FINISH_VERIFY`，默认 `auto`）：上下文独立于 actor，只看目标、证据路线与尾部截图，**绝不读 actor transcript**；TaskDoc 关闭时以 run 的原始目标为权威。`auto` 档在目标命中高风险词表，或复核发现硬矛盾（最后一步工具失败、观测无效、前台回到 Launcher）时触发；`always` 总是触发；`off` 关闭。验收器连续两次拒绝转为 `take_over`。
 4. **故障 fail-open**：验收器构建或调用失败时放行该 finish 并记审计状态 `skipped`，绝不记 `pass`。
+5. **裁决落盘**：验收器每产出一条裁决，`run.json` 就写 `finish_verifier`（`pass` / `fail` / `skipped`）与 `finish_verifier_verdict`（`approve`、`status`、`reason`、`latency_ms`、`usage`）。`reason` 是模型那句话说成的一行，脱敏并截 200 字（与驳回回执同一份文本）；`latency_ms` 是验收器耗时，`usage` 是记账到 `verifier` 角色的 token 数。未触发验收器时 `finish_verifier` 记 `skipped`、`finish_verifier_verdict` 为 `null`（「没触发」与「跑了但故障放行」是两件事）；无 session 可读时两个键都不写。多次裁决以最后一次为准，驳回流水另见 evidence 流。
 
 ## 产出物（deliverable） {#deliverable}
 

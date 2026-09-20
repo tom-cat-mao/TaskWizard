@@ -1,4 +1,9 @@
-"""Detached runner process used exclusively by the NiceGUI console."""
+"""Detached runner process used exclusively by the NiceGUI console.
+
+The terminal artifact is ``run.json``: run metadata, the ``RunResult``, per-role
+token usage, the resolved config snapshot, and the finish verifier's decision
+(``finish_verifier`` status plus the ``finish_verifier_verdict`` audit record).
+"""
 
 from __future__ import annotations
 
@@ -125,10 +130,23 @@ def _summary(
     finished_at: float,
     usage: dict[str, int],
     snapshot: dict[str, Any] | None = None,
+    verifier_status: str | None = None,
+    verifier_verdict: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Build the ``run.json`` payload for one terminal run.
+
+    ``finish_verifier`` / ``finish_verifier_verdict`` are the finish verifier's
+    authoritative decision, copied from the session at the terminal boundary
+    (WP3). The keys are omitted together when there was no session to read them
+    from — an artifact never invents a verdict. When the keys are present,
+    ``finish_verifier_verdict`` is ``null`` for a run whose verifier never
+    produced a decision (it was not triggered), which is a different claim from
+    ``status="skipped"`` with a reason (a fail-open outage that *was* observed).
+    """
+
     from dataclasses import asdict
 
-    return {
+    payload = {
         "run_id": spec.run_id,
         "task": spec.task,
         "status": status,
@@ -137,6 +155,12 @@ def _summary(
         "snapshot": dict(spec.snapshot if snapshot is None else snapshot),
         "finished_at": finished_at,
     }
+    if verifier_status is not None:
+        payload["finish_verifier"] = str(verifier_status)
+        payload["finish_verifier_verdict"] = (
+            dict(verifier_verdict) if isinstance(verifier_verdict, dict) else None
+        )
+    return payload
 
 
 def run_spec(
@@ -268,6 +292,7 @@ def run_spec(
                 controls.close()
             # Publish the atomic summary first: once run_end is visible, every
             # reconnecting console can also read terminal usage and metadata.
+            session = getattr(agent, "session", None)
             atomic_write_json(
                 summary_path,
                 _summary(
@@ -277,6 +302,8 @@ def run_spec(
                     finished_at=time.time(),
                     usage=usage,
                     snapshot=actual_snapshot,
+                    verifier_status=getattr(session, "finish_verifier", None),
+                    verifier_verdict=getattr(session, "finish_verifier_verdict", None),
                 ),
             )
             middleware.emit_run_end(result, status=status)
