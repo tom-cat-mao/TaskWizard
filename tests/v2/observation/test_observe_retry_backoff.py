@@ -14,20 +14,17 @@ from __future__ import annotations
 import pytest
 
 from phone_agent.v2.session import PhoneSession
-from tests.v2.test_observation_failure_codes import (
-    _SETTINGS_XML,
-    FakeConfig,
-    ScriptedDevice,
-)
-from tests.v2.test_observation_lifecycle import FakeDeviceFactory
+from tests.v2.doubles.config import FakeConfig
+from tests.v2.doubles.device import FakeDeviceFactory
+from tests.v2.doubles.marks import SETTINGS_XML_SINGLE
 
 
 def _session(dump_script, **config_overrides) -> PhoneSession:
-    config = FakeConfig()
+    config = FakeConfig(**config_overrides)
     config.observe_settle_ms = 0
-    for key, value in config_overrides.items():
-        setattr(config, key, value)
-    return PhoneSession(config, device_factory=ScriptedDevice(dump_script))
+    return PhoneSession(
+        config, device_factory=FakeDeviceFactory(observing=True, dumps=dump_script)
+    )
 
 
 @pytest.fixture
@@ -43,7 +40,7 @@ def test_transient_dump_failure_backs_off_then_recollects_the_whole_round(
     recorded_sleeps,
 ):
     # round 1: dump times out (transient); round 2: a settled screen.
-    session = _session(["timeout", _SETTINGS_XML], observe_retry_backoff_s=2.0)
+    session = _session(["timeout", SETTINGS_XML_SINGLE], observe_retry_backoff_s=2.0)
 
     obs = session.observe()
 
@@ -58,7 +55,7 @@ def test_transient_dump_failure_backs_off_then_recollects_the_whole_round(
 
 
 def test_second_round_screenshot_is_the_committed_frame(recorded_sleeps):
-    session = _session(["timeout", _SETTINGS_XML])
+    session = _session(["timeout", SETTINGS_XML_SINGLE])
 
     obs = session.observe()
 
@@ -83,7 +80,7 @@ def test_zero_max_loops_commits_annotated_without_retrying(recorded_sleeps):
 def test_extra_loops_are_honoured(recorded_sleeps):
     # Two transient failures, then success: needs 2 extra rounds, not just 1.
     session = _session(
-        ["timeout", "boom", _SETTINGS_XML],
+        ["timeout", "boom", SETTINGS_XML_SINGLE],
         observe_retry_max_loops=2,
         observe_retry_backoff_s=0.5,
     )
@@ -112,7 +109,7 @@ def test_persistent_failure_commits_on_the_last_round(recorded_sleeps):
 
 
 def test_zero_backoff_skips_the_sleep_but_still_retries(recorded_sleeps):
-    session = _session(["timeout", _SETTINGS_XML], observe_retry_backoff_s=0.0)
+    session = _session(["timeout", SETTINGS_XML_SINGLE], observe_retry_backoff_s=0.0)
 
     session.observe()
 
@@ -142,6 +139,7 @@ def test_foreground_change_retry_does_not_back_off(recorded_sleeps):
     session = PhoneSession(
         config,
         device_factory=FakeDeviceFactory(
+            observing=True,
             foreground=[
                 "com.example.app/.First",
                 "com.example.app/.Second",

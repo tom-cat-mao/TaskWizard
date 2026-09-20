@@ -24,6 +24,8 @@ from phone_agent.grounding.accessibility import _parse_uiautomator_xml
 from phone_agent.grounding.provider import MarkCandidate
 from phone_agent.v2.session import PhoneSession
 from phone_agent.v2.tools._obs import auto_observation
+from tests.v2.doubles.config import FakeConfig
+from tests.v2.doubles.device import FakeDeviceFactory
 
 
 # --------------------------------------------------------------------------
@@ -254,52 +256,11 @@ def test_display_digest_spends_its_budget_on_the_visible_label():
 # --------------------------------------------------------------------------
 # Render: the keyboard note is display-only and never an address.
 # --------------------------------------------------------------------------
-class _FakeShot:
-    def __init__(self) -> None:
-        self.base64_data = "shot"
-        self.width = 1080
-        self.height = 2400
-        self.mime_type = "image/png"
-        self.is_valid = True
-        self.failure_code = None
-
-
-class _FakeForeground:
-    component_name = "com.app/.Main"
-    package_name = "com.app"
-    display_name = "com.app"
-
-
-class _FakeDevice:
-    def __init__(self, xml: str) -> None:
-        self._xml = xml
-
-    def get_screenshot(self, device_id=None, timeout=10, **kwargs):
-        return _FakeShot()
-
-    def dump_uiautomator_xml(self, device_id=None, timeout=None, windowed=None):
-        return self._xml
-
-    def get_foreground_app(self, device_id=None):
-        return _FakeForeground()
-
-
-class _FakeConfig:
-    device_id = None
-    accessibility_max_marks = 80
-    accessibility_timeout = 3.0
-    grounding_provider = "accessibility"
-    locateanything_max_size = 960
-    locateanything_context_max_chars = 200
-    locate_max_size = 0
-    scope_padding_ratio = 0.05
-    locateanything_model = None
-    observe_settle_ms = 0
-    marks_windowed = "auto"
-
-
 def _obs_text(xml: str) -> str:
-    session = PhoneSession(_FakeConfig(), device_factory=_FakeDevice(xml))
+    session = PhoneSession(
+        FakeConfig(),
+        device_factory=FakeDeviceFactory(observing=True, xml=xml),
+    )
     return auto_observation(session)[0]["text"]
 
 

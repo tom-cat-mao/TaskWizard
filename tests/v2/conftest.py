@@ -7,8 +7,8 @@ are wall-clock cost a test must not inherit, so the shared
 fixture re-pins the class defaults for every test in the tree — a future edit
 that restores a production value cannot silently slow the suite down.
 
-The values themselves are under test (``test_observation_hardening.py``,
-``test_observe_retry_backoff.py``): those tests set them explicitly on the
+The values themselves are under test (``observation/test_observation_hardening.py``,
+``observation/test_observe_retry_backoff.py``): those tests set them explicitly on the
 instance, which the fixture does not touch.
 """
 

@@ -454,7 +454,7 @@ def test_locate_success_no_frame_degrades_to_text_only():
     # U1: locate returns the same frame the visual model ran on. A session
     # double that exposes no ``last_locate_frame`` degrades to a text-only block
     # (fail-closed, never a fabricated image). Real same-frame image return is
-    # covered in test_observation_lifecycle.py against the real PhoneSession.
+    # covered in observation/test_observation_lifecycle.py against the real PhoneSession.
     located = make_mark("loc_9", text="隐藏按钮", role="ImageView")
     session = FakePhoneSession({}, locate_result=located)
     tools = _tool_map(session)

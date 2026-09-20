@@ -47,69 +47,9 @@ from phone_agent.v2.obs_archive import (
 from phone_agent.v2.session import PhoneSession, ScreenshotError
 from phone_agent.v2.tools._obs import format_observation_text
 from phone_agent.v2.tools.obs_archive import make_obs_archive_tools
-
-
-# --------------------------------------------------------------------------
-# Fakes: a screenshot, a foreground observation, and a scriptable device.
-# --------------------------------------------------------------------------
-class FakeShot:
-    def __init__(self, payload: str = "SHOT-PAYLOAD", *, valid: bool = True) -> None:
-        self.base64_data = payload
-        self.width = 1080
-        self.height = 2400
-        self.mime_type = "image/png"
-        self.is_valid = valid
-        self.failure_code = None if valid else "screenshot_unavailable"
-
-
-class FakeForeground:
-    def __init__(self, component: str = "com.example.app/.Main") -> None:
-        self.component_name = component
-        self.package_name = component.split("/", 1)[0]
-        self.display_name = self.package_name
-
-
-_SETTINGS_XML = (
-    "<hierarchy>"
-    '<node text="WLAN" class="android.widget.TextView" clickable="true" '
-    'enabled="true" bounds="[0,100][1080,300]" />'
-    '<node text="蓝牙" class="android.widget.TextView" clickable="true" '
-    'enabled="true" bounds="[0,300][1080,500]" />'
-    "</hierarchy>"
-)
-
-
-class FakeConfig:
-    device_id = None
-    observe_settle_ms = 0
-    accessibility_max_marks = 80
-    accessibility_timeout = 3.0
-    grounding_provider = "accessibility"
-    locateanything_max_size = 960
-    locateanything_context_max_chars = 200
-    locate_max_size = 0
-    scope_padding_ratio = 0.05
-    locateanything_model = None
-    marks_windowed = "off"
-
-
-class FakeDeviceFactory:
-    """Scriptable device: screenshots, foreground, and a UiAutomator dump."""
-
-    def __init__(self, *, xml: str = _SETTINGS_XML, screenshot_valid: bool = True):
-        self._xml = xml
-        self._screenshot_valid = screenshot_valid
-        self.screenshot_calls = 0
-
-    def get_screenshot(self, device_id=None, timeout=10):
-        self.screenshot_calls += 1
-        return FakeShot(f"SHOT-{self.screenshot_calls}", valid=self._screenshot_valid)
-
-    def dump_uiautomator_xml(self, device_id=None, timeout=None):
-        return self._xml
-
-    def get_foreground_app(self, device_id=None):
-        return FakeForeground()
+from tests.v2.doubles.config import FakeConfig
+from tests.v2.doubles.device import FakeDeviceFactory
+from tests.v2.doubles.marks import SETTINGS_XML
 
 
 class RecordingSession(PhoneSession):
@@ -126,7 +66,12 @@ class RecordingSession(PhoneSession):
 
 
 def _session(**kwargs) -> RecordingSession:
-    return RecordingSession(FakeConfig(), FakeDeviceFactory(**kwargs))
+    # ``marks_windowed="off"``: these dumps are plain ``<hierarchy>`` roots, so the
+    # windowed probe is off (its own suites live in test_marks_windowed*.py).
+    return RecordingSession(
+        FakeConfig(marks_windowed="off"),
+        FakeDeviceFactory(observing=True, screenshot_prefix="SHOT-", **kwargs),
+    )
 
 
 def _attach(session: RecordingSession, root: Path, run_id: str = "run1") -> ObsArchive:
@@ -247,7 +192,7 @@ def test_search_finds_matching_frames_and_rebuilds_index(tmp_path):
     )
     archive = _attach(session, tmp_path / "obs")
     session.observe()
-    session.device_factory._xml = _SETTINGS_XML.replace(
+    session.device_factory._xml = SETTINGS_XML.replace(
         'text="WLAN"', 'text="蓝牙设置"'
     )
     session.observe()

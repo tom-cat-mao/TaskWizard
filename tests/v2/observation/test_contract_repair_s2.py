@@ -25,14 +25,8 @@ from phone_agent.v2.session import (
     ScreenshotError,
 )
 from phone_agent.v2.tools._obs import auto_observation
-
-
-_SETTINGS_XML = (
-    "<hierarchy>"
-    '<node text="WLAN" class="android.widget.TextView" clickable="true" '
-    'enabled="true" bounds="[0,100][1000,300]" />'
-    "</hierarchy>"
-)
+from tests.v2.doubles.config import FakeConfig
+from tests.v2.doubles.marks import SETTINGS_XML_NARROW
 
 
 def _png(width: int, height: int) -> str:
@@ -43,24 +37,19 @@ def _png(width: int, height: int) -> str:
 
 
 def _config(**overrides):
-    values = {
-        "device_id": None,
-        "accessibility_timeout": 3.0,
-        "accessibility_max_marks": 80,
-        "grounding_provider": "fake",
-        "locateanything_model": None,
-        "locateanything_max_size": 960,
-        "locateanything_context_max_chars": 200,
-        "locate_max_size": 0,
-        "scope_padding_ratio": 0.0,
-        "observe_settle_ms": 0,
-        # Retry paths are exercised here; the 2s production backoff would be
-        # pure wall-clock cost (its value is asserted in test_observe_retry_backoff.py).
-        "observe_retry_backoff_s": 0.0,
-        "marks_windowed": "off",
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
+    """The shared observation config, with this suite's three deviations.
+
+    ``grounding_provider="fake"`` (the provider is scripted here, not the
+    accessibility tier), ``scope_padding_ratio=0.0`` (exact crop geometry) and
+    ``marks_windowed="off"`` (plain ``<hierarchy>`` dumps).
+    """
+
+    return FakeConfig(
+        grounding_provider="fake",
+        scope_padding_ratio=0.0,
+        marks_windowed="off",
+        **overrides,
+    )
 
 
 class _Foreground:
@@ -126,7 +115,7 @@ class _DumpThenUnstableForegroundDevice(_DumpThenBadScreenshotDevice):
         self.dump_calls += 1
         if self.dump_calls == 1:
             raise TimeoutError("synthetic dump timeout")
-        return _SETTINGS_XML
+        return SETTINGS_XML_NARROW
 
     def get_foreground_app(self, device_id=None):
         component = next(self.foregrounds)

@@ -23,14 +23,9 @@ from __future__ import annotations
 
 from phone_agent.v2.session import PhoneSession
 from phone_agent.v2.tools._obs import auto_observation
-
-
-_SETTINGS_XML = (
-    "<hierarchy>"
-    '<node text="WLAN" class="android.widget.TextView" clickable="true" '
-    'enabled="true" bounds="[0,100][1080,300]" />'
-    "</hierarchy>"
-)
+from tests.v2.doubles.config import FakeConfig
+from tests.v2.doubles.device import FakeDeviceFactory
+from tests.v2.doubles.marks import SETTINGS_XML_SINGLE
 
 _DISPLAYS_WINDOWED = (
     '<?xml version="1.0"?><displays><display id="0">'
@@ -53,83 +48,13 @@ _DISPLAYS_WINDOWED = (
 )
 
 
-class FakeShot:
-    def __init__(self, payload: str) -> None:
-        self.base64_data = payload
-        self.width = 1080
-        self.height = 2400
-        self.mime_type = "image/png"
-        self.is_valid = True
-        self.failure_code = None
-
-
-class FakeForeground:
-    def __init__(self, component: str = "com.example.app/.Main") -> None:
-        self.component_name = component
-        self.package_name = "com.example.app"
-        self.display_name = "com.example.app"
-
-
-class FakeConfig:
-    device_id = None
-    accessibility_max_marks = 80
-    accessibility_timeout = 3.0
-    grounding_provider = "accessibility"
-    locateanything_max_size = 960
-    locateanything_context_max_chars = 200
-    locate_max_size = 0
-    scope_padding_ratio = 0.05
-    locateanything_model = None
-    observe_settle_ms = 0
-    # The retry path is the point of these tests, its wall-clock cost is not:
-    # the backoff value itself is under test in test_observe_retry_backoff.py.
-    observe_retry_backoff_s = 0.0
-    marks_windowed = "auto"
-
-
-class ScriptedDevice:
-    """Device whose ``dump_uiautomator_xml`` follows a per-call script.
-
-    ``dump_script`` is a list of "actions": a string returns that XML, the
-    string ``"timeout"`` raises TimeoutError, ``"boom"`` raises RuntimeError, and
-    ``"windows_unsupported"`` raises ValueError (the marks_windowed=on shape).
-    The last action repeats once the script is exhausted.
-    """
-
-    def __init__(self, dump_script, *, windowed_arg: bool = True) -> None:
-        self._script = list(dump_script)
-        self._i = 0
-        self._windowed_arg = windowed_arg
-        self.screenshot_calls = 0
-        self.dump_calls = 0
-        self.dump_windowed_args: list = []
-
-    def get_screenshot(self, device_id=None, timeout=10, **kwargs):
-        self.screenshot_calls += 1
-        return FakeShot(f"shot{self.screenshot_calls}")
-
-    def dump_uiautomator_xml(self, device_id=None, timeout=None, windowed=None):
-        self.dump_calls += 1
-        self.dump_windowed_args.append(windowed)
-        action = self._script[min(self._i, len(self._script) - 1)]
-        self._i += 1
-        if action == "timeout":
-            raise TimeoutError("dump timed out")
-        if action == "boom":
-            raise RuntimeError("adb died")
-        if action == "windows_unsupported":
-            raise ValueError("UiAutomator --windows dump unavailable on this device")
-        return action
-
-    def get_foreground_app(self, device_id=None):
-        return FakeForeground()
-
-
 def _session(dump_script, **cfg_over) -> PhoneSession:
-    config = FakeConfig()
-    for key, value in cfg_over.items():
-        setattr(config, key, value)
-    return PhoneSession(config, device_factory=ScriptedDevice(dump_script))
+    # ``dumps`` scripts the per-call dump (XML text / "timeout" / "boom" /
+    # "windows_unsupported"), repeating its last entry.
+    return PhoneSession(
+        FakeConfig(**cfg_over),
+        device_factory=FakeDeviceFactory(observing=True, dumps=dump_script),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -164,7 +89,7 @@ def test_refresh_marks_sample_ok_carries_windows_and_summary():
 
 
 def test_refresh_marks_backward_compat_returns_only_marks():
-    session = _session([_SETTINGS_XML])
+    session = _session([SETTINGS_XML_SINGLE])
     shot = session.screenshot()
     marks = session.refresh_marks(shot)
     assert isinstance(marks, list)
@@ -176,7 +101,7 @@ def test_refresh_marks_backward_compat_returns_only_marks():
 # --------------------------------------------------------------------------
 def test_observe_retries_once_on_transient_dump_timeout_then_commits():
     # attempt1: timeout (transient) -> retry; attempt2: success.
-    session = _session(["timeout", _SETTINGS_XML])
+    session = _session(["timeout", SETTINGS_XML_SINGLE])
     obs = session.observe()
     assert obs.epoch == 1
     assert len(obs.marks) == 1

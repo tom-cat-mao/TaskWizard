@@ -6,7 +6,7 @@ those reads are wall-clock waits in production (``observe_settle_ms`` 300ms,
 ``observe_retry_backoff_s`` 2s); the defaults here are pinned to zero so no test
 pays them, and ``tests/v2/conftest.py::no_production_timing`` re-pins them for
 every test (the timing values themselves are under test in
-``test_observation_hardening.py`` / ``test_observe_retry_backoff.py``, which set
+``observation/test_observation_hardening.py`` / ``observation/test_observe_retry_backoff.py``, which set
 them explicitly on the instance).
 
 Class attributes (not dataclass fields) on purpose: the autouse fixture pins the

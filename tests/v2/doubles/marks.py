@@ -11,7 +11,7 @@ must **not** be collapsed into one:
     / ``len(sample.marks) == 1``, so adding a second node would change what they
     measure. Same 1080 width as above.
 ``SETTINGS_XML_NARROW``
-    One node on a **1000**-wide screen: ``test_contract_repair_s2`` pins the
+    One node on a **1000**-wide screen: ``observation/test_contract_repair_s2.py`` pins the
     screenshot-vs-dump geometry mismatch, so the width is the point.
 """
 
