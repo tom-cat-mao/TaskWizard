@@ -81,6 +81,9 @@ class FakeConfig:
     scope_padding_ratio = 0.05
     locateanything_model = None
     observe_settle_ms = 0
+    # The retry path is the point of these tests, its wall-clock cost is not:
+    # the backoff value itself is under test in test_observe_retry_backoff.py.
+    observe_retry_backoff_s = 0.0
     marks_windowed = "auto"
 
 

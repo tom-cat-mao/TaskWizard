@@ -54,6 +54,9 @@ def _config(**overrides):
         "locate_max_size": 0,
         "scope_padding_ratio": 0.0,
         "observe_settle_ms": 0,
+        # Retry paths are exercised here; the 2s production backoff would be
+        # pure wall-clock cost (its value is asserted in test_observe_retry_backoff.py).
+        "observe_retry_backoff_s": 0.0,
         "marks_windowed": "off",
     }
     values.update(overrides)

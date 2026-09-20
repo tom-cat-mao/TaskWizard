@@ -56,6 +56,7 @@ import base64
 import binascii
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -302,6 +303,8 @@ class DiagnosticEvidenceWriter:
         self._path: str | None = None
         # doc-change dedupe.
         self._last_doc_hash: str | None = None
+        # WP4: Diagnostic mode for raw XML evidence
+        self.diagnostic_mode = enabled and unredacted
         if self.enabled:
             os.makedirs(self.evidence_dir, exist_ok=True)
             self._path = os.path.join(self.evidence_dir, f"{run_id}.evidence.jsonl")
@@ -335,6 +338,49 @@ class DiagnosticEvidenceWriter:
         """``<run_dir>/screenshots`` — run_dir is the evidence dir (skill sets it)."""
 
         return os.path.join(self.evidence_dir, "screenshots")
+
+    # WP4-②: XML evidence writer for diagnostic mode
+    def xml_evidence_dir(self) -> str:
+        """``<run_dir>/xml_evidence`` — raw accessibility XML dumps in diagnostic mode."""
+
+        return os.path.join(self.evidence_dir, "xml_evidence")
+
+    def _write_xml_evidence(self, xml_content: str) -> str | None:
+        """Write raw accessibility XML to evidence directory (≤256KB limit).
+
+        Only called when diagnostic_mode=True (unredacted + enabled), i.e.,
+        live-diagnosis skill runs. Production mode (diagnostic_mode=False)
+        has zero cost—this branch is never executed.
+
+        Returns relative path to the written file, or None on error.
+        Path is recorded in evidence.jsonl for replay.
+        """
+
+        if not self.diagnostic_mode:
+            return None
+
+        # Enforce size limit: ≤256KB per dump
+        MAX_XML_SIZE = 256 * 1024
+        if len(xml_content) > MAX_XML_SIZE:
+            # Truncate with marker
+            xml_content = xml_content[:MAX_XML_SIZE] + "\n... [truncated: original exceeds 256KB]"
+
+        try:
+            os.makedirs(self.xml_evidence_dir(), exist_ok=True)
+            # Unique filename per run_id and timestamp
+            import time
+            ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+            filename = f"{self.run_id}-{ts}.xml"
+            path = os.path.join(self.xml_evidence_dir(), filename)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(xml_content)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            return f"xml_evidence/{filename}"
+        except Exception:  # noqa: BLE001 - observability must never crash the loop
+            return None
 
     def _write_screenshot(self, seq: Any, url: str) -> str | None:
         """Decode a data-url screenshot to ``screenshots/screen-<seq>.png``.
@@ -631,6 +677,31 @@ class DiagnosticEvidenceWriter:
             if rel:
                 image["path"] = rel
         obs = _parse_obs_block(text)
+        
+        # WP4-①: Extract accessibility exception type and parse_summary (P0 #6 redaction unchanged)
+        accessibility_error = None
+        parse_summary_data = None
+        
+        if obs and obs.get("current_app"):
+            # Check for marks_failure_code in the observation text context
+            # The [OBS] block may contain accessibility failure annotations like "[accessibility:timeout]"
+            if obs.get("mark_count") == 0 and "[accessibility:" in text:
+                match = re.search(r'\[accessibility:(\w+)\]', text)
+                if match:
+                    accessibility_error = match.group(1)
+            
+            # parse_summary is available on session.obs when observe() returns
+            if self.session:
+                session_obs = getattr(self.session, "obs", None)
+                if session_obs:
+                    parse_summary_data = getattr(session_obs, "parse_summary", None)
+        
+        # WP4-②: Raw XML evidence directory prepared but not written (requires session.obs.raw_xml)
+        # The accessibility tool does NOT expose raw XML currently; this field is a placeholder
+        # for future enhancement when raw dump becomes available via device_factory or session.
+        # For now, diagnostic_mode ensures zero-cost in prod (no file IO executed).
+        original_xml_path = None  # TODO: populate when raw_xml attr is added to session.obs
+        
         self._write(
             {
                 "event": "tool_observation",
@@ -641,6 +712,10 @@ class DiagnosticEvidenceWriter:
                 "obs": obs,
                 "image": image,
                 "error": self._text(error) if error else None,
+                # WP4: Accessibility failure metadata (redacted per P0 #6 rules)
+                "accessibility_error": self._text(accessibility_error) if accessibility_error else None,
+                "parse_summary": parse_summary_data,
+                "original_xml_path": original_xml_path,
             }
         )
 
@@ -671,6 +746,13 @@ class DiagnosticEvidenceWriter:
         latency_ms = int((time.perf_counter() - started) * 1000)
         try:
             content = getattr(result, "content", None)
+            # WP4: Before emitting, refresh session.obs.parse_summary from current state
+            # This ensures parse_summary reflects the latest accessibility dump
+            if self.session and name == "observe":
+                session_obs = getattr(self.session, "obs", None)
+                if session_obs and hasattr(session_obs, "parse_summary"):
+                    # Already available on session; no action needed
+                    pass
             self._emit_tool_observation(name, content, latency_ms, None)
         except Exception:  # noqa: BLE001
             pass

@@ -16,13 +16,15 @@ records a warning. It must never wedge a correct completion behind a flaky model
 
 Everything the verifier reads is authoritative world/route state, not model
 prose; the goal and evidence strings are redacted (``config/redact``) before
-egress to the verifier model.
+egress to the verifier model, and its answer is redacted/bounded the same way
+before it reaches the receipt, the trace or the run artifact (P0 #6).
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from typing import Any
 
 from phone_agent.config.policy import DEFAULT_SAFETY_POLICY, SafetyPolicyRegistry
@@ -42,6 +44,10 @@ DISPUTE_TAKEOVER_REASON = "finish 反复被验收驳回，需人工确认"
 # the run escalates to human takeover (L2 -> L3). Design §4.4: "2 次转 take_over".
 DISPUTE_TAKEOVER_THRESHOLD = 2
 
+# One bounded sentence for the verdict reason: the in-band receipt, the trace and
+# the persisted run artifact all show the same text, never the model's full reply.
+VERDICT_REASON_LIMIT = 200
+
 _VERIFIER_SYSTEM = (
     "你是移动端任务验收器。你只会看到【目标】【已完成路线与证据】和【当前屏幕截图】，"
     "看不到执行体的任何自我说明或辩解。请仅凭这些世界事实与证据，判断目标是否真的达成。"
@@ -52,11 +58,19 @@ _VERIFIER_SYSTEM = (
 
 @dataclass(frozen=True)
 class Verdict:
-    """One verifier decision; ``status=skipped`` marks fail-open outage."""
+    """One verifier decision; ``status=skipped`` marks fail-open outage.
+
+    ``latency_ms`` is the verifier's own wall time (context build + model call)
+    and ``usage`` the tokens the call was booked for (``{"role", "tokens"}``);
+    both stay ``None`` when they were never measured — an audit record says
+    "unknown" rather than manufacturing a zero (P0 #5).
+    """
 
     approve: bool
     reason: str
     status: str | None = None
+    latency_ms: int | None = None
+    usage: dict[str, Any] | None = None
 
 
 def _goal_texts(session: Any) -> list[str]:
@@ -198,15 +212,35 @@ def _content_text(resp: Any) -> str:
     return str(content)
 
 
+def _bounded_reason(text: Any) -> str:
+    """Redact, collapse and bound one verifier reason (the single text policy).
+
+    The reason leaves for three sinks — the in-band finish receipt, the trace
+    and the run artifact — so the same redaction the verifier's own context gets
+    is applied once, here (P0 #6 primitives), and the text stays one line of at
+    most :data:`VERDICT_REASON_LIMIT` characters.
+    """
+
+    redacted = redact_context_text(str(text or ""))
+    return " ".join(redacted.split())[:VERDICT_REASON_LIMIT] or "（无理由）"
+
+
+def _elapsed_ms(started: float) -> int:
+    """Whole milliseconds of verifier wall time since ``started``."""
+
+    return round((time.perf_counter() - started) * 1000)
+
+
 def _parse_verdict(text: str) -> Verdict:
     """Parse the verifier answer into a :class:`Verdict` (fail-open on ambiguity).
 
     A clear ``REJECT`` / ``未达成`` / ``没有达成`` rejects; everything else — including
     an unparseable answer — approves. This keeps the verifier from wedging a
-    correct completion on a fuzzy reply (fail-open bias, S2 §4.5).
+    correct completion on a fuzzy reply (fail-open bias, S2 §4.5). The reason is
+    one line capped at :data:`VERDICT_REASON_LIMIT`.
     """
 
-    reason = " ".join(text.split())[:200] or "（无理由）"
+    reason = _bounded_reason(text)
     lowered = text.strip().lower()
     rejected = (
         "reject" in lowered
@@ -222,19 +256,25 @@ def _parse_verdict(text: str) -> Verdict:
 def verify_finish(session: Any, config: Any, *, model: Any | None = None) -> Verdict:
     """Run the independent-context verifier for a finish confirm (S2 §4).
 
-    Returns a :class:`Verdict`. Any setup or call failure is **fail-open**
-    (``approve=True``, ``status="skipped"``) with a warning-shaped reason and a
-    ``logger.warning`` — a flaky verifier must never block a completion the L1
-    two-step already cleared.
+    Returns a :class:`Verdict` carrying the measured ``latency_ms`` and the
+    ``usage`` the call was booked for, so the run artifact can record the
+    decision itself rather than only its status. Any setup or call failure is
+    **fail-open** (``approve=True``, ``status="skipped"``) with a warning-shaped
+    reason and a ``logger.warning`` — a flaky verifier must never block a
+    completion the L1 two-step already cleared.
     ``model`` may be injected (tests / reuse); otherwise it is built from config.
     """
 
+    started = time.perf_counter()
     try:
         messages = _build_verifier_messages(session, config)
     except Exception as exc:  # noqa: BLE001 - setup failure -> fail-open
         logger.warning("finish verifier setup failed, fail-open: %s", exc)
         return Verdict(
-            True, f"验收器构建失败，已放行（fail-open）：{exc}", status="skipped"
+            True,
+            _bounded_reason(f"验收器构建失败，已放行（fail-open）：{exc}"),
+            status="skipped",
+            latency_ms=_elapsed_ms(started),
         )
 
     try:
@@ -248,24 +288,34 @@ def verify_finish(session: Any, config: Any, *, model: Any | None = None) -> Ver
     except Exception as exc:  # noqa: BLE001 - call failure -> fail-open
         logger.warning("finish verifier call failed, fail-open: %s", exc)
         return Verdict(
-            True, f"验收器调用失败，已放行（fail-open）：{exc}", status="skipped"
+            True,
+            _bounded_reason(f"验收器调用失败，已放行（fail-open）：{exc}"),
+            status="skipped",
+            latency_ms=_elapsed_ms(started),
         )
 
+    usage: dict[str, Any] | None = None
     ledger = getattr(session, "usage_ledger", None)
     if ledger is not None:
         try:
             estimate = estimate_context_tokens(messages) + estimate_message_tokens(resp)
-            ledger.record("verifier", resp, estimate_tokens=estimate)
+            counted = ledger.record("verifier", resp, estimate_tokens=estimate)
+            usage = {"role": "verifier", "tokens": int(counted)}
         except Exception:  # noqa: BLE001 - accounting must never alter the verdict
-            pass
+            usage = None
 
-    return _parse_verdict(_content_text(resp))
+    return replace(
+        _parse_verdict(_content_text(resp)),
+        latency_ms=_elapsed_ms(started),
+        usage=usage,
+    )
 
 
 __all__ = [
-    "Verdict",
-    "verify_finish",
-    "should_verify_finish",
     "DISPUTE_TAKEOVER_REASON",
     "DISPUTE_TAKEOVER_THRESHOLD",
+    "VERDICT_REASON_LIMIT",
+    "Verdict",
+    "should_verify_finish",
+    "verify_finish",
 ]

@@ -21,9 +21,9 @@ ROOT = Path(__file__).resolve().parents[2]
 def load_project_env() -> None:
     """Load PHONE_AGENT_* defaults from the project .env without overriding shell values.
 
-    Tolerates a leading ``export `` prefix and surrounding single/double quotes.
-    Only keys with the ``PHONE_AGENT_`` prefix are loaded, and existing shell env
-    values are never overwritten (shell env > .env).
+    Tolerates a leading ``export `` prefix, surrounding single/double quotes and a
+    trailing inline ``#`` comment. Only keys with the ``PHONE_AGENT_`` prefix are
+    loaded, and existing shell env values are never overwritten (shell env > .env).
     """
 
     env_path = ROOT / ".env"
@@ -35,14 +35,40 @@ def load_project_env() -> None:
             continue
         if line.startswith("export "):
             line = line[len("export ") :].strip()
-        key, value = line.split("=", 1)
+        key, raw_value = line.split("=", 1)
         key = key.strip()
         if not key.startswith("PHONE_AGENT_") or key in os.environ:
             continue
-        value = value.strip()
+        value = _strip_inline_comment(raw_value).strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
             value = value[1:-1]
         os.environ[key] = value
+
+
+def _strip_inline_comment(value: str) -> str:
+    """Drop a trailing ``#`` comment while respecting quoted regions.
+
+    Mirrors the shell / python-dotenv rule: ``#`` only starts a comment at the
+    start of a value or right after whitespace, so an unquoted value that merely
+    contains ``#`` (a key, a password) survives intact. Inside single or double
+    quotes ``#`` is always literal; a backslash-escaped quote does not close the
+    quoted region.
+    """
+
+    result: list[str] = []
+    quote: str | None = None
+    for index, char in enumerate(value):
+        if quote is not None:
+            result.append(char)
+            if char == quote and value[index - 1] != "\\":
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == "#" and (index == 0 or value[index - 1] in " \t"):
+            break
+        result.append(char)
+    return "".join(result)
 
 
 def _env_str(key: str, default: str) -> str:
@@ -172,6 +198,12 @@ class V2Config:
     # (rather than adds to) observe_settle_ms.
     black_screen_detect: bool = True
     observe_settle_ms: int = 300
+    # WP2: a transient marks-dump failure (``session.observe``) waits
+    # ``observe_retry_backoff_s`` seconds before the next atomic round and is
+    # bounded by ``observe_retry_max_loops`` extra rounds. Default 1 keeps the
+    # historical "at most 2 rounds" behaviour; 0 means a single round.
+    observe_retry_max_loops: int = 1
+    observe_retry_backoff_s: float = 2.0
     # WP-WF4-A: additive blocklist for foreground-source ``app/launched``
     # announcements (comma-separated env). Extends the built-in minimal filter
     # (shell, permission/installer dialogs, launcher-family packages). The
@@ -347,7 +379,7 @@ class V2Config:
     sibling_receipts_enabled: bool = True
     # grounding
     grounding_provider: str = "hybrid"
-    accessibility_timeout: float = 3.0
+    accessibility_timeout: float = 12.0
     accessibility_max_marks: int = 80
     # WP-G2a windowed marks (pure display layer): auto|on|off.
     #   * ``auto`` (default) tries a ``uiautomator dump --windows`` first and
@@ -486,6 +518,8 @@ class V2Config:
                 == "on"
             ),
             observe_settle_ms=_env_int("PHONE_AGENT_OBSERVE_SETTLE_MS", 300),
+            observe_retry_max_loops=_env_int("PHONE_AGENT_OBSERVE_RETRY_MAX_LOOPS", 1),
+            observe_retry_backoff_s=_env_float("PHONE_AGENT_OBSERVE_RETRY_BACKOFF_S", 2.0),
             foreground_event_blocked_packages=tuple(
                 item.strip()
                 for item in _env_str(
@@ -666,7 +700,7 @@ class V2Config:
                 == "on"
             ),
             grounding_provider=_env_str("PHONE_AGENT_GROUNDING_PROVIDER", "hybrid"),
-            accessibility_timeout=_env_float("PHONE_AGENT_ACCESSIBILITY_TIMEOUT", 3.0),
+            accessibility_timeout=_env_float("PHONE_AGENT_ACCESSIBILITY_TIMEOUT", 12.0),
             accessibility_max_marks=_env_int("PHONE_AGENT_ACCESSIBILITY_MAX_MARKS", 80),
             marks_windowed=_env_choice(
                 "PHONE_AGENT_MARKS_WINDOWED", "auto", ("auto", "on", "off")
@@ -737,6 +771,14 @@ class V2Config:
             raise ValueError("PHONE_AGENT_LOCATE_MAX_SIZE must be 0 or a positive integer")
         if config.observe_settle_ms < 0:
             raise ValueError("PHONE_AGENT_OBSERVE_SETTLE_MS must be non-negative")
+        if config.observe_retry_max_loops < 0:
+            raise ValueError(
+                "PHONE_AGENT_OBSERVE_RETRY_MAX_LOOPS must be non-negative"
+            )
+        if config.observe_retry_backoff_s < 0:
+            raise ValueError(
+                "PHONE_AGENT_OBSERVE_RETRY_BACKOFF_S must be non-negative"
+            )
         if config.accessibility_max_marks <= 0:
             raise ValueError(
                 "PHONE_AGENT_ACCESSIBILITY_MAX_MARKS must be positive "

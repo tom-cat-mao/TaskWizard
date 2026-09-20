@@ -115,6 +115,9 @@ class FakeConfig:
     scope_padding_ratio = 0.05
     locateanything_model = None
     observe_settle_ms = 0
+    # Failure/retry paths run here for real; the 2s production backoff would be
+    # pure wall-clock cost.  Its value is asserted in test_observe_retry_backoff.py.
+    observe_retry_backoff_s = 0.0
     marks_windowed = "auto"
 
 

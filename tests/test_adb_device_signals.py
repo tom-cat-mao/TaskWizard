@@ -48,6 +48,77 @@ def test_get_focused_window_skips_null_current_focus(monkeypatch) -> None:
     assert device.get_top_activity() == "tv.danmaku.bili/.MainActivity"
 
 
+def test_get_focused_window_filters_on_the_device_in_one_shell_string(monkeypatch) -> None:
+    """WP2 regression: the pipe must reach the *device* shell.
+
+    ``adb shell`` receives one command string here; passing ``"|"`` as a separate
+    argv element (the original WP2 form) made it an argument of ``dumpsys`` and
+    the query silently returned nothing.
+    """
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return FakeCompletedProcess(
+            stdout=(
+                "mCurrentFocus=Window{def u0 tv.danmaku.bili/.MainActivity}\n"
+            )
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert device.get_focused_window_or_app("serial") == "tv.danmaku.bili/.MainActivity"
+    assert calls == [
+        [
+            "adb",
+            "-s",
+            "serial",
+            "shell",
+            "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'",
+        ]
+    ]
+
+
+def test_get_focused_window_falls_back_to_the_full_dump(monkeypatch) -> None:
+    """A ROM without a usable device-side ``grep`` still resolves the component."""
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if len(calls) == 1:
+            return FakeCompletedProcess(stdout="")
+        return FakeCompletedProcess(
+            stdout=(
+                "mCurrentFocus=null\n"
+                "mFocusedApp=ActivityRecord{abc tv.danmaku.bili/.MainActivity}\n"
+            )
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert device.get_focused_window_or_app() == "tv.danmaku.bili/.MainActivity"
+    assert len(calls) == 2
+    assert calls[0][-1].startswith("dumpsys window | grep")
+    assert calls[1] == ["adb", "shell", "dumpsys", "window"]
+
+
+def test_get_focused_window_does_not_retry_when_the_filter_answered(monkeypatch) -> None:
+    """``mCurrentFocus=null`` is an answer: no second (full) dump roundtrip."""
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return FakeCompletedProcess(stdout="mCurrentFocus=null\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert device.get_focused_window_or_app() is None
+    assert len(calls) == 1
+
+
 def test_is_keyboard_visible_from_input_method(monkeypatch) -> None:
     def fake_run(*args, **kwargs):
         return FakeCompletedProcess(

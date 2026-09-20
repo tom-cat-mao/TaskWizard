@@ -150,8 +150,10 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | 变量 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `PHONE_AGENT_GROUNDING_PROVIDER` | `hybrid`/`accessibility`/`locateanything` | `hybrid` | `locate` 工具的视觉 provider 档位。观测 marks 恒由控件树产出，与本键无关；`hybrid` / `locateanything` 构建 LocateAnything 视觉 provider，`accessibility` 不构建——该档下 `locate` 报 `provider_unavailable` |
-| `PHONE_AGENT_ACCESSIBILITY_TIMEOUT` | float | `3.0` | 控件树抓取超时（秒） |
+| `PHONE_AGENT_ACCESSIBILITY_TIMEOUT` | float | `12.0` | 控件树抓取超时（秒）。`uiautomator dump` 内部的 `waitForIdle` 硬编码等待在页面跳转后的忙乱期会久留，超时过短会把这次 dump 打断成 `provider_error`，故默认放宽到 12.0 |
 | `PHONE_AGENT_ACCESSIBILITY_MAX_MARKS` | int | `80` | 单次观测最多输出的 mark 数 |
+| `PHONE_AGENT_OBSERVE_RETRY_MAX_LOOPS` | int | `1` | 不稳定 marks dump（`timeout` / `provider_error` / `accessibility_xml_parse_error`）的额外整轮重采上限；总轮数 = `1 + 本值`，`0` 表示单轮不重试。默认 `1` 即「最多 2 轮」 |
+| `PHONE_AGENT_OBSERVE_RETRY_BACKOFF_S` | float | `2.0` | marks dump 失败后、下一轮开始前的退避秒数，用来错开页面跳转后的忙乱窗口；重试是整轮重采（含截图），不单独重采 marks |
 | `PHONE_AGENT_MARKS_WINDOWED` | `auto`/`on`/`off` | `auto` | 窗口感知 marks（纯展示层）。`auto` 先试 `uiautomator dump --windows`，不支持则回退 legacy 单根 dump；`on` 强制 `--windows`（不支持报错可见）；`off` 只跑 legacy 单根 dump。分组条件是出现多个不同窗口或存在真窗口证据（layer/type），否则平铺渲染——legacy 单根 dump 的多个顶层 node 会各生成一个弱窗口，因此同样按分组渲染并输出 `op=` 字段。仅影响分组/标注/渲染，寻址/执行/安全门/折叠/locate 不变，`op=blocked` 仅展示不拦截 |
 | `PHONE_AGENT_LOCATEANYTHING_MODEL` | path | `models/LocateAnything-3B-4bit` | 本地视觉定位模型路径；留空时按该默认路径加载，路径不存在时视觉定位不可用 |
 | `PHONE_AGENT_LOCATEANYTHING_MAX_SIZE` | int | `960` | 视觉定位 provider 自身输入图的最长边上限（模型侧档位）。与工具侧 `LOCATE_MAX_SIZE` 独立 |
@@ -276,12 +278,13 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 |---|---|---|---|
 | `PHONE_AGENT_SCREENSHOT_FORMAT` | `jpeg`/`png` | `jpeg` | 模型输入图的编码格式；非 `jpg`/`jpeg` 值按 PNG 保存 |
 | `PHONE_AGENT_SCREENSHOT_JPEG_QUALITY` | int | `80` | JPEG 质量，钳制在 1-95；非法值回落 `80` |
+| `PHONE_AGENT_SCREENSHOT_USE_EXEC_OUT` | `on`/`off` | `on` | 截图走 `adb exec-out screencap -p` 单次往返（PNG 直读 stdout）；只有 `1`/`true`/`yes`/`on` 视为开，其余取值回退 legacy 三往返路径（设备端写文件 + pull + rm）。老设备不支持 exec-out 时设 `off` |
 | `PHONE_AGENT_LOCATEANYTHING_STRUCTURE_MODE` | `off`/`target`/`screen` | `off` | 视觉定位的结构化提示档位；非法值回落 `off` |
 | `PHONE_AGENT_GROUNDING_MAX_SIZE` | int | `960` | 视觉定位输入图最长边的兜底别名；v2 session 恒先提供 `PHONE_AGENT_LOCATEANYTHING_MAX_SIZE` 的值，故本键在 v2 路径不生效 |
 | `PHONE_AGENT_LOCATEANYTHING_MAX_VISUAL_CANDIDATES` | int | `30` | 单次结构化的视觉候选上限 |
 | `PHONE_AGENT_LOCATEANYTHING_VISUAL_CATEGORY_BUDGET` | int | `5` | 单类视觉候选配额 |
 | `PHONE_AGENT_LOCATEANYTHING_MAX_STRUCTURE_CALLS` | int | `5` | 单次结构化的模型调用次数上限 |
-| `PHONE_AGENT_TAP_DELAY` / `PHONE_AGENT_DOUBLE_TAP_DELAY` / `PHONE_AGENT_LONG_PRESS_DELAY` / `PHONE_AGENT_SWIPE_DELAY` / `PHONE_AGENT_BACK_DELAY` / `PHONE_AGENT_HOME_DELAY` / `PHONE_AGENT_LAUNCH_DELAY` | float | `1.0` | 各动作执行后的等待秒数 |
+| `PHONE_AGENT_TAP_DELAY` / `PHONE_AGENT_DOUBLE_TAP_DELAY` / `PHONE_AGENT_LONG_PRESS_DELAY` / `PHONE_AGENT_SWIPE_DELAY` / `PHONE_AGENT_BACK_DELAY` / `PHONE_AGENT_HOME_DELAY` / `PHONE_AGENT_LAUNCH_DELAY` | float | `0.3` | 各动作执行后的等待秒数；由 `DeviceTimingConfig` 读入，被 `phone_agent/adb/device.py` 的各动作消费。慢设备可调高 |
 | `PHONE_AGENT_DOUBLE_TAP_INTERVAL` | float | `0.1` | 双击两次点击之间的间隔 |
 | `PHONE_AGENT_ADB_RESTART_DELAY` | float | `2.0` | 切到 TCP/IP 模式后的等待秒数 |
 | `PHONE_AGENT_SERVER_RESTART_DELAY` | float | `1.0` | 重启 ADB server 前后的等待秒数 |
@@ -295,4 +298,4 @@ token 估算仍按[预算契约](#token-budget)的固定口径，不随这两项
     见上表，为 no-op。`PHONE_AGENT_LOCATE_LA_MAX_SIZE` 同样无读取方（`resolve_locate_la_max_size` 没有调用方），
     locate 工具的输入档位用 `PHONE_AGENT_LOCATE_MAX_SIZE`。`PHONE_AGENT_KEYBOARD_SWITCH_DELAY` /
     `PHONE_AGENT_TEXT_CLEAR_DELAY` / `PHONE_AGENT_TEXT_INPUT_DELAY` / `PHONE_AGENT_KEYBOARD_RESTORE_DELAY`
-    被 `phone_agent/config/timing.py` 读入 `ActionTimingConfig`，但该配置的字段无读取方。
+    被 `phone_agent/config/timing.py` 读入 `ActionTimingConfig`，但该配置的字段无读取方，其取值不影响行为。

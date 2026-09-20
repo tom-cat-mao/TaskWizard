@@ -20,10 +20,24 @@ WP-G2cA (parser-layer fixes, still pure display layer):
 * A4 — the dead ``disabled``/``invisible`` ``blocked`` branch is removed
   (those nodes are already dropped by ``_is_candidate_node``).
 
+WP1 (input-method collapse + label priority, still pure display layer):
+
+* A ``TYPE_INPUT_METHOD`` window contributes only its *action* keys (搜索 /
+  完成 / 发送 / … or a node carrying an IME action) to the mark candidates. Its
+  letter keys are dropped before the per-window quota, so an open keyboard can
+  no longer spend the ``max_marks`` budget the foreground app's controls need.
+  A dropped key is dropped — never replaced by a synthesized mark, since a mark
+  must map a real accessibility node (P0 #2).
+* ``_node_text`` prefers a node's own ``text`` and falls back to
+  ``content-desc`` only when there is no text, so a resource-id-shaped desc
+  cannot spend the 32-char display budget of the marks digest.
+
 None of this touches addressing, tool execution, the safety gate, folding, or
 locate: for a legacy ``<hierarchy>`` dump a single window keeps the historic
 document order, so the mark id sequence, dedup, ``max_marks`` cut, and every
-legacy field are byte-identical; the windowed metadata is purely additive.
+legacy field are byte-identical; the windowed metadata is purely additive. A
+weak (inferred) window carries no real type, so the IME collapse never reaches
+a legacy dump either.
 """
 
 from __future__ import annotations
@@ -57,6 +71,38 @@ MAX_TEXT_SUMMARY_CHARS = 120
 # with a mark; nameless layout ancestors (FrameLayout/LinearLayout/…) are
 # dropped so the path stays a short intent signal, not a DOM dump.
 MAX_CONTAINER_PATH = 3
+
+# WP1 — input-method (soft keyboard) window collapse.
+#
+# An open keyboard ships dozens of clickable key nodes. As ordinary candidates
+# they ate most of ``max_marks`` and left the foreground app with a handful of
+# marks, which is why the model fell back to a slow visual locate for controls
+# that were right there in the dump. Only keys that can plausibly *finish* an
+# input stay eligible — the named action keys, or a node carrying a real IME
+# action. Everything else is dropped; nothing is synthesized in its place.
+IME_WINDOW_TYPE = "TYPE_INPUT_METHOD"
+IME_ACTION_KEY_TEXTS = frozenset(
+    {
+        "搜索",
+        "完成",
+        "发送",
+        "确定",
+        "前往",
+        "下一步",
+        "go",
+        "search",
+        "done",
+        "enter",
+        "next",
+    }
+)
+# Attribute spellings an IME action may arrive under (dumps vary by producer).
+_IME_ACTION_ATTRS = ("ime-action", "imeaction", "ime_action")
+# Values meaning "this key carries no action": EditorInfo.IME_ACTION_UNSPECIFIED
+# and IME_ACTION_NONE are 0 and 1; the symbolic spellings are the usual aliases.
+_IME_ACTION_NONE_VALUES = frozenset(
+    {"", "0", "1", "none", "no_action", "noaction", "unspecified"}
+)
 
 
 @dataclass(frozen=True)
@@ -179,6 +225,12 @@ def _parse_uiautomator_xml(
         finalized.append((window, root_elem))
     windows = finalized
     summary["raw_node_count"] = len(records)
+    # WP1 — how many windows this dump classified as a soft keyboard. Counted
+    # from the finalized windows so an IME window with no eligible key still
+    # shows up; the display layer renders its keyboard note from these keys.
+    summary["ime_window_count"] = sum(
+        1 for win, _elem in windows if _is_ime_window(win)
+    )
 
     # Phase 1 — collect every dedup-passing candidate mark in document order,
     # tagging its window. ``total_candidates`` is this pre-truncation total
@@ -190,8 +242,19 @@ def _parse_uiautomator_xml(
         attrs = rec.attrs
         role = rec.role
         text = rec.text
-        if _is_candidate_node(attrs, role=role, text=text):
+        is_candidate = _is_candidate_node(attrs, role=role, text=text)
+        if is_candidate:
             summary["interactive_candidate_count"] += 1
+        # WP1 — input-method window collapse. Key nodes are dropped *before*
+        # the quota so they never consume a slot the app window needs; only the
+        # action keys above stay eligible. Dropping is the whole fix: no key is
+        # replaced by a synthetic mark, because a mark must map a real node
+        # (P0 #2). ``ime_collapsed_key_count`` counts the dropped keys that
+        # would otherwise have become marks.
+        if _is_ime_window(rec.window) and not _is_ime_action_key(attrs):
+            if is_candidate:
+                summary["ime_collapsed_key_count"] += 1
+            continue
         raw_bounds = rec.raw_bounds
         if raw_bounds is None:
             summary["bounds_parse_fail_count"] += 1
@@ -341,6 +404,11 @@ def _empty_parse_summary() -> dict[str, Any]:
         # ``per_window_counts`` maps window_id -> candidate count (pre-truncation).
         "total_candidates": 0,
         "per_window_counts": {},
+        # WP1: soft-keyboard collapse accounting (counts only, trace-safe). The
+        # display layer renders ``keyboard: open (N keys collapsed)`` from
+        # ``ime_collapsed_key_count``; never rename these keys.
+        "ime_window_count": 0,
+        "ime_collapsed_key_count": 0,
     }
 
 
@@ -582,18 +650,60 @@ def _to_relative(value: int, maximum: int) -> int:
 
 
 def _node_text(attrs: dict[str, str]) -> str:
+    """Label one node: its ``text``, else its ``content-desc``.
+
+    WP1 — the two used to be concatenated with ``" | "``. A resource-id-shaped
+    ``content-desc`` (some apps write one) then rode inside the 32-char digest
+    budget and spent it on a string no action can address, exactly where the
+    model needs to read the visible label. A node with real ``text`` now keeps
+    it alone; ``content-desc`` is the label only for a node that has no text at
+    all. The result is still bounded by ``MAX_TEXT_SUMMARY_CHARS`` where the
+    mark is built.
+    """
+
     if attrs.get("password") == "true":
         return ""
-    values = [
-        attrs.get("text") or "",
-        attrs.get("content-desc") or "",
-    ]
-    parts: list[str] = []
-    for value in values:
-        cleaned = " ".join(str(value).split())
-        if cleaned and cleaned not in parts:
-            parts.append(cleaned)
-    return " | ".join(parts)
+    text = " ".join(str(attrs.get("text") or "").split())
+    if text:
+        return text
+    return " ".join(str(attrs.get("content-desc") or "").split())
+
+
+def _is_ime_window(window: WindowRecord) -> bool:
+    """True for a real soft-keyboard window (weak inferred windows are never IME).
+
+    Only ``--windows`` dumps carry a real ``type``; a legacy ``<hierarchy>``
+    window is inferred and leaves ``window_type`` ``None``, which keeps the IME
+    collapse out of the legacy single-root path entirely.
+    """
+
+    return str(window.window_type or "").strip().upper() == IME_WINDOW_TYPE
+
+
+def _is_ime_action_key(attrs: dict[str, str]) -> bool:
+    """True when a key of a keyboard window may stay a mark candidate.
+
+    Two kinds of evidence: the action labels the model already looks for
+    (``搜索`` / ``完成`` / … on ``text`` or ``content-desc``), or an IME-action
+    attribute carrying a real action — ``none`` / ``unspecified`` / ``0`` / ``1``
+    mean the key does nothing but insert text.
+    """
+
+    for name in ("text", "content-desc"):
+        label = " ".join(str(attrs.get(name) or "").split()).casefold()
+        if label and label in IME_ACTION_KEY_TEXTS:
+            return True
+    action = ""
+    for name in _IME_ACTION_ATTRS:
+        raw = attrs.get(name)
+        if raw is not None:
+            action = " ".join(str(raw).split()).casefold()
+            break
+    if not action or action in _IME_ACTION_NONE_VALUES:
+        return False
+    if action.lstrip("-").isdigit():
+        return int(action) > 1
+    return True
 
 
 def _role_from_class(class_name: str) -> str:

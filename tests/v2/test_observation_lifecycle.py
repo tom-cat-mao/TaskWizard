@@ -72,6 +72,13 @@ class FakeConfig:
     locate_max_size = 0
     scope_padding_ratio = 0.05
     locateanything_model = None
+    # These tests drive the *real* PhoneSession, so the observation waits are
+    # pinned to zero: a test never pays wall-clock time for production timing
+    # (the settle/backoff values themselves are under test in
+    # test_observation_hardening.py and test_observe_retry_backoff.py, which
+    # assert on a monkeypatched ``time.sleep``).
+    observe_settle_ms = 0
+    observe_retry_backoff_s = 0.0
 
 
 class FakeDeviceFactory:
