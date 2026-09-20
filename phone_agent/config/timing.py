@@ -13,10 +13,10 @@ class ActionTimingConfig:
     """Configuration for action handler timing delays."""
 
     # Text input related delays (in seconds)
-    keyboard_switch_delay: float = 1.0  # Delay after switching to ADB keyboard
-    text_clear_delay: float = 1.0  # Delay after clearing text
-    text_input_delay: float = 1.0  # Delay after typing text
-    keyboard_restore_delay: float = 1.0  # Delay after restoring original keyboard
+    keyboard_switch_delay: float = 0.3  # Delay after switching to ADB keyboard
+    text_clear_delay: float = 0.3  # Delay after clearing text
+    text_input_delay: float = 0.3  # Delay after typing text
+    keyboard_restore_delay: float = 0.3  # Delay after restoring original keyboard
 
     def __post_init__(self):
         """Load values from environment variables if present."""
@@ -39,14 +39,14 @@ class DeviceTimingConfig:
     """Configuration for device operation timing delays."""
 
     # Default delays for various device operations (in seconds)
-    default_tap_delay: float = 1.0  # Default delay after tap
-    default_double_tap_delay: float = 1.0  # Default delay after double tap
+    default_tap_delay: float = 0.3  # Default delay after tap
+    default_double_tap_delay: float = 0.3  # Default delay after double tap
     double_tap_interval: float = 0.1  # Interval between two taps in double tap
-    default_long_press_delay: float = 1.0  # Default delay after long press
-    default_swipe_delay: float = 1.0  # Default delay after swipe
-    default_back_delay: float = 1.0  # Default delay after back button
-    default_home_delay: float = 1.0  # Default delay after home button
-    default_launch_delay: float = 1.0  # Default delay after launching app
+    default_long_press_delay: float = 0.3  # Default delay after long press
+    default_swipe_delay: float = 0.3  # Default delay after swipe
+    default_back_delay: float = 0.3  # Default delay after back button
+    default_home_delay: float = 0.3  # Default delay after home button
+    default_launch_delay: float = 0.3  # Default delay after launching app
 
     def __post_init__(self):
         """Load values from environment variables if present."""

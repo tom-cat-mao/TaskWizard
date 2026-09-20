@@ -56,10 +56,21 @@ def get_foreground_app(device_id: str | None = None) -> ForegroundAppObservation
     return DEFAULT_APP_REGISTRY.foreground_observation(component)
 
 
+# WP2: only two lines of the ``dumpsys window`` dump are read here, so the filter
+# runs on the device instead of shipping the whole dump back. The pipe is executed
+# on the *device*: the whole command must travel as one shell string — passing
+# ``"|"`` as a separate argv element would make it an argument of ``dumpsys``.
+_FOCUSED_WINDOW_QUERY = "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'"
+
+
 def get_focused_window_or_app(device_id: str | None = None) -> str | None:
     """Return the focused package/activity component for verifier diagnostics."""
 
-    output = _run_adb_shell_text(device_id, ["dumpsys", "window"], timeout=5)
+    output = _run_adb_shell_text(device_id, [_FOCUSED_WINDOW_QUERY], timeout=5)
+    if "mCurrentFocus" not in output and "mFocusedApp" not in output:
+        # No device-side match: either ``grep`` is unavailable on this ROM or the
+        # dump itself failed. Fall back to the unfiltered dump and filter here.
+        output = _run_adb_shell_text(device_id, ["dumpsys", "window"], timeout=5)
     if not output:
         return None
     for line in output.splitlines():
