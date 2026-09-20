@@ -165,7 +165,7 @@ def test_doubts_soft_on_too_few_marks():
 
 # --------------------------------------------------------------------------
 # two-step finish integration through the control tool.
-# The fresh/stale/off flow matrix itself lives in test_tools.py via
+# The fresh/stale/off flow matrix itself lives in actuation/test_tools.py via
 # build_tools (the production assembly perspective); packet/doubt content
 # is covered above through build_review_package / finish_doubts directly.
 # --------------------------------------------------------------------------

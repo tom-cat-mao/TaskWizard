@@ -752,7 +752,7 @@ def test_unapproved_lessons_never_enter_actor_initial_messages_when_on(
 
 
 def test_evolution_config_env_overrides(monkeypatch):
-    # Default values live in test_config.py::test_from_env_defaults.
+    # Default values live in providers/test_config.py::test_from_env_defaults.
     monkeypatch.setenv("PHONE_AGENT_EVOLUTION", "off")
     monkeypatch.setenv("PHONE_AGENT_LESSONS_DIR", "/tmp/example-lessons")
     configured = V2Config.from_env()

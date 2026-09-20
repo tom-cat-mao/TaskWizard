@@ -19,7 +19,9 @@ from langchain_core.tools import tool
 from phone_agent.device_factory import DeviceFactory
 from phone_agent.v2.tools.actuation import build_actuation_tools
 from phone_agent.v2.tools.control import build_control_tools
-from tests.v2._doubles import FakeDeviceFactory, FakePhoneSession, make_mark
+from tests.v2.doubles.device import FakeDeviceFactory
+from tests.v2.doubles.marks import make_mark
+from tests.v2.doubles.session import FakePhoneSession
 from tests.v2.doubles.models import ScriptedModel
 
 

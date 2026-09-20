@@ -1,6 +1,7 @@
 """WP-F1 behavioural guards for the v2 event-chain nesting.
 
-``tests/v2/test_plugin_e4.py`` pins the *mechanism* (which listener sits at which
+``tests/v2/providers/test_plugin_middleware_retirement.py`` pins the *mechanism*
+(which listener sits at which
 index of ``event_bus._listeners``). This file pins the *guarantee* the mechanism
 exists for: it assembles a real ``ThinPhoneAgent`` with fakes and asserts
 observable behaviour, so moving a registration statement in
@@ -195,9 +196,10 @@ def test_blocked_call_is_traced_as_a_pair(wary_agent):
     registered outermost (i.e. before trace), safety returns before trace is ever
     entered: neither record is written, ``tap_calls``/``tap_results`` are both
     empty and this test fails — which is exactly the regression the white-box
-    assertions in ``tests/v2/test_plugin_e4.py::test_tool_execute_chain_order``
+    assertions in
+    ``tests/v2/providers/test_plugin_middleware_retirement.py::test_tool_execute_chain_order``
     cannot catch, because they are updated together with the registration order.
-    (Same invariant, coarser: ``tests/v2/test_trace_invariant.py``.)
+    (Same invariant, coarser: ``tests/v2/safety/test_trace_invariant.py``.)
     """
 
     agent, session = wary_agent
@@ -341,8 +343,9 @@ def test_t2_fold_prunes_once_and_taskdoc_stays_pinned(tmp_path, monkeypatch):
     listener: it prunes images/OBS marks (C1) *before* summarising, then hands
     the rebuilt transcript to the inner listeners — the TaskDoc injector still
     pins a fresh board onto it. The same invariant at unit level is covered by
-    ``tests/v2/test_compact.py::test_t2_fold_preserves_pinned_taskdoc_and_listener_refreshes_it``
-    (and the compact-OFF variant in ``tests/v2/test_context_pruner.py``);
+    ``tests/v2/context/test_compact.py::test_t2_fold_preserves_pinned_taskdoc_and_listener_refreshes_it``
+    (and the compact-OFF variant in
+    ``tests/v2/context/test_context_pruner.py``);
     this test asserts it through the assembled chain.
     """
 

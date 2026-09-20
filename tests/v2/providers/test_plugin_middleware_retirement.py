@@ -151,9 +151,9 @@ def test_create_agent_middleware_is_bridges_only(captured_agent):
 # The WP-F1 white-box chain assertions (reading ``event_bus._listeners``) were
 # removed: they pinned the registration order that updates them in the same
 # commit, so they could never fail on a reorder. The guarantees they existed
-# for are asserted behaviourally in ``tests/v2/test_event_chain_behavior.py``
+# for are asserted behaviourally in ``tests/v2/harness/test_event_chain_behavior.py``
 # (trace pairing under the safety short-circuit; compact/taskdoc nesting) and
-# ``tests/v2/test_trace_invariant.py``.
+# ``tests/v2/safety/test_trace_invariant.py``.
 # ---------------------------------------------------------------------------
 
 

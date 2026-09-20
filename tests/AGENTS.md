@@ -28,8 +28,11 @@
   `tests/docs/test_doc_bash_blocks.py`。改门禁连带改这条清单。
 - `tests/web/`：守护 Web 投影契约——bridge 快照与 run 目录协议、状态推进、App-KB 只读表、流式观察者。
   改 `phone_agent/web/` 时同批改这里的断言，别只改实现。
-- `tests/v2/`：会话、事件、安全、预算、经验与配置的契约测试；跨模块行为在这里集成验证。双打统一在
-  `tests/v2/doubles/`（唯一事实源，别再抄一份），观测域（会话帧/标记/截图）用例在 `tests/v2/observation/`。
+- `tests/v2/`：会话、事件、安全、预算、经验与配置的契约测试，跨模块行为在这里集成验证。下按域分目录：
+  observation、locate、actuation、taskdoc、safety、context、providers、memory、recall、harness、finish、
+  runner（观测域＝会话帧/标记/截图）；双打统一在 `tests/v2/doubles/`（唯一事实源，别再抄一份）。
+  新文件进对应域目录、按被测对象命名——名字带批次编号（`_wp1`、`_wf3`、`_s2`、`_e1`）会被
+  `tests/v2/harness/test_suite_layout.py` 拒绝。
 - `tests/skill/`：真机诊断 skill 的离线冒烟（20 个文件、自带 `conftest.py` 把 skill 的 scripts 目录放进
   `sys.path`），随 CI 的全量 `pytest tests` 跑，没有自己的分层命令。
 - `tests/` 根：保留库的测试——`phone_agent/adb/`（test_adb_app_labels.py、test_adb_device_signals.py、

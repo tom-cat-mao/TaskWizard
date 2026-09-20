@@ -84,7 +84,7 @@ def test_mlx_embedder_is_lazy_without_importing_or_loading_model():
 
 
 def test_memory_rag_illegal_value_falls_back_to_shadow(monkeypatch):
-    # Default values live in test_config.py::test_from_env_defaults (single
+    # Default values live in providers/test_config.py::test_from_env_defaults (single
     # dataclass comparison); here only the illegal-value fallback contract.
     monkeypatch.delenv("PHONE_AGENT_MEMORY_RAG", raising=False)
     monkeypatch.setenv("PHONE_AGENT_MEMORY_RAG", "unsupported")

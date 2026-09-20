@@ -26,7 +26,9 @@ from phone_agent.v2.middleware.taskdoc import (
 )
 from phone_agent.v2.tools import build_tools
 
-from tests.v2._doubles import FakeConfig, FakePhoneSession, make_mark
+from tests.v2.doubles.config import FakeConfig
+from tests.v2.doubles.marks import make_mark
+from tests.v2.doubles.session import FakePhoneSession
 from tests.v2.doubles.taskdoc import FakeTaskDoc, FakeTaskItem
 
 

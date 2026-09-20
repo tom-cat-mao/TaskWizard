@@ -23,7 +23,7 @@ from phone_agent.v2.middleware.images import (
 
 
 # --------------------------------------------------------------------------
-# helpers (mirrors test_middleware.py)
+# helpers (mirrors context/test_middleware_context.py)
 # --------------------------------------------------------------------------
 def _image_msg(seq: int) -> HumanMessage:
     return HumanMessage(
@@ -230,7 +230,7 @@ def test_compact_off_prunes_images_exactly_once(monkeypatch, tmp_path):
 
 
 # The compact-ON prune-once invariant is asserted through the assembled chain
-# by tests/v2/test_event_chain_behavior.py::test_t2_fold_prunes_once_and_
+# by tests/v2/harness/test_event_chain_behavior.py::test_t2_fold_prunes_once_and_
 # taskdoc_stays_pinned (which also pins the TaskDoc re-attach); the compact-OFF
 # unit variant below keeps the pruner-count guarded at unit level.
 

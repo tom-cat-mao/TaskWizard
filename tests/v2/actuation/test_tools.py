@@ -6,7 +6,9 @@ from phone_agent.v2.resolver import LocateAmbiguousError
 from phone_agent.v2.tools import build_tools
 from phone_agent.v2.tools.actuation import TEXT_MISS_HINT
 
-from tests.v2._doubles import FakeConfig, FakePhoneSession, make_mark
+from tests.v2.doubles.config import FakeConfig
+from tests.v2.doubles.marks import make_mark
+from tests.v2.doubles.session import FakePhoneSession
 
 
 def _tool_map(session, config=None):
@@ -299,7 +301,7 @@ def test_launch_app_unknown_error_includes_available_names():
 
 def test_launch_app_device_failure_reported():
     """P0 #5: a failed device launch must surface as an error, never fake OK."""
-    from tests.v2._doubles import FakeDeviceFactory
+    from tests.v2.doubles.device import FakeDeviceFactory
 
     session = FakePhoneSession(
         {}, device_factory=FakeDeviceFactory(launch_result=False)
@@ -313,7 +315,7 @@ def test_launch_app_device_failure_reported():
 
 def test_launch_app_not_installed_reported():
     """A registry app missing from the device inventory -> not_installed, no launch."""
-    from tests.v2._doubles import FakeDeviceFactory
+    from tests.v2.doubles.device import FakeDeviceFactory
 
     session = FakePhoneSession(
         {}, device_factory=FakeDeviceFactory(installed=frozenset({"com.tencent.mm"}))

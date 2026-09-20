@@ -248,7 +248,7 @@ class _MiniConfig:
 
 
 def _install_mini_agent_modules(monkeypatch, tmp_path, enabled: bool):
-    from tests.v2._doubles import FakePhoneSession
+    from tests.v2.doubles.session import FakePhoneSession
 
     session = FakePhoneSession()
 

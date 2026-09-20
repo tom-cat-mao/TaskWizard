@@ -145,7 +145,7 @@ def test_real_thin_agent_retains_legacy_window_at_final_admission(tmp_path, monk
     from phone_agent.v2.config import V2Config
     from phone_agent.v2.providers import register_provider
     from phone_agent.v2.session import Observation, PhoneSession
-    from tests.v2._doubles import FakeDeviceFactory
+    from tests.v2.doubles.device import FakeDeviceFactory
 
     device = FakeDeviceFactory()
     monkeypatch.setattr("phone_agent.v2.session.get_device_factory", lambda: device)

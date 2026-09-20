@@ -19,7 +19,8 @@ from phone_agent.v2.names import (
 from phone_agent.v2.recall import HashEmbedder, VecIndex
 from phone_agent.v2.middleware.trace import TraceMiddleware
 from phone_agent.v2.tools.actuation import build_actuation_tools
-from tests.v2._doubles import FakeDeviceFactory, FakePhoneSession
+from tests.v2.doubles.device import FakeDeviceFactory
+from tests.v2.doubles.session import FakePhoneSession
 
 BILI_PACKAGE = "tv.danmaku.bili"
 

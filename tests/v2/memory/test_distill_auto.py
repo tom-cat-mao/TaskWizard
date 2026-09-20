@@ -598,7 +598,7 @@ def test_prompt_rows_carry_one_marker_block_per_episode(tmp_path):
 
 # --- A6: injection gate ----------------------------------------------------
 # The full gate matrix (approved/auto/needs_review × rule/procedure + kind
-# filtering) lives in test_workflow_memory_wf1.py::test_injection_gate_matrix.
+# filtering) lives in test_procedure_distill.py::test_injection_gate_matrix.
 
 
 def test_human_approval_still_required_to_move_past_a_verdict(tmp_path):

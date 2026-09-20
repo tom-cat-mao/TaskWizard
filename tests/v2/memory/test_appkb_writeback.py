@@ -10,7 +10,8 @@ from phone_agent.v2.appkb import AppKnowledge, AppKnowledgeStore
 from phone_agent.v2.session import PhoneSession
 from phone_agent.v2.tools.actuation import build_actuation_tools
 
-from tests.v2._doubles import FakeDeviceFactory, FakePhoneSession
+from tests.v2.doubles.device import FakeDeviceFactory
+from tests.v2.doubles.session import FakePhoneSession
 
 
 WECHAT_PACKAGE = "com.tencent.mm"

@@ -12,7 +12,8 @@ from phone_agent.v2.taskdoc import TaskDoc, TaskItem
 from phone_agent.v2.tools import build_tools
 from phone_agent.v2.tools.taskdoc import make_update_task_doc_tool
 
-from tests.v2._doubles import FakeConfig, FakePhoneSession
+from tests.v2.doubles.config import FakeConfig
+from tests.v2.doubles.session import FakePhoneSession
 
 
 # --------------------------------------------------------------------------

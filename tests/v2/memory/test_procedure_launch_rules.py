@@ -46,7 +46,7 @@ from phone_agent.v2.recall import (
 )
 from phone_agent.v2.session import PhoneSession
 
-from tests.v2._doubles import FakePhoneSession
+from tests.v2.doubles.session import FakePhoneSession
 from tests.v2.memory.test_experience import _install_mini_agent_modules
 
 APP = "com.example.flashnote"

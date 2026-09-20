@@ -11,7 +11,7 @@ core/tools modules).
 
 U3 removed the stagnation nudge (``seen_states``/``nudged``); the pinned block
 now carries a transcript-derived flow line instead — covered by
-``tests/v2/test_flow_line.py``.
+``tests/v2/taskdoc/test_flow_line.py``.
 """
 
 from __future__ import annotations

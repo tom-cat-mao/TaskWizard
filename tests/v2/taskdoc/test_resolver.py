@@ -9,7 +9,8 @@ from phone_agent.v2.resolver import (
     resolve_description,
 )
 
-from tests.v2._doubles import FakePhoneSession, make_mark
+from tests.v2.doubles.marks import make_mark
+from tests.v2.doubles.session import FakePhoneSession
 
 
 def test_exact_match_wins_over_substring():
