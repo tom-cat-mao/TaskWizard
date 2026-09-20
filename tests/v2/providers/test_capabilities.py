@@ -10,7 +10,7 @@ import pytest
 from phone_agent.v2.capabilities import CapabilityRegistry, CapabilitySpec
 from phone_agent.v2.recall import read_episode_events
 from phone_agent.web.bridge import WebRunBridge
-from tests.v2.test_experience import _install_mini_agent_modules
+from tests.v2.memory.test_experience import _install_mini_agent_modules
 
 
 def _by_id(registry: CapabilityRegistry) -> dict[str, dict]:

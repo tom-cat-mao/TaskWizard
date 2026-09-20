@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from phone_agent.v2.agent import ThinPhoneAgent
 from phone_agent.v2.evolution import LessonCandidate, select_lessons_for_injection
 from phone_agent.v2.recall import read_episode_events
-from tests.v2.test_experience import _install_mini_agent_modules
+from tests.v2.memory.test_experience import _install_mini_agent_modules
 
 
 def _lesson(

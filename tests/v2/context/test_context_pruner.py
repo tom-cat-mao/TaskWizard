@@ -129,7 +129,7 @@ def test_service_retrievable_from_capability_context():
 
 
 def test_service_accessible_via_agent_capability_context(monkeypatch, tmp_path):
-    from tests.v2.test_experience import _install_mini_agent_modules
+    from tests.v2.memory.test_experience import _install_mini_agent_modules
 
     config = _install_mini_agent_modules(monkeypatch, tmp_path, enabled=False)
     config.image_keep = 2
@@ -207,7 +207,7 @@ def _prune_call_counter(service: ContextPrunerService):
 
 
 def test_compact_off_prunes_images_exactly_once(monkeypatch, tmp_path):
-    from tests.v2.test_experience import _install_mini_agent_modules
+    from tests.v2.memory.test_experience import _install_mini_agent_modules
 
     config = _install_mini_agent_modules(monkeypatch, tmp_path, enabled=False)
     config.compact_enabled = False

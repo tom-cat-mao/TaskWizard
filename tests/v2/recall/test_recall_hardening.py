@@ -531,7 +531,7 @@ def test_coexisting_mounts_never_cross_notify_each_other(tmp_path):
 
 
 def _mini_config(monkeypatch, tmp_path: Path, *, mode: str):
-    from tests.v2.test_experience import _install_mini_agent_modules
+    from tests.v2.memory.test_experience import _install_mini_agent_modules
 
     config = _install_mini_agent_modules(monkeypatch, tmp_path, True)
     config.trace_enabled = True

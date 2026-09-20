@@ -173,7 +173,7 @@ def test_conflicting_second_mount_does_not_poison_first_service() -> None:
 
 
 def _real_registry_and_ctx(monkeypatch, tmp_path, *, memory_rag="shadow"):
-    from tests.v2.test_experience import _install_mini_agent_modules
+    from tests.v2.memory.test_experience import _install_mini_agent_modules
 
     config = _install_mini_agent_modules(monkeypatch, tmp_path, True)
     config.trace_enabled = True

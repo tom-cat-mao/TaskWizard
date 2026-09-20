@@ -44,7 +44,7 @@ from phone_agent.v2.session import PhoneSession
 from phone_agent.v2.tools.actuation import build_actuation_tools
 
 from tests.v2._doubles import FakeDeviceFactory, FakePhoneSession
-from tests.v2.test_experience import _install_mini_agent_modules
+from tests.v2.memory.test_experience import _install_mini_agent_modules
 
 FOOD = "com.example.food"
 WEATHER = "com.example.weather"

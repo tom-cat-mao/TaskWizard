@@ -15,6 +15,7 @@ import pytest
 from types import SimpleNamespace
 
 from phone_agent.v2.middleware.diagnostic import build_diagnostic_middleware
+from tests.v2.doubles.paths import REPO_ROOT
 
 
 # --------------------------------------------------------------------------
@@ -219,15 +220,15 @@ def test_skill_analyze_window_quota_starvation_rule():
     """Test that window quota starvation detection rule fires correctly."""
 
     import sys
-    from pathlib import Path
-    
-    # Add scripts dir to path (skill layout)
-    scripts_dir = Path(__file__).parent.parent.parent / ".agents/skills/phone-agent-live-diagnosis/scripts"
+
+    # Add scripts dir to path (skill layout). REPO_ROOT is depth-independent, so
+    # this file keeps working from tests/v2/runner/.
+    scripts_dir = REPO_ROOT / ".agents/skills/phone-agent-live-diagnosis/scripts"
     if scripts_dir.exists() and str(scripts_dir) not in sys.path:
         sys.path.insert(0, str(scripts_dir))
-    
+
     from analyze import build_windowing
-    
+
     # Build mock view with window quota starvation scenario
     tool_calls = [
         {
@@ -268,15 +269,15 @@ def test_skill_analyze_accessibility_failure_threshold():
     """WP4-②: accessibility failures trigger finding when count >= 2."""
 
     import sys
-    from pathlib import Path
-    
-    # Add scripts dir to path (skill layout)
-    scripts_dir = Path(__file__).parent.parent.parent / ".agents/skills/phone-agent-live-diagnosis/scripts"
+
+    # Add scripts dir to path (skill layout). REPO_ROOT is depth-independent, so
+    # this file keeps working from tests/v2/runner/.
+    scripts_dir = REPO_ROOT / ".agents/skills/phone-agent-live-diagnosis/scripts"
     if scripts_dir.exists() and str(scripts_dir) not in sys.path:
         sys.path.insert(0, str(scripts_dir))
-    
+
     from analyze import build_windowing
-    
+
     # Simulate 3 accessibility provider errors across run
     tool_calls = [
         {

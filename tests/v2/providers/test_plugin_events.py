@@ -305,7 +305,7 @@ def test_model_pre_request_bridge_listener_replaces_messages() -> None:
 
 def test_run_start_event_emitted(tmp_path, monkeypatch) -> None:
     from phone_agent.v2.agent import ThinPhoneAgent
-    from tests.v2.test_experience import _install_mini_agent_modules
+    from tests.v2.memory.test_experience import _install_mini_agent_modules
 
     config = _install_mini_agent_modules(monkeypatch, tmp_path, enabled=False)
     config.trace_enabled = False
