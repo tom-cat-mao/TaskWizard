@@ -896,6 +896,9 @@ def build_windowing(view: EvidenceView) -> dict[str, Any]:
     marks: a ``tap`` / ``long_press`` / ``type_text`` whose ``target_mark_id``
     was tagged ``op=blocked`` in the most recent windowed observation is a
     finding (the model addressed a mark the window layer had marked blocked).
+    
+    WP4 extensions: adds ``starvation_events`` (foreground app marks < 20% of retained)
+    and ``accessibility_failures`` (provider_error ≥ 2 times).
     """
 
     observations: list[dict[str, Any]] = []
@@ -907,11 +910,23 @@ def build_windowing(view: EvidenceView) -> dict[str, Any]:
     # later actuation is judged against the window structure it acted on.
     blocked_by_mark: dict[str, str] = {}
     blocked_taps: list[dict[str, Any]] = []
+    
+    # WP4: Track foreground app mark ratios and accessibility failures
+    starvation_events: list[dict[str, Any]] = []
+    accessibility_failures: list[dict[str, Any]] = []
+    total_applications_seen: dict[str, int] = {}  # app name -> count
+    failed_accessibility_count = 0
 
     for call in view.tool_calls:
         tool = call.get("tool")
         obs_event = call.get("observation") or {}
         text = result_text_of(obs_event)
+        
+        # WP4-①: Count accessibility failures
+        accessibility_error = obs_event.get("accessibility_error")
+        if accessibility_error:
+            failed_accessibility_count += 1
+        
         parsed = None
         try:
             parsed = parse_obs_windows(text)
@@ -935,51 +950,111 @@ def build_windowing(view: EvidenceView) -> dict[str, Any]:
                 )
 
         if not parsed or not parsed.get("present"):
-            continue
-        present = True
-        window_count = int(parsed.get("window_count", 0) or 0)
-        peak_windows = max(peak_windows, window_count)
-        op_counts = parsed.get("op_counts") or {}
-        for level in _WINDOW_OP_LEVELS:
-            total_op_counts[level] += int(op_counts.get(level, 0) or 0)
-        windows = parsed.get("windows") or []
-        for window in windows:
-            win_type = window.get("type") or "?"
-            type_counts[win_type] = type_counts.get(win_type, 0) + 1
-        observations.append(
-            {
-                "step": call.get("step"),
-                "tool": tool,
-                "schema": parsed.get("schema"),
-                "source": parsed.get("source"),
-                "window_count": window_count,
-                "op_counts": {
-                    level: int(op_counts.get(level, 0) or 0)
-                    for level in _WINDOW_OP_LEVELS
-                },
-                "windows": [
-                    {
-                        "id": window.get("id"),
-                        "type": window.get("type"),
-                        "package": window.get("package"),
-                        "layer": window.get("layer"),
-                        "covered_by": window.get("covered_by"),
-                        "flags": list(window.get("flags", []) or []),
-                        "mark_count": int(window.get("mark_count", 0) or 0),
-                        "op_counts": dict(window.get("op_counts", {}) or {}),
-                    }
-                    for window in windows
-                ],
-                "blocked_mark_ids": list(parsed.get("blocked_mark_ids", []) or []),
-            }
-        )
-        # Refresh the blocked-mark index to this frame's structure.
-        blocked_by_mark = {}
-        for window in windows:
-            for mark in window.get("marks", []) or []:
-                mid = mark.get("mark_id")
-                if mid:
-                    blocked_by_mark[str(mid)] = mark.get("op")
+            # WP4: Still track accessibility failures even without windowed marks
+            if accessibility_error and not isinstance(accessibility_error, bool):
+                pass  # Will be counted below
+        else:
+            present = True
+            window_count = int(parsed.get("window_count", 0) or 0)
+            peak_windows = max(peak_windows, window_count)
+            op_counts = parsed.get("op_counts") or {}
+            for level in _WINDOW_OP_LEVELS:
+                total_op_counts[level] += int(op_counts.get(level, 0) or 0)
+            windows = parsed.get("windows") or []
+            
+            # WP4-③: Check for window quota starvation
+            # Get foreground app mark ratio
+            current_app = None
+            foreground_mark_count = 0
+            total_retained_marks = 0
+            
+            # Extract app name and mark counts from windows
+            for window in windows:
+                win_type = window.get("type", "")
+                package = window.get("package", "")
+                win_mark_count = int(window.get("mark_count", 0) or 0)
+                total_retained_marks += win_mark_count
+                
+                if win_type.startswith("foreground") or win_type.startswith("active"):
+                    current_app = package
+                    foreground_mark_count = win_mark_count
+            
+            # If we can't determine from windows, fall back to parse_summary
+            if current_app is None and window_count > 0:
+                parse_summary = parsed.get("parse_summary", {})
+                if isinstance(parse_summary, dict):
+                    window_source = parse_summary.get("window_source", "")
+                    if window_source == "shell_windows":
+                        # Multiple shell windows → check if any are input/method editors
+                        input_window_types = ("input_method", "status_bar", "navigation_bar", "notification", "system_overlay")
+                        has_input_system = any(
+                            w.get("type", "").startswith(input_window_types) 
+                            for w in windows
+                        )
+                        if has_input_system:
+                            # Check if foreground app has < 20% of marks
+                            if total_retained_marks > 0 and foreground_mark_count < total_retained_marks * 0.2:
+                                starvation_events.append({
+                                    "step": call.get("step"),
+                                    "reason": "foreground_app_mark_ratio_low",
+                                    "foreground_marks": foreground_mark_count,
+                                    "total_retained": total_retained_marks,
+                                    "ratio": round(foreground_mark_count / total_retained_marks, 3) if total_retained_marks > 0 else 0,
+                                    "has_input_system_window": has_input_system,
+                                })
+            
+            # WP4: Track per-app occurrences for diagnosis correlation
+            if current_app:
+                total_applications_seen[current_app] = total_applications_seen.get(current_app, 0) + 1
+            
+            for window in windows:
+                win_type = window.get("type") or "?"
+                type_counts[win_type] = type_counts.get(win_type, 0) + 1
+            observations.append(
+                {
+                    "step": call.get("step"),
+                    "tool": tool,
+                    "schema": parsed.get("schema"),
+                    "source": parsed.get("source"),
+                    "window_count": window_count,
+                    "op_counts": {
+                        level: int(op_counts.get(level, 0) or 0)
+                        for level in _WINDOW_OP_LEVELS
+                    },
+                    "windows": [
+                        {
+                            "id": window.get("id"),
+                            "type": window.get("type"),
+                            "package": window.get("package"),
+                            "layer": window.get("layer"),
+                            "covered_by": window.get("covered_by"),
+                            "flags": list(window.get("flags", []) or []),
+                            "mark_count": int(window.get("mark_count", 0) or 0),
+                            "op_counts": dict(window.get("op_counts", {}) or {}),
+                        }
+                        for window in windows
+                    ],
+                    "blocked_mark_ids": list(parsed.get("blocked_mark_ids", []) or []),
+                }
+            )
+            # Refresh the blocked-mark index to this frame's structure.
+            blocked_by_mark = {}
+            for window in windows:
+                for mark in window.get("marks", []) or []:
+                    mid = mark.get("mark_id")
+                    if mid:
+                        blocked_by_mark[str(mid)] = mark.get("op")
+    
+    # WP4-②: Add accessibility dump failure finding if ≥ 2 occurrences
+    if failed_accessibility_count >= 2:
+        accessibility_failures.append({
+            "failure_type": "provider_error",
+            "count": failed_accessibility_count,
+            "examples": [
+                f"Step {call.get('step')}: {call.get('tool')} triggered accessibility error"
+                for call in view.tool_calls[:min(3, failed_accessibility_count)]
+            ]
+        })
 
     return {
         "present": present,
@@ -989,6 +1064,12 @@ def build_windowing(view: EvidenceView) -> dict[str, Any]:
         "window_types": type_counts,
         "blocked_taps": blocked_taps,
         "observations": observations,
+        # WP4 fields
+        "starvation_events": starvation_events,
+        "starvation_count": len(starvation_events),
+        "accessibility_failures": accessibility_failures,
+        "accessibility_failure_count": failed_accessibility_count,
+        "total_applications_seen": total_applications_seen,
     }
 
 
@@ -1910,6 +1991,64 @@ def build_findings(
                 ),
             }
         )
+    
+    # WP4-①: Window quota starvation detection
+    starvation_events = windowing.get("starvation_events", []) or []
+    if starvation_events:
+        findings.append(
+            {
+                "category": "window_quota_starvation",
+                "layer": "grounding",
+                "severity": "P2",
+                "title": "前台 App 窗口配额饥饿 suspected",
+                "count": len(starvation_events),
+                "examples": [
+                    f"Step {evt.get('step')}: foreground app has {evt.get('foreground_marks')} marks out of {evt.get('total_retained')} total ({evt.get('ratio'):.1%})"
+                    for evt in starvation_events[:3]
+                ],
+                "files": add_line_numbers(["phone_agent/grounding/accessibility.py"]),
+                "suggestion": (
+                    "前台 App 在窗口分组中标记数占 retained 总数 < 20%，同时存在输入法/系统窗口。\n"
+                    "- 可能原因：窗口层级复杂导致主应用窗口被挤占\n"
+                    "- 检查：无障碍 XML 中实际窗口结构、窗口 type 分类逻辑\n"
+                    "- 缓解：提高 foreground 窗口优先级或增加其 marks 分配比例"
+                ),
+                "verify": (
+                    "复现同一 App 在不同页面下的 marks 分布，确认是否均为 foreground 窗口 mark 数偏低。"
+                ),
+            }
+        )
+    
+    # WP4-②: Accessibility dump failures detection
+    accessibility_failure_count = windowing.get("accessibility_failure_count", 0)
+    if accessibility_failure_count >= 2:
+        findings.append(
+            {
+                "category": "accessibility_dump_failures",
+                "layer": "grounding",
+                "severity": "P1",
+                "title": "Accessibility provider dump failures detected",
+                "count": accessibility_failure_count,
+                "examples": [
+                    f"Step {i+1}: accessibility dump failed with error code"
+                    for i in range(min(3, accessibility_failure_count))
+                ],
+                "files": add_line_numbers([
+                    "phone_agent/grounding/accessibility.py",
+                    "phone_agent/v2/session.py",
+                ]),
+                "suggestion": (
+                    f"Run 内 accessibility provider_error 发生 {accessibility_failure_count} 次，超过阈值 2。\n"
+                    "- 可能原因：无障碍服务超时、Android 版本兼容性问题、权限不足\n"
+                    "- 检查：ADB shell settings get secure enabled_accessibility_services\n"
+                    "- 缓解：增加 accessibility timeout 重试次数，或 fallback 到替代探测方案"
+                ),
+                "verify": (
+                    "检查设备无障碍服务状态，运行 uiautomator dump --windows 验证是否能稳定获取 XML。"
+                ),
+            }
+        )
+
     return findings
 
 
