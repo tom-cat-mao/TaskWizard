@@ -835,7 +835,11 @@ class PhoneSession:
         failure is not the batch-invalidating observation failure that a bad
         screenshot or persistent foreground instability is. A genuinely empty
         screen (``accessibility_dump_empty`` / ``no_interactive_marks``) does not
-        retry.
+        retry. A marks-dump retry waits ``config.observe_retry_backoff_s``
+        (default 2.0s) first — the post-navigation busy window is what makes the
+        dump fail — and the number of extra rounds is bounded by
+        ``config.observe_retry_max_loops`` (default 1: the two rounds above).
+        Every round re-captures the whole window, screenshot included.
 
         A failed observation retains the most recent valid screenshot this call
         captured as an unverified reference frame (:meth:`last_reference_frame`):
@@ -863,7 +867,16 @@ class PhoneSession:
         last_error: Exception | None = None
         last_valid_shot: "Screenshot | None" = None
         self._last_reference_frame = None
-        for attempt in range(2):
+        # WP2: a transient marks-dump failure waits out the post-navigation busy
+        # window instead of retrying into it. ``retry_max_loops`` extra rounds,
+        # so the default 1 keeps the historical "at most 2 rounds" behaviour.
+        retry_max_loops = max(
+            0, int(getattr(self.config, "observe_retry_max_loops", 1))
+        )
+        retry_backoff_s = max(
+            0.0, float(getattr(self.config, "observe_retry_backoff_s", 2.0))
+        )
+        for attempt in range(1 + retry_max_loops):
             if effective_settle_ms > 0:
                 time.sleep(effective_settle_ms / 1000.0)
             try:
@@ -885,15 +898,18 @@ class PhoneSession:
                 )
                 continue
             # A transient marks-dump failure is observation instability: retry
-            # once (like a foreground change). A stable/empty screen or the
-            # second attempt commits with whatever the dump produced.
+            # (like a foreground change) while configured retries remain. A
+            # stable/empty screen or the final attempt commits with whatever the
+            # dump produced.
             if (
                 sample.failure_code in _UNSTABLE_MARK_CODES
-                and attempt == 0
+                and attempt < retry_max_loops
             ):
                 last_error = ScreenshotError(
                     f"marks dump unstable: {sample.failure_code}"
                 )
+                if retry_backoff_s > 0:
+                    time.sleep(retry_backoff_s)
                 continue
             # The ``after`` sample is closest to the committed frame — use it for
             # the display label so the label matches the bracket that verified

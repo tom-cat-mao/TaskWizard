@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 from phone_agent.v2 import config as config_mod
@@ -61,6 +64,12 @@ PHONE_AGENT_KEYS = [
     "PHONE_AGENT_GROUNDING_PROVIDER",
     "PHONE_AGENT_ACCESSIBILITY_TIMEOUT",
     "PHONE_AGENT_ACCESSIBILITY_MAX_MARKS",
+    "PHONE_AGENT_OBSERVE_SETTLE_MS",
+    "PHONE_AGENT_OBSERVE_RETRY_MAX_LOOPS",
+    "PHONE_AGENT_OBSERVE_RETRY_BACKOFF_S",
+    "PHONE_AGENT_BLACK_SCREEN_DETECT",
+    "PHONE_AGENT_TASKDOC",
+    "PHONE_AGENT_TASKDOC_NUDGE_STEPS",
     "PHONE_AGENT_LOCATEANYTHING_MODEL",
     "PHONE_AGENT_LOCATEANYTHING_MAX_SIZE",
     "PHONE_AGENT_LOCATEANYTHING_CONTEXT_MAX_CHARS",
@@ -385,6 +394,122 @@ def test_env_beats_dotenv(monkeypatch, tmp_path):
 def test_dotenv_missing_is_noop(monkeypatch, tmp_path):
     monkeypatch.setattr(config_mod, "ROOT", tmp_path / "nope")
     load_project_env()  # must not raise
+
+
+# -- .env parsing: inline comments (WP2) ---------------------------------
+
+_EXAMPLE_TEMPLATE = Path(__file__).resolve().parents[2] / ".env.example"
+
+
+def _commented_active_template_lines() -> list[str]:
+    """Active ``PHONE_AGENT_*`` lines of the shipped template that end in a comment."""
+
+    return [
+        line
+        for line in _EXAMPLE_TEMPLATE.read_text(encoding="utf-8").splitlines()
+        if line.startswith("PHONE_AGENT_") and "#" in line
+    ]
+
+
+def _value_as_an_operator_reads_it(line: str) -> str:
+    """The line's literal meaning: the value, then an inline ``#`` comment."""
+
+    return line.split("=", 1)[1].split("#", 1)[0].strip().strip("\"'")
+
+
+def test_dotenv_parses_the_shipped_template_inline_comments(monkeypatch, tmp_path):
+    """Regression (WP2): ``KEY="value"   # note`` used to load the whole tail.
+
+    The cases are not synthetic: they are the commented active lines of the
+    shipped ``.env.example``, the file operators copy into ``.env``.
+    """
+
+    commented = _commented_active_template_lines()
+    assert len(commented) >= 3, (
+        "the template no longer exercises inline comments; "
+        "pick another real case or drop this test"
+    )
+    (tmp_path / ".env").write_text("\n".join(commented) + "\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "ROOT", tmp_path)
+
+    load_project_env()
+
+    for line in commented:
+        key = line.split("=", 1)[0].strip()
+        value = os.environ[key]
+        assert value == _value_as_an_operator_reads_it(line), f"{key}={value!r}"
+        assert "#" not in value, f"{key} kept its inline comment: {value!r}"
+
+
+def test_dotenv_inline_comment_honours_quotes_and_bare_hashes(monkeypatch, tmp_path):
+    """``#`` only starts a comment when it stands alone (shell rule)."""
+
+    (tmp_path / ".env").write_text(
+        "PHONE_AGENT_GROUNDING_PROVIDER='hybrid' # quoted, then comment\n"
+        "PHONE_AGENT_API_KEY=sk-abc#def\n"
+        "PHONE_AGENT_MEMORY_DIR=/tmp/a#b/c\n"
+        "PHONE_AGENT_LANG=#nothing-but-a-comment\n"
+        'PHONE_AGENT_LOCATEANYTHING_MODEL="models/x#y"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_mod, "ROOT", tmp_path)
+
+    load_project_env()
+
+    assert os.environ["PHONE_AGENT_GROUNDING_PROVIDER"] == "hybrid"
+    assert os.environ["PHONE_AGENT_API_KEY"] == "sk-abc#def"
+    assert os.environ["PHONE_AGENT_MEMORY_DIR"] == "/tmp/a#b/c"
+    assert os.environ["PHONE_AGENT_LANG"] == ""
+    assert os.environ["PHONE_AGENT_LOCATEANYTHING_MODEL"] == "models/x#y"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('"hybrid"   # hybrid | accessibility', '"hybrid"   '),
+        ("'config.yml'\t# path", "'config.yml'\t"),
+        ("plain-value", "plain-value"),
+        ("value # comment", "value "),
+        ("value\t# tab-separated", "value\t"),
+        ("sk-abc#def", "sk-abc#def"),
+        ('"models/x#y"', '"models/x#y"'),
+        ('"a\\"#b"', '"a\\"#b"'),
+        ("#whole-value-comment", ""),
+    ],
+)
+def test_strip_inline_comment_follows_the_shell_rule(raw, expected):
+    assert config_mod._strip_inline_comment(raw) == expected
+
+
+# -- WP2: observe retry knobs --------------------------------------------
+
+
+def test_observe_retry_defaults_keep_the_two_round_window():
+    cfg = V2Config.from_env()
+
+    assert cfg.observe_retry_max_loops == 1
+    assert cfg.observe_retry_backoff_s == 2.0
+
+
+def test_observe_retry_keys_read_env_and_lose_to_an_override(monkeypatch):
+    monkeypatch.setenv("PHONE_AGENT_OBSERVE_RETRY_MAX_LOOPS", "3")
+    monkeypatch.setenv("PHONE_AGENT_OBSERVE_RETRY_BACKOFF_S", "0.5")
+
+    cfg = V2Config.from_env({"observe_retry_max_loops": 0})
+
+    assert cfg.observe_retry_max_loops == 0
+    assert cfg.observe_retry_backoff_s == 0.5
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["PHONE_AGENT_OBSERVE_RETRY_MAX_LOOPS", "PHONE_AGENT_OBSERVE_RETRY_BACKOFF_S"],
+)
+def test_negative_observe_retry_values_are_rejected(monkeypatch, key):
+    monkeypatch.setenv(key, "-1")
+
+    with pytest.raises(ValueError, match=key):
+        V2Config.from_env()
 
 
 # -- sampling ------------------------------------------------------------

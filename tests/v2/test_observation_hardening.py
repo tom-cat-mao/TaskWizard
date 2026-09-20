@@ -24,7 +24,12 @@ def _install_screencap(
     output: str = "",
     returncode: int = 0,
 ):
-    """Make get_screenshot exercise its public decode path without ADB."""
+    """Make get_screenshot exercise its public decode path without ADB.
+
+    The fake speaks the legacy channel (``shell screencap`` + ``pull``), so these
+    tests pin ``use_exec_out=False``; the exec-out channel has its own suite in
+    ``tests/v2/test_screenshot_exec_out.py``.
+    """
 
     def fake_run(args, **_kwargs):
         if "screencap" in args:
@@ -41,7 +46,7 @@ def _install_screencap(
 def test_uniform_black_png_uses_existing_secure_blocked_channel(monkeypatch):
     _install_screencap(monkeypatch, Image.new("RGB", (12, 20), (4, 4, 4)))
 
-    shot = screenshot_mod.get_screenshot(black_screen_detect=True)
+    shot = screenshot_mod.get_screenshot(black_screen_detect=True, use_exec_out=False)
 
     assert shot.is_valid is False
     assert shot.is_placeholder is True
@@ -55,7 +60,7 @@ def test_dark_ui_with_one_bright_pixel_remains_valid(monkeypatch):
     image.putpixel((6, 10), (220, 220, 220))
     _install_screencap(monkeypatch, image)
 
-    shot = screenshot_mod.get_screenshot(black_screen_detect=True)
+    shot = screenshot_mod.get_screenshot(black_screen_detect=True, use_exec_out=False)
 
     assert shot.is_valid is True
     assert shot.is_sensitive is False
@@ -66,7 +71,7 @@ def test_dark_ui_with_one_bright_pixel_remains_valid(monkeypatch):
 def test_screencap_secure_error_keeps_existing_failure_channel(monkeypatch):
     _install_screencap(monkeypatch, None, output="Status: -1")
 
-    shot = screenshot_mod.get_screenshot(black_screen_detect=False)
+    shot = screenshot_mod.get_screenshot(black_screen_detect=False, use_exec_out=False)
 
     assert shot.is_valid is False
     assert shot.is_sensitive is True
@@ -76,7 +81,7 @@ def test_screencap_secure_error_keeps_existing_failure_channel(monkeypatch):
 def test_screencap_nonzero_keeps_existing_failure_channel(monkeypatch):
     _install_screencap(monkeypatch, None, returncode=1)
 
-    shot = screenshot_mod.get_screenshot(black_screen_detect=True)
+    shot = screenshot_mod.get_screenshot(black_screen_detect=True, use_exec_out=False)
 
     assert shot.is_valid is False
     assert shot.is_sensitive is False
@@ -86,7 +91,7 @@ def test_screencap_nonzero_keeps_existing_failure_channel(monkeypatch):
 def test_black_screen_detection_can_be_disabled(monkeypatch):
     _install_screencap(monkeypatch, Image.new("RGB", (12, 20), "black"))
 
-    shot = screenshot_mod.get_screenshot(black_screen_detect=False)
+    shot = screenshot_mod.get_screenshot(black_screen_detect=False, use_exec_out=False)
 
     assert shot.is_valid is True
 

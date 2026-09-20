@@ -31,6 +31,7 @@ def get_screenshot(
     timeout: int = 10,
     *,
     black_screen_detect: bool | None = None,
+    use_exec_out: bool | None = None,
 ) -> Screenshot:
     """
     Capture a screenshot from the connected Android device.
@@ -41,6 +42,11 @@ def get_screenshot(
         black_screen_detect: Whether a decoded uniformly black image should be
             treated as a system-protected screen. ``None`` reads
             ``PHONE_AGENT_BLACK_SCREEN_DETECT`` (default on).
+        use_exec_out: Whether to capture through ``adb exec-out screencap -p``
+            (one ADB roundtrip, PNG read from stdout) instead of the legacy
+            write-on-device + pull + rm path (three roundtrips). ``None`` reads
+            ``PHONE_AGENT_SCREENSHOT_USE_EXEC_OUT`` (default on; only
+            ``1``/``true``/``yes``/``on`` enable it).
 
     Returns:
         Screenshot object containing base64 data and dimensions.
@@ -50,9 +56,113 @@ def get_screenshot(
         is_valid=False, is_placeholder=True, and a stable failure_code. Graph
         nodes must treat it as unavailable and fail closed before model calls.
     """
-    temp_path = os.path.join(tempfile.gettempdir(), f"screenshot_{uuid.uuid4()}.png")
-    device_temp_path = f"/sdcard/tmp_{uuid.uuid4().hex}.png"
+
+    if use_exec_out is None:
+        use_exec_out = _env_bool("PHONE_AGENT_SCREENSHOT_USE_EXEC_OUT", True)
+
     adb_prefix = _get_adb_prefix(device_id)
+
+    try:
+        if use_exec_out:
+            return _exec_out_screencap(adb_prefix, timeout, black_screen_detect)
+        # Legacy path: screencap to a device file + pull + cleanup.
+        return _legacy_screencap(
+            adb_prefix,
+            timeout,
+            f"/sdcard/tmp_{uuid.uuid4().hex}.png",
+            black_screen_detect,
+        )
+
+    except Exception as e:
+        print(f"Screenshot error: {e}")
+        return _create_fallback_screenshot(
+            is_sensitive=False,
+            failure_code="screenshot_unavailable",
+            failure_message=type(e).__name__,
+        )
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    """Read an on/off env switch; only ``1``/``true``/``yes``/``on`` count as on."""
+
+    raw = os.getenv(key)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _exec_out_screencap(
+    adb_prefix: list[str], timeout: int, black_screen_detect: bool | None
+) -> Screenshot:
+    """Read one PNG from ``exec-out screencap -p`` stdout (single ADB roundtrip)."""
+
+    try:
+        result = subprocess.run(
+            adb_prefix + ["exec-out", "screencap", "-p"],
+            capture_output=True,
+            timeout=timeout,
+        )
+
+        if result.returncode != 0:
+            return _create_fallback_screenshot(
+                is_sensitive=False,
+                failure_code="adb_screencap_failed",
+                failure_message=f"screencap exited with status {result.returncode}",
+            )
+
+        png_data = result.stdout
+        if not png_data:
+            return _create_fallback_screenshot(
+                is_sensitive=False,
+                failure_code="empty_screenshot",
+                failure_message="No PNG data received",
+            )
+
+        img = Image.open(BytesIO(png_data))
+        width, height = img.size
+
+        if _black_screen_detect_enabled(black_screen_detect) and _is_uniform_black(img):
+            return _create_fallback_screenshot(
+                is_sensitive=True,
+                failure_code="secure_screenshot_blocked",
+                failure_message="系统级保护页（登录/支付等），截图不可用",
+            )
+
+        buffered = BytesIO()
+        mime_type = _save_model_image(img, buffered)
+        base64_data = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+        return Screenshot(
+            base64_data=base64_data,
+            width=width,
+            height=height,
+            mime_type=mime_type,
+            is_sensitive=False,
+        )
+
+    except subprocess.TimeoutExpired:
+        return _create_fallback_screenshot(
+            is_sensitive=False,
+            failure_code="screenshot_timeout",
+            failure_message="ADB screenshot timed out",
+        )
+    except Exception as exc:
+        return _create_fallback_screenshot(
+            is_sensitive=False,
+            failure_code="screenshot_exec_out_failed",
+            failure_message=str(exc),
+        )
+
+
+def _legacy_screencap(
+    adb_prefix: list[str],
+    timeout: int,
+    device_temp_path: str,
+    black_screen_detect: bool | None,
+) -> Screenshot:
+    """Legacy path: screencap to a device file + pull + rm (3 ADB roundtrips)."""
+
+    temp_path = os.path.join(tempfile.gettempdir(), f"screenshot_{uuid.uuid4()}.png")
 
     try:
         # Execute screenshot command
@@ -116,13 +226,6 @@ def get_screenshot(
             is_sensitive=False,
         )
 
-    except Exception as e:
-        print(f"Screenshot error: {e}")
-        return _create_fallback_screenshot(
-            is_sensitive=False,
-            failure_code="screenshot_unavailable",
-            failure_message=type(e).__name__,
-        )
     finally:
         try:
             if os.path.exists(temp_path):
