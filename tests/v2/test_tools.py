@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from phone_agent.v2.resolver import LocateAmbiguousError
 from phone_agent.v2.tools import build_tools
+from phone_agent.v2.tools.actuation import TEXT_MISS_HINT
 
 from tests.v2._doubles import FakeConfig, FakePhoneSession, make_mark
 
@@ -126,6 +127,52 @@ def test_tap_description_resolves_and_taps():
     out = tools["tap"].invoke({"target_description": "确认付款"})
     assert _text(out).startswith("OK.")
     assert any(c[0] == "tap" for c in session.device_factory.calls)
+
+
+def test_tap_without_text_hit_reports_the_address_format_correction():
+    """A description that matched no mark text still acts — and says why it fell back."""
+
+    located = make_mark("loc_9", text="沈阳市", role="TextView")
+    session = FakePhoneSession({}, locate_result=located)
+    tools = _tool_map(session)
+    out = tools["tap"].invoke(
+        {"target_description": "搜索结果第一行「沈阳市」（带蓝色「城市」标签）"}
+    )
+
+    text = _text(out)
+    assert text.startswith("OK.")  # the tap did happen; nothing is faked
+    assert TEXT_MISS_HINT in text
+    assert any(c[0] == "tap" for c in session.device_factory.calls)
+    assert session.marks  # the visual fallback registered its hit
+
+
+def test_tap_text_hit_carries_no_correction():
+    marks = {"ax_1": make_mark("ax_1", text="沈阳市", center=(200, 400))}
+    session = FakePhoneSession(marks)
+    tools = _tool_map(session)
+    out = tools["tap"].invoke({"target_description": "沈阳市"})
+    assert TEXT_MISS_HINT not in _text(out)
+
+
+def test_type_text_without_text_hit_reports_the_same_correction():
+    located = make_mark("loc_9", text="搜索框", role="EditText")
+    session = FakePhoneSession({}, locate_result=located)
+    tools = _tool_map(session)
+    out = tools["type_text"].invoke(
+        {"text": "上海", "target_description": "顶部那个灰色圆角搜索框"}
+    )
+    assert TEXT_MISS_HINT in _text(out)
+
+
+def test_tap_description_miss_includes_the_correction_in_the_error():
+    """A visual fallback that finds nothing is a description problem, not a fault."""
+
+    session = FakePhoneSession({}, locate_error=LocateAmbiguousError("no candidate"))
+    tools = _tool_map(session)
+    out = tools["tap"].invoke({"target_description": "第一行的蓝色标签"})
+    assert isinstance(out, str)
+    assert TEXT_MISS_HINT in out
+    assert session.device_factory.calls == []
 
 
 def test_tap_both_addresses_rejected():

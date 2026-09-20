@@ -8,6 +8,9 @@ fail-closed:
   black-image path exists.
 - Resolver ambiguity / stale marks / unknown apps return an error string and
   DO NOT execute (the error stays in the transcript for the model to read).
+- A description that matched no mark text still resolves through the resolver's
+  visual fallback, but the receipt then carries ``TEXT_MISS_HINT`` so the model
+  learns the address format instead of seeing an unexplained success.
 - On success the tool returns a multimodal content ``list`` — an ``"OK. <result>"``
   text block followed by the §7.4 auto observation blocks (text + a fresh
   screenshot image when the screen changed). Error/ambiguity branches stay a
@@ -49,6 +52,16 @@ from phone_agent.v2.tools._obs import auto_observation, mark_tool_fail, mark_too
 
 
 _PACKAGE_NAME_RE = re.compile(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+")
+
+# Correction hint appended to a receipt when the description path matched no
+# mark text and the resolver had to drop to deep visual locate (WP3). The
+# resolver's text tiers only do exact / substring / normalized matching, so a
+# positional or appearance sentence structurally cannot hit; without this line
+# the model sees a plain success and never learns its addressing was wrong.
+TEXT_MISS_HINT = (
+    "文本未匹配：target_description 只写控件上的短原文（如「沈阳市」）；"
+    "位置/外观描述改用 locate，可用 scope 圈定区域后再操作。"
+)
 
 
 def _available_app_names(session, *, max_n: int) -> str:
@@ -324,33 +337,47 @@ def _resolve_target(
     session,
     target_mark_id: str | None,
     target_description: str | None,
-) -> tuple[MarkCandidate | None, str | None]:
-    """Return ``(mark, error_text)``; exactly one is non-None.
+) -> tuple[MarkCandidate | None, str | None, str]:
+    """Return ``(mark, error_text, text_miss_hint)``.
 
     ``mark_id`` path -> ``session.resolve_mark`` (stale -> hint string).
     ``description`` path -> resolver (ambiguity/locate-failure -> candidate text).
+
+    ``text_miss_hint`` is the correction text for a *successful* description
+    resolution that had to drop to the visual fallback; it is ``""`` on every
+    other path (including the failures, which carry their own guidance).
     """
 
     if target_mark_id and target_description:
-        return None, (
-            "error: pass only one of target_mark_id or target_description, not both"
+        return (
+            None,
+            "error: pass only one of target_mark_id or target_description, not both",
+            "",
         )
     if target_mark_id:
         try:
-            return session.resolve_mark(target_mark_id), None
+            return session.resolve_mark(target_mark_id), None, ""
         except StaleMarkError:
-            return None, (
+            stale = (
                 f"stale mark: {target_mark_id!r} is no longer on the current "
                 "screen. Call read_screen() to refresh marks, then retry."
             )
+            return None, stale, ""
     if target_description:
+        # The resolver's text tiers can only return a mark that already exists
+        # on screen; zero hits delegate to ``session.locate``, which mints its
+        # hit into a fresh batch under a new id. A resolved id outside the
+        # pre-call mark set is therefore exactly "the description matched no
+        # visible text" — the format error this receipt has to surface.
+        on_screen = set(getattr(session, "marks", None) or {})
         try:
-            return resolve_description(session, target_description), None
+            mark = resolve_description(session, target_description)
         except ResolveAmbiguousError as exc:
-            return None, (
+            ambiguous = (
                 "ambiguous: " + "; ".join(exc.candidates)
                 + " — refine the description or use target_mark_id"
             )
+            return None, ambiguous, ""
         except LocateAmbiguousError as exc:
             failure_code = normalize_locate_failure_code(
                 getattr(exc, "failure_code", None)
@@ -365,15 +392,23 @@ def _resolve_target(
                     message += (
                         "本轮定位服务持续故障：请停止使用 locate 与描述式 tap，改用 marks"
                     )
-                return None, message
+                return None, message, ""
             if failure_class == "transient":
-                return None, (
-                    f"定位暂时失败（{failure_code}）：可原样重试，勿修改目标描述"
+                return (
+                    None,
+                    f"定位暂时失败（{failure_code}）：可原样重试，勿修改目标描述",
+                    "",
                 )
-            return None, (
-                f"ambiguous: {exc} — refine the description or use target_mark_id"
+            # Zero / multiple visual candidates: the description itself is the
+            # problem, so the miss hint rides along with the ambiguity text.
+            missed = (
+                f"ambiguous: {exc} — refine the description or use target_mark_id；"
+                f"{TEXT_MISS_HINT}"
             )
-    return None, "error: one of target_mark_id or target_description is required"
+            return None, missed, ""
+        hint = "" if str(getattr(mark, "mark_id", "")) in on_screen else TEXT_MISS_HINT
+        return mark, None, hint
+    return None, "error: one of target_mark_id or target_description is required", ""
 
 
 def _mark_label(mark) -> str:
@@ -405,7 +440,9 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
         target_description: str | None,
         settle_ms: int | None,
     ) -> str | list[dict]:
-        mark, err = _resolve_target(session, target_mark_id, target_description)
+        mark, err, text_miss = _resolve_target(
+            session, target_mark_id, target_description
+        )
         if err is not None:
             return _fail(session, err)
         x, y = session.mark_center_abs(mark)
@@ -418,9 +455,10 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
                 verb = "已点击"
         except Exception:  # noqa: BLE001
             return _device_failure(session, "点击" if action == "tap" else "长按")
-        return _ok_with_obs(
-            f"{verb}{_mark_label(mark)}", session, settle_ms=settle_ms
-        )
+        head = f"{verb}{_mark_label(mark)}"
+        if text_miss:
+            head = f"{head}\n{TEXT_MISS_HINT}"
+        return _ok_with_obs(head, session, settle_ms=settle_ms)
 
     def tap(
         target_mark_id: str | None = None,
@@ -434,8 +472,11 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
         """Tap one on-screen element.
 
         Provide exactly one of ``target_mark_id`` (a mark from the latest
-        observation) or ``target_description`` (natural language, resolved to a
-        unique mark; ambiguity returns candidates and does not tap).
+        observation) or ``target_description``: only the short text visible on
+        the control (e.g. 「沈阳市」). Matching is substring-based, so a
+        positional / appearance sentence matches nothing and the call drops to
+        slow visual locate instead; ambiguity returns candidates and does not
+        tap.
 
         Always pass ``intent`` (this step's goal, e.g. 把出发地改成上海).
         ``note`` optionally records what you discovered this step.
@@ -484,9 +525,10 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
     ) -> str | list[dict]:
         """Type ``text`` into a field.
 
-        If a target is given, the field is tapped to focus first. Text is
-        entered through the ADB keyboard (switched in and restored when the
-        device layer supports it).
+        If a target is given, the field is tapped to focus first; the field's
+        ``target_description`` follows the same short-visible-text rule as
+        ``tap``. Text is entered through the ADB keyboard (switched in and
+        restored when the device layer supports it).
 
         Always pass ``intent`` (this step's goal). ``note`` optionally records
         what you discovered this step. Resend with ``confirm_irreversible=true``
@@ -496,7 +538,9 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
         """
 
         if target_mark_id or target_description:
-            mark, err = _resolve_target(session, target_mark_id, target_description)
+            mark, err, text_miss = _resolve_target(
+                session, target_mark_id, target_description
+            )
             if err is not None:
                 return _fail(session, err)
             fx, fy = session.mark_center_abs(mark)
@@ -504,6 +548,8 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
                 device.tap(fx, fy, device_id=device_id)
             except Exception:  # noqa: BLE001
                 return _device_failure(session, "输入框聚焦点击")
+        else:
+            text_miss = False
 
         ime = None
         detect = getattr(device, "detect_and_set_adb_keyboard", None)
@@ -555,9 +601,10 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
 
         preview = text if len(text) <= 32 else text[:31] + "…"
         cleanup = "；输入已发送；键盘恢复失败" if restore_error else ""
-        return _ok_with_obs(
-            f"已输入 {preview!r}{cleanup}", session, settle_ms=settle_ms
-        )
+        head = f"已输入 {preview!r}{cleanup}"
+        if text_miss:
+            head = f"{head}\n{TEXT_MISS_HINT}"
+        return _ok_with_obs(head, session, settle_ms=settle_ms)
 
     def scroll(
         direction: Literal["up", "down", "left", "right"],

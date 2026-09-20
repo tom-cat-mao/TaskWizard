@@ -11,11 +11,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from langchain_core.messages import AIMessage
+
 import phone_agent.v2.verify as verify_mod
 from phone_agent.v2.taskdoc import TaskDoc, TaskItem
 from phone_agent.v2.tools.control import build_control_tools
+from phone_agent.v2.usage import UsageLedger
 from phone_agent.v2.verify import (
     DISPUTE_TAKEOVER_REASON,
+    VERDICT_REASON_LIMIT,
     Verdict,
     should_verify_finish,
     verify_finish,
@@ -47,10 +51,12 @@ class _Sess:
     finish_dispute_count: int = 0
     finish_hard_doubts: list = field(default_factory=list)
     finish_verifier: str = "skipped"
+    finish_verifier_verdict: Any = None
     takeover_reason: Any = None
     nudged: bool = False
     seen_states: set = field(default_factory=set)
     marks: dict = field(default_factory=dict)
+    usage_ledger: UsageLedger | None = None
     _observe_fail: bool = False
 
     def observe(self) -> _Obs:
@@ -95,6 +101,24 @@ class _FakeModel:
 class _BoomModel:
     def invoke(self, messages):
         raise RuntimeError("verifier net down")
+
+
+class _MeteredModel:
+    """Stub verifier model that reports provider usage like a real call."""
+
+    def __init__(self, text: str, tokens: int = 30) -> None:
+        self.text = text
+        self.tokens = tokens
+
+    def invoke(self, messages):
+        return AIMessage(
+            content=self.text,
+            usage_metadata={
+                "input_tokens": self.tokens - 5,
+                "output_tokens": 5,
+                "total_tokens": self.tokens,
+            },
+        )
 
 
 # --------------------------------------------------------------------------
@@ -221,6 +245,47 @@ def test_verify_observe_failure_yields_route_only():
 
 
 # --------------------------------------------------------------------------
+# verdict audit fields: latency, usage, reason policy
+# --------------------------------------------------------------------------
+def test_verdict_carries_latency_and_the_tokens_the_call_was_booked_for():
+    ledger = UsageLedger()
+    s = _Sess(task_doc=TaskDoc(goal_base="在支付宝完成支付"), usage_ledger=ledger)
+    v = verify_finish(s, _Cfg(), model=_MeteredModel("APPROVE 支付成功页可见"))
+
+    assert v.approve is True and v.status == "pass"
+    assert isinstance(v.latency_ms, int) and v.latency_ms >= 0
+    assert v.usage == {"role": "verifier", "tokens": 30}
+    assert ledger.by_role() == {"verifier": 30}
+
+
+def test_fail_open_verdict_measures_latency_and_reports_usage_unknown():
+    s = _Sess(task_doc=TaskDoc(goal_base="在支付宝完成支付"))
+    v = verify_finish(s, _Cfg(), model=_BoomModel())
+
+    assert v.status == "skipped"
+    assert isinstance(v.latency_ms, int) and v.latency_ms >= 0
+    # No call happened -> no token count. Unknown, never a manufactured zero.
+    assert v.usage is None
+
+
+def test_verdict_reason_stays_one_bounded_line():
+    s = _Sess(task_doc=TaskDoc(goal_base="在支付宝完成支付"))
+    v = verify_finish(s, _Cfg(), model=_FakeModel("REJECT " + "缺少屏幕证据" * 60))
+
+    assert v.approve is False
+    assert len(v.reason) <= VERDICT_REASON_LIMIT
+    assert "\n" not in v.reason
+
+
+def test_verdict_reason_is_redacted_before_any_sink():
+    s = _Sess(task_doc=TaskDoc(goal_base="在支付宝完成支付"))
+    v = verify_finish(s, _Cfg(), model=_FakeModel("REJECT 未见订单成功 order:99887766"))
+
+    assert "<redacted>" in v.reason
+    assert "99887766" not in v.reason
+
+
+# --------------------------------------------------------------------------
 # finish control-tool integration
 # --------------------------------------------------------------------------
 def _finish_tool(session, config):
@@ -271,6 +336,53 @@ def test_finish_high_risk_approve_lands(monkeypatch):
     assert s.finished is True
 
 
+def test_finish_confirm_persists_the_whole_verdict(monkeypatch):
+    """The reason/latency/usage must survive the process, not only the status."""
+
+    _patch_verify(
+        monkeypatch,
+        Verdict(
+            True,
+            "支付成功页可见",
+            status="pass",
+            latency_ms=1234,
+            usage={"role": "verifier", "tokens": 30},
+        ),
+    )
+    s = _Sess(task_doc=TaskDoc(goal_base="在支付宝完成支付"))
+    finish = _finish_tool(s, _Cfg())
+    finish.invoke({"summary": "done", "evidence": ["pay ok"]})
+    finish.invoke({"summary": "done", "evidence": ["pay ok"], "confirm": True})
+
+    assert s.finish_verifier == "pass"
+    assert s.finish_verifier_verdict == {
+        "approve": True,
+        "status": "pass",
+        "reason": "支付成功页可见",
+        "latency_ms": 1234,
+        "usage": {"role": "verifier", "tokens": 30},
+    }
+
+
+def test_rejected_verdict_is_persisted_before_the_dispute_escalates(monkeypatch):
+    _patch_verify(
+        monkeypatch, Verdict(False, "未见支付成功", status="fail", latency_ms=88)
+    )
+    s = _Sess(task_doc=TaskDoc(goal_base="在支付宝完成支付"))
+    finish = _finish_tool(s, _Cfg())
+    finish.invoke({"summary": "done", "evidence": ["pay ok"]})
+    out = finish.invoke({"summary": "done", "evidence": ["pay ok"], "confirm": True})
+
+    assert "验收未通过" in out
+    assert s.finished is False
+    assert s.finish_verifier == "fail"
+    assert s.finish_verifier_verdict["approve"] is False
+    assert s.finish_verifier_verdict["status"] == "fail"
+    assert s.finish_verifier_verdict["reason"] == "未见支付成功"
+    assert s.finish_verifier_verdict["latency_ms"] == 88
+    assert s.finish_verifier_verdict["usage"] is None
+
+
 def test_finish_ordinary_goal_skips_verifier(monkeypatch):
     spy: dict = {}
     _patch_verify(monkeypatch, Verdict(True, "x"), spy=spy)
@@ -281,6 +393,9 @@ def test_finish_ordinary_goal_skips_verifier(monkeypatch):
     assert out == "已确认完成"
     assert s.finished is True
     assert spy.get("n", 0) == 0  # verifier never called for an ordinary goal
+    # No verdict was produced, so nothing is recorded: "not triggered" stays a
+    # different claim from a fail-open skip that the harness actually observed.
+    assert s.finish_verifier_verdict is None
 
 
 def test_finish_off_mode_skips_verifier(monkeypatch):
@@ -309,11 +424,13 @@ def test_finish_verifier_import_or_error_is_fail_open(monkeypatch):
     assert out == "已确认完成"
     assert s.finished is True
     assert s.finish_verifier == "skipped"
+    assert s.finish_verifier_verdict["status"] == "skipped"
+    assert "fail-open" in s.finish_verifier_verdict["reason"]
 
 
 def test_finish_verifier_model_outage_lands_but_records_skipped(monkeypatch):
     monkeypatch.setattr(verify_mod, "_build_verifier_model", lambda _cfg: _BoomModel())
-    s = _Sess(task_doc=TaskDoc(goal_base="在支付宝完成支付"))
+    s = _Sess(task_doc=TaskDoc(goal_base="在支付宝完成支付"), usage_ledger=UsageLedger())
     finish = _finish_tool(s, _Cfg())
 
     finish.invoke({"summary": "done", "evidence": ["pay ok"]})
@@ -324,3 +441,8 @@ def test_finish_verifier_model_outage_lands_but_records_skipped(monkeypatch):
     assert out == "已确认完成"
     assert s.finished is True
     assert s.finish_verifier == "skipped"
+    audit = s.finish_verifier_verdict
+    assert audit["status"] == "skipped"
+    assert "fail-open" in audit["reason"]
+    assert isinstance(audit["latency_ms"], int)
+    assert audit["usage"] is None  # the call never happened

@@ -119,6 +119,10 @@ class FakePhoneSession:
         self.takeover_reason: str | None = None
         self.launched_apps: list[str] = []
         self.finish_verifier: str = "skipped"
+        # WP3: the finish verifier's audit record (approve/status/reason/
+        # latency/usage), written by tools/control.py and persisted into
+        # run.json by the runner. Stays None until a verdict exists.
+        self.finish_verifier_verdict: dict | None = None
         # finish two-step review state (S2 §1.2): mirrors PhoneSession so the
         # control-tool tests exercise the real review/confirm seq guard.
         self.last_tool_ok: bool | None = None

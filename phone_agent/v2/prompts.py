@@ -28,7 +28,8 @@ SYSTEM_PROMPT_ZH = """你是一个安卓手机操作智能体。你通过工具�
 定位与执行（marks 优先）：
 - 执行类动作（点击/长按/输入等）必须绑定一个目标，二选一：
   - target_mark_id：直接使用当前屏幕上的某个 mark_id（最可靠）。
-  - target_description：用自然语言描述目标；系统会解析为唯一 mark 才执行。
+  - target_description：只写控件上可见的短原文（如「沈阳市」「搜索」）；系统按文本包含匹配，长句必然落空。
+- 位置、外观、颜色这类长描述（如「第一行的蓝色标签」）只用于 locate，不要写进 target_description：描述未命中 mark 文本时系统会退回视觉定位（慢且可能失败），回执里会提示改写。
 - 若描述有歧义或无匹配，工具会返回候选列表且不执行。此时请细化描述，或改用 target_mark_id。
 - 不要臆造 mark_id；只使用最近一次观测里真实出现的 mark_id。
 
@@ -65,7 +66,8 @@ Output contract (every call needs intent):
 Grounding and acting (marks-first):
 - Every action (tap/long_press/type, etc.) must bind a target, one of:
   - target_mark_id: use a mark_id from the current screen directly (most reliable).
-  - target_description: natural-language target; the system resolves it to a unique mark before acting.
+  - target_description: only the short text visible on the control (e.g. "Shenyang", "Search"); the system matches it as a substring, so a longer sentence finds nothing.
+- Keep position/appearance/colour phrases (e.g. "the blue tag on the first row") for locate, never for target_description: when a description matches no mark text the call drops to deep visual locate (slower, may fail) and the receipt tells you to rewrite it.
 - If the description is ambiguous or unmatched, the tool returns candidates and does NOT act. Refine the description, or switch to target_mark_id.
 - Never invent a mark_id; only use mark_ids that actually appeared in the latest observation.
 

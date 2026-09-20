@@ -22,12 +22,16 @@ On a fresh confirm, an independent-context **verifier** (S2 §4, ``verify.py``) 
 run — for a high-risk goal, a hard-contradiction confirm, or ``FINISH_VERIFY=always``.
 A verifier REJECT is returned in-band (``finished`` stays False); the 2nd rejection
 escalates to human takeover. The verifier is **fail-open**: any setup/call failure
-lands the finish anyway (the L1 two-step already gated it).
+lands the finish anyway (the L1 two-step already gated it). Every verdict it does
+produce is mirrored onto the session as ``finish_verifier`` (status) plus
+``finish_verifier_verdict`` (approve/status/reason/latency/usage) so the runner can
+persist the decision itself, not only its status.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from langchain_core.tools import StructuredTool
 
@@ -37,6 +41,32 @@ class _SkippedVerifier:
     approve: bool = True
     reason: str = "验收器不可用，已放行（fail-open）"
     status: str = "skipped"
+    latency_ms: int | None = None
+    usage: dict[str, Any] | None = None
+
+
+def _verifier_audit(verdict) -> dict[str, Any]:
+    """Mirror one verifier verdict onto the run-level audit record (WP3).
+
+    The status string alone (``session.finish_verifier``) says the verifier
+    gated or skipped; this dict is the *decision* behind it — approve, status,
+    the redacted one-line reason, the measured latency and the tokens booked —
+    so a finished run can be audited afterwards (``runner.py`` writes it into
+    ``run.json``) instead of leaving the reason only in process memory.
+    """
+
+    approve = bool(getattr(verdict, "approve", True))
+    usage = getattr(verdict, "usage", None)
+    latency = getattr(verdict, "latency_ms", None)
+    return {
+        "approve": approve,
+        "status": str(
+            getattr(verdict, "status", None) or ("pass" if approve else "fail")
+        ),
+        "reason": str(getattr(verdict, "reason", "") or ""),
+        "latency_ms": int(latency) if latency is not None else None,
+        "usage": dict(usage) if isinstance(usage, dict) else None,
+    }
 
 
 def _maybe_verify_finish(session, config):
@@ -176,6 +206,10 @@ def build_control_tools(session, config) -> list[StructuredTool]:
                     session.finish_verifier = getattr(verdict, "status", None) or (
                         "pass" if verdict.approve else "fail"
                     )
+                    # The reason only lived in this process before (WP3): keep
+                    # the whole verdict on the session so the run artifact can
+                    # carry the authoritative decision, not just its status.
+                    session.finish_verifier_verdict = _verifier_audit(verdict)
                 except Exception:  # noqa: BLE001 - outcome mirror cannot affect finish
                     pass
             if verdict is not None and not verdict.approve:

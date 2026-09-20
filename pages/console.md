@@ -27,6 +27,7 @@
 | 参考帧 | 帧按事件自带的 `reference` / `screen_ref` 标记判定为参考帧并标注「参考帧未验证」，不靠帧序缺失推断；各帧保留独立身份，不互相覆盖、不冒充新观测 |
 | 配置抽屉 | 设备 serial 留空或纯空白 = 显式自动（解析为 `None` 后进入序列化与指纹）；省略该 override 才继承环境变量 |
 | 终局合成 | runner 启动失败 / runner 死亡 / 重连到无终局的死 run：Web 进程合成终局 `run_end`（`error: runner_start_failed` / `error: runner_died`）并同步写 `run.json` |
+| 裁决字段 | `run.json` 的 `finish_verifier`（`pass` / `fail` / `skipped`）与 `finish_verifier_verdict`（`approve` / `status` / `reason` / `latency_ms` / `usage`，未产出裁决时为 `null`）由 runner 在终局写入：验收器已把 reason 脱敏并截断，控制台只从 `run.json` 读 usage，不渲染裁决，也不替它解读 |
 | App-KB generation | run spec 的可选 generation 以显式 `generation` / `version` 标识，否则取内容摘要；run 启动时发现漂移只写一条 `memory_generation_drift` 审计事件（captured / actual），绝不阻止启动 |
 
 ## 布局 {#layout}
