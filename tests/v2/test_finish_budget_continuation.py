@@ -674,7 +674,7 @@ def _uncertain_back_session():
     """Real session/back tool with a fake command that changes world then fails."""
 
     from phone_agent.v2.tools.actuation import build_actuation_tools
-    from tests.v2.test_observation_lifecycle import _session
+    from tests.v2.observation.test_observation_lifecycle import _session
 
     session = _session()
     session.config.observe_settle_ms = 0

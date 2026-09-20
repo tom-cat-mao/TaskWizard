@@ -46,13 +46,9 @@ from phone_agent.v2.middleware.images import ContextPrunerService
 from phone_agent.v2.run_events import WebEventMiddleware
 from phone_agent.v2.session import PhoneSession, ScreenshotError, StaleMarkError
 from phone_agent.v2.tools._obs import auto_observation
-
-_SETTINGS_XML = (
-    "<hierarchy>"
-    '<node text="WLAN" class="android.widget.TextView" clickable="true" '
-    'enabled="true" bounds="[0,100][1080,300]" />'
-    "</hierarchy>"
-)
+from tests.v2.doubles.config import FakeConfig
+from tests.v2.doubles.device import FakeDeviceFactory
+from tests.v2.doubles.marks import SETTINGS_XML_SINGLE, FakeShot
 
 
 def _png_b64(color: tuple[int, int, int] = (20, 40, 60)) -> str:
@@ -62,118 +58,32 @@ def _png_b64(color: tuple[int, int, int] = (20, 40, 60)) -> str:
     return base64.b64encode(output.getvalue()).decode("ascii")
 
 
-class _ShotSpec:
-    """Synthetic screenshot response: payload + real mime, or an invalid code."""
+def good(payload: str, mime: str = "image/png") -> FakeShot:
+    """A valid synthetic screenshot carrying a real mime type."""
 
-    def __init__(
-        self,
-        payload: str = "shot",
-        *,
-        mime: str = "image/png",
-        failure_code: str | None = None,
-    ) -> None:
-        self.payload = payload
-        self.mime = mime
-        self.failure_code = failure_code
-        self.valid = failure_code is None
+    return FakeShot(payload, mime_type=mime)
 
 
-def good(payload: str, mime: str = "image/png") -> _ShotSpec:
-    return _ShotSpec(payload, mime=mime)
+def bad(failure_code: str = "adb_screencap_failed") -> FakeShot:
+    """An invalid synthetic screenshot carrying the device's failure code."""
 
-
-def bad(failure_code: str = "adb_screencap_failed") -> _ShotSpec:
-    return _ShotSpec("", failure_code=failure_code)
-
-
-class FakeShot:
-    def __init__(self, spec: _ShotSpec) -> None:
-        self.base64_data = spec.payload
-        self.width = 1080
-        self.height = 2400
-        self.mime_type = spec.mime
-        self.is_valid = spec.valid
-        self.failure_code = spec.failure_code
-        self.failure_message = None
-
-
-class FakeForeground:
-    def __init__(self, component: str = "com.example.app/.Main") -> None:
-        self.component_name = component
-        self.package_name = component.split("/", 1)[0]
-        self.display_name = self.package_name
-
-
-class FakeConfig:
-    device_id = None
-    accessibility_max_marks = 80
-    accessibility_timeout = 3.0
-    grounding_provider = "accessibility"
-    locateanything_max_size = 960
-    locateanything_context_max_chars = 200
-    locate_max_size = 0
-    scope_padding_ratio = 0.05
-    locateanything_model = None
-    observe_settle_ms = 0
-    # Failure/retry paths run here for real; the 2s production backoff would be
-    # pure wall-clock cost.  Its value is asserted in test_observe_retry_backoff.py.
-    observe_retry_backoff_s = 0.0
-    marks_windowed = "auto"
-
-
-class ScriptedDevice:
-    """Per-call screenshot/dump/foreground script; the last entry repeats.
-
-    Shot entries are :class:`_ShotSpec` values. Dump entries are XML strings,
-    ``""`` (an empty dump is ``accessibility_dump_empty``), or ``"timeout"``
-    (raises ``TimeoutError``). ``foreground`` is a component string or a list
-    consumed one call at a time.
-    """
-
-    def __init__(self, shots, dumps, foreground="com.example.app/.Main") -> None:
-        self._shots = [_ShotSpec(entry) if isinstance(entry, str) else entry for entry in shots]
-        self._dumps = list(dumps)
-        self._foreground = foreground
-        self._shot_i = 0
-        self._dump_i = 0
-        self._fg_i = 0
-        self.screenshot_calls = 0
-        self.dump_calls = 0
-        self.taps: list[tuple[int, int]] = []
-
-    def get_screenshot(self, device_id=None, timeout=10, **kwargs):
-        spec = self._shots[min(self._shot_i, len(self._shots) - 1)]
-        self._shot_i += 1
-        self.screenshot_calls += 1
-        return FakeShot(spec)
-
-    def dump_uiautomator_xml(self, device_id=None, timeout=None, windowed=None):
-        action = self._dumps[min(self._dump_i, len(self._dumps) - 1)]
-        self._dump_i += 1
-        self.dump_calls += 1
-        if action == "timeout":
-            raise TimeoutError("dump timed out")
-        return action
-
-    def get_foreground_app(self, device_id=None):
-        value = self._foreground
-        if isinstance(value, list):
-            component = value[min(self._fg_i, len(value) - 1)]
-            self._fg_i += 1
-        else:
-            component = value
-        return FakeForeground(component)
-
-    def tap(self, x, y, device_id=None, delay=None):
-        self.taps.append((int(x), int(y)))
+    return FakeShot("", valid=False, failure_code=failure_code)
 
 
 def _session(shots, dumps, foreground="com.example.app/.Main", **overrides) -> PhoneSession:
-    config = FakeConfig()
-    for key, value in overrides.items():
-        setattr(config, key, value)
+    """Real session against a scripted device.
+
+    ``shots`` are :class:`~tests.v2.doubles.marks.FakeShot` values (``good`` /
+    ``bad``); ``dumps`` are XML strings, ``""`` (an empty dump is
+    ``accessibility_dump_empty``) or ``"timeout"``. Both scripts repeat their
+    last entry once exhausted.
+    """
+
     return PhoneSession(
-        config, device_factory=ScriptedDevice(shots, dumps, foreground=foreground)
+        FakeConfig(**overrides),
+        device_factory=FakeDeviceFactory(
+            observing=True, shots=shots, dumps=dumps, foreground=foreground
+        ),
     )
 
 
@@ -236,7 +146,7 @@ def test_reference_frame_keeps_epoch_marks_and_geometry_frozen():
 def test_reference_frame_uses_the_most_recent_valid_attempt():
     session = _session(
         [good("shot1"), good("shot2")],
-        [_SETTINGS_XML, _SETTINGS_XML],
+        [SETTINGS_XML_SINGLE, SETTINGS_XML_SINGLE],
         foreground=["A/.X", "B/.Y", "C/.Z", "D/.W"],
     )
 
@@ -325,7 +235,7 @@ def test_action_success_survives_failed_observation_with_reference():
     from phone_agent.v2.tools.actuation import build_actuation_tools
 
     session = _session(
-        [good("shot1"), good("shot2"), bad()], [_SETTINGS_XML, "timeout", "timeout"]
+        [good("shot1"), good("shot2"), bad()], [SETTINGS_XML_SINGLE, "timeout", "timeout"]
     )
     session.observe()
     target = next(iter(session.marks))
@@ -345,7 +255,7 @@ def test_action_success_survives_failed_observation_with_reference():
 def test_foreground_change_reference_never_poses_as_current_frame():
     session = _session(
         [good("shot1"), good("shot2")],
-        [_SETTINGS_XML, _SETTINGS_XML],
+        [SETTINGS_XML_SINGLE, SETTINGS_XML_SINGLE],
         foreground=[
             "A1/.X",
             "A2/.X",

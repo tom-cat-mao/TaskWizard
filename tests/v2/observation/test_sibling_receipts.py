@@ -45,7 +45,9 @@ from phone_agent.v2.tools._obs import (
     sibling_receipt_requested,
 )
 from phone_agent.v2.tools.actuation import build_actuation_tools
-from tests.v2._doubles import FakeDeviceFactory, FakePhoneSession, make_mark
+from tests.v2.doubles.device import FakeDeviceFactory
+from tests.v2.doubles.marks import make_mark
+from tests.v2.doubles.session import FakePhoneSession
 
 
 class _GrowingSession(FakePhoneSession):

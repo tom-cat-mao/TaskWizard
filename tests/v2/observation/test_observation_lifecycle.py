@@ -30,99 +30,18 @@ from phone_agent.v2.session import (
     mint_badge,
     parse_badge,
 )
-
-
-# --------------------------------------------------------------------------
-# Fakes: a screenshot, a foreground observation, and a scriptable device.
-# --------------------------------------------------------------------------
-class FakeShot:
-    def __init__(self, payload: str, *, valid: bool = True) -> None:
-        self.base64_data = payload
-        self.width = 1080
-        self.height = 2400
-        self.mime_type = "image/png"
-        self.is_valid = valid
-        self.failure_code = None if valid else "screenshot_unavailable"
-
-
-class FakeForeground:
-    def __init__(self, component: str, package: str = "com.example.app") -> None:
-        self.component_name = component
-        self.package_name = package
-        self.display_name = package
-
-
-_SETTINGS_XML = (
-    "<hierarchy>"
-    '<node text="WLAN" class="android.widget.TextView" clickable="true" '
-    'enabled="true" bounds="[0,100][1080,300]" />'
-    '<node text="蓝牙" class="android.widget.TextView" clickable="true" '
-    'enabled="true" bounds="[0,300][1080,500]" />'
-    "</hierarchy>"
-)
-
-
-class FakeConfig:
-    device_id = None
-    accessibility_max_marks = 80
-    accessibility_timeout = 3.0
-    grounding_provider = "accessibility"
-    locateanything_max_size = 960
-    locateanything_context_max_chars = 200
-    locate_max_size = 0
-    scope_padding_ratio = 0.05
-    locateanything_model = None
-    # These tests drive the *real* PhoneSession, so the observation waits are
-    # pinned to zero: a test never pays wall-clock time for production timing
-    # (the settle/backoff values themselves are under test in
-    # test_observation_hardening.py and test_observe_retry_backoff.py, which
-    # assert on a monkeypatched ``time.sleep``).
-    observe_settle_ms = 0
-    observe_retry_backoff_s = 0.0
-
-
-class FakeDeviceFactory:
-    """Scriptable device: screenshots, foreground, and a UiAutomator dump.
-
-    ``foreground_script`` is a list of component names returned by successive
-    ``get_foreground_app`` calls (observe() samples twice per attempt). A single
-    string means the foreground is stable. ``screenshot_valid`` toggles a screenshot
-    failure for the batch-invalidation test.
-    """
-
-    def __init__(
-        self,
-        *,
-        foreground: str | list[str] = "com.example.app/.Main",
-        xml: str = _SETTINGS_XML,
-        screenshot_valid: bool = True,
-    ) -> None:
-        self._fg = foreground
-        self._fg_i = 0
-        self._xml = xml
-        self._screenshot_valid = screenshot_valid
-        self.screenshot_calls = 0
-        self.dump_calls = 0
-
-    def get_screenshot(self, device_id=None, timeout=10):
-        self.screenshot_calls += 1
-        return FakeShot(f"shot{self.screenshot_calls}", valid=self._screenshot_valid)
-
-    def dump_uiautomator_xml(self, device_id=None, timeout=None):
-        self.dump_calls += 1
-        return self._xml
-
-    def get_foreground_app(self, device_id=None):
-        if isinstance(self._fg, list):
-            comp = self._fg[min(self._fg_i, len(self._fg) - 1)]
-            self._fg_i += 1
-        else:
-            comp = self._fg
-        return FakeForeground(comp)
+from tests.v2.doubles.config import FakeConfig
+from tests.v2.doubles.device import FakeDeviceFactory
+from tests.v2.doubles.marks import SETTINGS_XML
 
 
 def _session(**kwargs) -> PhoneSession:
-    return PhoneSession(FakeConfig(), device_factory=FakeDeviceFactory(**kwargs))
+    """The real session against a scripted device (observation surface on)."""
+
+    return PhoneSession(
+        FakeConfig(),
+        device_factory=FakeDeviceFactory(observing=True, xml=SETTINGS_XML, **kwargs),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -255,12 +174,7 @@ def test_stale_mark_blocks_tap_tool_no_device_action():
 # --------------------------------------------------------------------------
 def test_observe_retries_once_on_foreground_change():
     # attempt1: before=A, after=B (unstable) -> retry; attempt2: before=B, after=B.
-    session = PhoneSession(
-        FakeConfig(),
-        device_factory=FakeDeviceFactory(
-            foreground=["A/.X", "B/.Y", "B/.Y", "B/.Y"]
-        ),
-    )
+    session = _session(foreground=["A/.X", "B/.Y", "B/.Y", "B/.Y"])
     obs = session.observe()
     assert obs.epoch == 1
     # Two attempts -> two screenshots taken; the committed one is the 2nd.
@@ -270,12 +184,7 @@ def test_observe_retries_once_on_foreground_change():
 
 def test_observe_fails_and_invalidates_batch_on_persistent_instability():
     # Every attempt flips foreground -> never stable -> observation failure.
-    session = PhoneSession(
-        FakeConfig(),
-        device_factory=FakeDeviceFactory(
-            foreground=["A/.X", "B/.Y", "C/.Z", "D/.W"]
-        ),
-    )
+    session = _session(foreground=["A/.X", "B/.Y", "C/.Z", "D/.W"])
     # Seed a prior batch so we can prove failure clears it.
     session.marks = {"ax_1@e0": MarkCandidate("ax_1@e0", [0, 0, 1, 1], [0, 0], epoch=0)}
     with pytest.raises(ScreenshotError):
@@ -285,9 +194,7 @@ def test_observe_fails_and_invalidates_batch_on_persistent_instability():
 
 
 def test_observe_screenshot_failure_invalidates_batch():
-    session = PhoneSession(
-        FakeConfig(), device_factory=FakeDeviceFactory(screenshot_valid=False)
-    )
+    session = _session(screenshot_valid=False)
     session.marks = {"ax_1@e0": MarkCandidate("ax_1@e0", [0, 0, 1, 1], [0, 0], epoch=0)}
     with pytest.raises(ScreenshotError):
         session.observe()

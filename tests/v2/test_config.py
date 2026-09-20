@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
 
 from phone_agent.v2 import config as config_mod
 from phone_agent.v2.config import V2Config, load_project_env
 from phone_agent.v2.model import DEFAULT_MODEL_USER_AGENT, build_default_headers
+from tests.v2.doubles.paths import REPO_ROOT
 
 PHONE_AGENT_KEYS = [
     "PHONE_AGENT_BASE_URL",
@@ -398,7 +398,7 @@ def test_dotenv_missing_is_noop(monkeypatch, tmp_path):
 
 # -- .env parsing: inline comments (WP2) ---------------------------------
 
-_EXAMPLE_TEMPLATE = Path(__file__).resolve().parents[2] / ".env.example"
+_EXAMPLE_TEMPLATE = REPO_ROOT / ".env.example"
 
 
 def _commented_active_template_lines() -> list[str]:

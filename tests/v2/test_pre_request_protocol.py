@@ -44,6 +44,7 @@ from phone_agent.v2.middleware.compact import CompactMiddleware
 from phone_agent.v2.middleware.taskdoc import TaskDocInjector
 from phone_agent.v2.pins import TASKDOC_ID_PREFIX
 from phone_agent.v2.usage import UsageLedger
+from tests.v2.doubles.taskdoc import FakeTaskDoc
 
 
 # ---------------------------------------------------------------------------
@@ -61,12 +62,10 @@ class _FakeSummariser:
         return AIMessage(content=self.text)
 
 
-class _FakeTaskDoc:
-    def __init__(self, goal: str = "打开设置并连上 WLAN") -> None:
-        self.goal = goal
+def _board() -> FakeTaskDoc:
+    """A non-empty board: the injector only pins a block for a rendered doc."""
 
-    def render(self, lang: str = "cn") -> str:  # noqa: ARG002
-        return f"## 目标\nbase: {self.goal}"
+    return FakeTaskDoc(goal_base="打开设置并连上 WLAN")
 
 
 def _make_session(task_doc: Any = None) -> Any:
@@ -163,7 +162,7 @@ def test_t2_fold_plus_stale_taskdoc_wires_clean():
 
     summariser = _FakeSummariser()
     taskdoc_old_id = f"{TASKDOC_ID_PREFIX}old"
-    injector = TaskDocInjector(_make_session(task_doc=_FakeTaskDoc()))
+    injector = TaskDocInjector(_make_session(task_doc=_board()))
     injector._injected_id = taskdoc_old_id
 
     history: list[Any] = [
@@ -210,7 +209,7 @@ def test_t2_fold_and_budget_warn_same_turn():
     and the warn message.
     """
 
-    injector = TaskDocInjector(_make_session(task_doc=_FakeTaskDoc()))
+    injector = TaskDocInjector(_make_session(task_doc=_board()))
     history: list[Any] = [
         SystemMessage(content="系统提示词", id="sys-1"),
         HumanMessage(content="任务"),
@@ -251,7 +250,7 @@ def test_t1_warn_keeps_full_transcript_and_flow_line():
     transcript (tool_calls + receipts), and the history stays verbatim.
     """
 
-    injector = TaskDocInjector(_make_session(task_doc=_FakeTaskDoc()))
+    injector = TaskDocInjector(_make_session(task_doc=_board()))
     history: list[Any] = [
         SystemMessage(content="系统提示词", id="sys-1"),
         HumanMessage(content="任务"),
@@ -305,7 +304,7 @@ def test_two_consecutive_t2_folds_stay_stable_and_wire_clean():
     """
 
     summariser = _FakeSummariser()
-    injector = TaskDocInjector(_make_session(task_doc=_FakeTaskDoc()))
+    injector = TaskDocInjector(_make_session(task_doc=_board()))
     compact = _make_compact(summariser=summariser)
 
     history: list[Any] = [
@@ -358,7 +357,7 @@ def test_pair_straddling_fold_cut_stays_paired():
     content-only estimate these AIMessages weigh ~0 and the cut moves).
     """
 
-    injector = TaskDocInjector(_make_session(task_doc=_FakeTaskDoc()))
+    injector = TaskDocInjector(_make_session(task_doc=_board()))
     big_args = {"html": "y" * 4_000, "intent": "写入文档"}
     history: list[Any] = [
         SystemMessage(content="系统提示词", id="sys-1"),
@@ -519,7 +518,7 @@ def test_compact_reserves_read_from_env(monkeypatch):
 # taskdoc listener contract
 # ---------------------------------------------------------------------------
 def test_taskdoc_listener_transforms_full_list_without_remove_message():
-    injector = TaskDocInjector(_make_session(task_doc=_FakeTaskDoc()))
+    injector = TaskDocInjector(_make_session(task_doc=_board()))
     old_id = f"{TASKDOC_ID_PREFIX}old"
     injector._injected_id = old_id
     messages = [
@@ -539,7 +538,7 @@ def test_taskdoc_listener_transforms_full_list_without_remove_message():
 
 
 def test_taskdoc_make_delta_legacy_path_keeps_remove_message():
-    injector = TaskDocInjector(_make_session(task_doc=_FakeTaskDoc()))
+    injector = TaskDocInjector(_make_session(task_doc=_board()))
     # First turn: fresh block, nothing to remove yet.
     first = injector.make_delta([HumanMessage(content="任务")])
     assert first is not None and len(first) == 1

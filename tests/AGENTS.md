@@ -10,7 +10,7 @@
    守护的那层目录，不要堆在 `tests/` 根下。
 2. **只用 `.venv/bin/python -m pytest`**，绝不用系统 Python（根文件 Environment Gotchas）。解释器不对，
    依赖解析与 `sys.path` 行为都不可复现。
-3. **离线是硬约束**：不碰真机、不连网关、不触发下载。设备与观测用 `tests/v2/_doubles.py` 的 fake，
+3. **离线是硬约束**：不碰真机、不连网关、不触发下载。设备与观测用 `tests/v2/doubles/` 的 fake，
    provider 用假 transport，记忆与插件落到 `tmp_path`；[`conftest.py`](conftest.py) 已守护真实 `memory/`
    目录与用户插件清单。
 4. **`tests/docs` 保持标准库 + pytest**：CI 的 `docs` job 只装 pytest 与 mkdocs-material、不装
@@ -28,7 +28,8 @@
   `tests/docs/test_doc_bash_blocks.py`。改门禁连带改这条清单。
 - `tests/web/`：守护 Web 投影契约——bridge 快照与 run 目录协议、状态推进、App-KB 只读表、流式观察者。
   改 `phone_agent/web/` 时同批改这里的断言，别只改实现。
-- `tests/v2/`：会话、事件、安全、预算、经验与配置的契约测试；跨模块行为在这里集成验证。
+- `tests/v2/`：会话、事件、安全、预算、经验与配置的契约测试；跨模块行为在这里集成验证。双打统一在
+  `tests/v2/doubles/`（唯一事实源，别再抄一份），观测域（会话帧/标记/截图）用例在 `tests/v2/observation/`。
 - `tests/skill/`：真机诊断 skill 的离线冒烟（20 个文件、自带 `conftest.py` 把 skill 的 scripts 目录放进
   `sys.path`），随 CI 的全量 `pytest tests` 跑，没有自己的分层命令。
 - `tests/` 根：保留库的测试——`phone_agent/adb/`（test_adb_app_labels.py、test_adb_device_signals.py、

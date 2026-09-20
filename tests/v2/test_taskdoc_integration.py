@@ -1,9 +1,9 @@
 """W2 TaskDoc integration tests (spec §3 W2): renderer, flow line, finish guard, seeding.
 
 All fakes — no real device, MLX, or network. ``phone_agent.v2.taskdoc`` is owned
-by the concurrent W1 worktree and may not exist here, so these tests use a local
-``FakeTaskDoc`` matching the spec §2.1 interface
-(``TaskDoc(goal_base=..., items=[...], facts=[...])`` with
+by the concurrent W1 worktree and may not exist here, so these tests use the
+shared ``FakeTaskDoc`` (``tests/v2/doubles/taskdoc.py``) matching the spec §2.1
+interface (``TaskDoc(goal_base=..., items=[...], facts=[...])`` with
 ``validate()`` / ``has_open_items()`` / ``open_items_summary()`` / ``render(lang)``)
 and, for the seeding test, inject a fake ``phone_agent.v2.taskdoc`` module into
 ``sys.modules`` (the same technique ``tests/v2/test_agent_loop.py`` uses for the
@@ -27,52 +27,7 @@ from langchain_core.messages import AIMessage, RemoveMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from phone_agent.v2.middleware.taskdoc import build_taskdoc_middleware
-
-
-# --------------------------------------------------------------------------
-# Fake TaskDoc matching spec §2.1 (goal + route + facts, three-段 render).
-# --------------------------------------------------------------------------
-@dataclass
-class FakeTaskItem:
-    id: str
-    content: str
-    status: str = "pending"
-    reason: str | None = None
-    evidence_note: str | None = None
-
-
-@dataclass
-class FakeTaskDoc:
-    goal_base: str = ""
-    amendments: list[str] = field(default_factory=list)
-    items: list[FakeTaskItem] = field(default_factory=list)
-    facts: list[str] = field(default_factory=list)
-
-    def validate(self) -> str | None:
-        return None
-
-    def has_open_items(self) -> bool:
-        return any(i.status in {"pending", "in_progress"} for i in self.items)
-
-    def open_items_summary(self) -> str:
-        return "; ".join(
-            f"{i.id}:{i.content}[{i.status}]"
-            for i in self.items
-            if i.status in {"pending", "in_progress"}
-        )
-
-    def render(self, lang: str = "cn") -> str:
-        if not (self.goal_base or self.items or self.facts):
-            return ""
-        lines = ["## 目标", f"base: {self.goal_base}"]
-        if self.items:
-            lines.append("## 路线")
-            for i in self.items:
-                lines.append(f"- {i.id} [{i.status}] {i.content}")
-        if self.facts:
-            lines.append("## 关键事实")
-            lines.extend(f"- {f}" for f in self.facts)
-        return "\n".join(lines)
+from tests.v2.doubles.taskdoc import FakeTaskDoc, FakeTaskItem
 
 
 @dataclass

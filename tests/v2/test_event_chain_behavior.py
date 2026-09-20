@@ -32,6 +32,8 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 
+from tests.v2.doubles.taskdoc import FakeTaskDoc, FakeTaskItem
+
 
 # --------------------------------------------------------------------------
 # fakes
@@ -86,34 +88,6 @@ class _FakeSession:
     def observe(self) -> _FakeObservation:
         self.screen_seq += 1
         return _FakeObservation(screen_seq=self.screen_seq)
-
-
-@dataclass
-class _FakeTaskItem:
-    id: str
-    content: str
-    status: str = "pending"
-
-
-@dataclass
-class _FakeTaskDoc:
-    goal_base: str = "打开设置并连上 WLAN"
-    items: list = field(default_factory=list)
-    facts: list = field(default_factory=list)
-
-    def render(self, lang: str = "cn") -> str:  # noqa: ARG002
-        if not (self.goal_base or self.items or self.facts):
-            return ""
-        lines = ["## 目标", f"base: {self.goal_base}"]
-        if self.items:
-            lines.append("## 路线")
-            lines.extend(
-                f"- [{item.status}] {item.id}: {item.content}" for item in self.items
-            )
-        if self.facts:
-            lines.append("## 关键事实")
-            lines.extend(f"- {fact}" for fact in self.facts)
-        return "\n".join(lines)
 
 
 def _install_fake_modules(monkeypatch, session: _FakeSession, model, tools_builder):
@@ -373,9 +347,9 @@ def test_t2_fold_prunes_once_and_taskdoc_stays_pinned(tmp_path, monkeypatch):
     """
 
     session = _FakeSession(
-        task_doc=_FakeTaskDoc(
+        task_doc=FakeTaskDoc(
             goal_base="打开设置",
-            items=[_FakeTaskItem("1", "打开设置", "in_progress")],
+            items=[FakeTaskItem("1", "打开设置", "in_progress")],
         )
     )
     # The summariser: one canned hand-off summary.

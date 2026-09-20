@@ -10,9 +10,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
-from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 
 from phone_agent.v2.capabilities import CapabilitySpec
@@ -22,23 +20,13 @@ from phone_agent.v2.run_events import WebEventMiddleware
 from phone_agent.v2.run_ipc import JsonlReader, read_run_spec
 from phone_agent.v2.runner import run_spec
 from phone_agent.web.bridge import WebRunBridge
+from tests.v2.doubles.models import ScriptedModel
 
 
-class _ScriptedModel(BaseChatModel):
-    responses: list[AIMessage]
-    i: int = 0
+class _ScriptedModel(ScriptedModel):
+    """Scripted model; the label only keeps this suite's traces readable."""
 
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        response = self.responses[min(self.i, len(self.responses) - 1)]
-        self.i += 1
-        return ChatResult(generations=[ChatGeneration(message=response)])
-
-    def bind_tools(self, tools, **kwargs):  # noqa: ANN001
-        return self
-
-    @property
-    def _llm_type(self) -> str:
-        return "contract-integration"
+    llm_type: str = "contract-integration"
 
 
 @dataclass

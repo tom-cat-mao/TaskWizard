@@ -14,7 +14,7 @@ contract promises:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
@@ -27,6 +27,7 @@ from phone_agent.v2.middleware.taskdoc import (
 from phone_agent.v2.tools import build_tools
 
 from tests.v2._doubles import FakeConfig, FakePhoneSession, make_mark
+from tests.v2.doubles.taskdoc import FakeTaskDoc, FakeTaskItem
 
 
 # --------------------------------------------------------------------------
@@ -198,42 +199,15 @@ def test_derive_flow_lines_en_uses_english_undeclared():
 # 3. Middleware wiring: the pinned block carries the flow line after the doc.
 # --------------------------------------------------------------------------
 @dataclass
-class _FakeItem:
-    id: str
-    content: str
-    status: str = "pending"
-    reason: str | None = None
-    evidence_note: str | None = None
-
-
-@dataclass
-class _FakeDoc:
-    goal_base: str = ""
-    amendments: list = field(default_factory=list)
-    items: list = field(default_factory=list)
-    facts: list = field(default_factory=list)
-
-    def render(self, lang: str = "cn") -> str:
-        if not (self.goal_base or self.items or self.facts):
-            return ""
-        lines = ["## 目标", f"base: {self.goal_base}"]
-        if self.items:
-            lines.append("## 路线")
-            for i in self.items:
-                lines.append(f"- [{i.status}] {i.id}: {i.content}")
-        return "\n".join(lines)
-
-
-@dataclass
 class _FakeSession:
     task_doc: Any = None
 
 
 def test_middleware_appends_flow_line_after_taskdoc():
     session = _FakeSession(
-        task_doc=_FakeDoc(
+        task_doc=FakeTaskDoc(
             goal_base="订一张去上海的票",
-            items=[_FakeItem("s1", "选择出发地", status="in_progress")],
+            items=[FakeTaskItem("s1", "选择出发地", status="in_progress")],
         )
     )
     mw = build_taskdoc_middleware(session, lang="cn")
@@ -252,7 +226,7 @@ def test_middleware_appends_flow_line_after_taskdoc():
 
 
 def test_middleware_no_flow_line_when_transcript_has_no_tool_calls():
-    session = _FakeSession(task_doc=_FakeDoc(goal_base="任意目标"))
+    session = _FakeSession(task_doc=FakeTaskDoc(goal_base="任意目标"))
     mw = build_taskdoc_middleware(session, lang="cn")
     result = mw.before_model(
         {"messages": [AIMessage(content="只是想一下")]}, runtime=None

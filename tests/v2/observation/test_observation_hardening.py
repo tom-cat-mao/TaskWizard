@@ -12,9 +12,10 @@ from phone_agent.v2.session import PhoneSession, ScreenshotError
 from phone_agent.v2.tools import build_tools
 from phone_agent.v2.tools.actuation import build_actuation_tools
 from phone_agent.v2.tools._obs import auto_observation
-from tests.v2._doubles import FakeConfig as ToolConfig
-from tests.v2._doubles import FakePhoneSession, make_mark
-from tests.v2.test_observation_lifecycle import FakeConfig, FakeDeviceFactory
+from tests.v2.doubles.config import FakeConfig
+from tests.v2.doubles.device import FakeDeviceFactory
+from tests.v2.doubles.marks import make_mark
+from tests.v2.doubles.session import FakePhoneSession
 
 
 def _install_screencap(
@@ -28,7 +29,7 @@ def _install_screencap(
 
     The fake speaks the legacy channel (``shell screencap`` + ``pull``), so these
     tests pin ``use_exec_out=False``; the exec-out channel has its own suite in
-    ``tests/v2/test_screenshot_exec_out.py``.
+    ``tests/v2/observation/test_screenshot_exec_out.py``.
     """
 
     def fake_run(args, **_kwargs):
@@ -101,7 +102,7 @@ def _real_session(*, settle_ms: int = 300, foreground=None) -> PhoneSession:
     config.observe_settle_ms = settle_ms
     return PhoneSession(
         config,
-        device_factory=FakeDeviceFactory(foreground=foreground),
+        device_factory=FakeDeviceFactory(observing=True, foreground=foreground),
     )
 
 
@@ -168,7 +169,7 @@ def _text(result) -> str:
 def test_action_settle_override_and_clamp_receipt():
     marks = {"ax_1": make_mark("ax_1", text="搜索")}
     session = _RecordingSession(marks)
-    tools = {tool.name: tool for tool in build_tools(session, ToolConfig())}
+    tools = {tool.name: tool for tool in build_tools(session, FakeConfig())}
 
     tools["tap"].invoke({"target_mark_id": "ax_1", "settle_ms": 2000})
     clamped = tools["back"].invoke({"settle_ms": 99999})
@@ -179,7 +180,7 @@ def test_action_settle_override_and_clamp_receipt():
 
 def test_negative_action_settle_clamps_to_zero_with_receipt():
     session = _RecordingSession({})
-    tools = {tool.name: tool for tool in build_tools(session, ToolConfig())}
+    tools = {tool.name: tool for tool in build_tools(session, FakeConfig())}
 
     clamped = tools["home"].invoke({"settle_ms": -50})
 
@@ -196,7 +197,7 @@ def test_execution_tool_override_drives_real_observe_sleep(monkeypatch):
     monkeypatch.setattr("phone_agent.v2.session.time.sleep", sleeps.append)
     config = FakeConfig()
     config.observe_settle_ms = 300
-    session = PhoneSession(config, device_factory=ActionDevice())
+    session = PhoneSession(config, device_factory=ActionDevice(observing=True))
     tools = {
         tool.name: tool for tool in build_actuation_tools(session, config)
     }
@@ -208,7 +209,7 @@ def test_execution_tool_override_drives_real_observe_sleep(monkeypatch):
 
 def test_read_screen_supports_default_and_explicit_settle():
     session = _RecordingSession({})
-    tools = {tool.name: tool for tool in build_tools(session, ToolConfig())}
+    tools = {tool.name: tool for tool in build_tools(session, FakeConfig())}
 
     tools["read_screen"].invoke({})
     tools["read_screen"].invoke({"settle_ms": 2000})
@@ -229,7 +230,7 @@ def test_secure_screen_receipt_contains_required_guidance():
 
     config = FakeConfig()
     config.observe_settle_ms = 0
-    session = PhoneSession(config, device_factory=SecureDevice())
+    session = PhoneSession(config, device_factory=SecureDevice(observing=True))
     receipt = _text(auto_observation(session))
 
     assert "此屏被系统级保护（登录/支付页）" in receipt
@@ -257,7 +258,7 @@ def test_secure_screen_receipt_reports_remaining_marks():
 
 def test_every_execution_tool_and_read_screen_expose_settle_ms():
     session = _RecordingSession({})
-    tools = {tool.name: tool for tool in build_tools(session, ToolConfig())}
+    tools = {tool.name: tool for tool in build_tools(session, FakeConfig())}
 
     for name in (
         "tap",
