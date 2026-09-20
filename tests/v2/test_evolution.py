@@ -14,6 +14,7 @@ import pytest
 import main_v2
 from phone_agent.v2.agent import ThinPhoneAgent
 from phone_agent.v2.config import V2Config
+from tests.v2.doubles.paths import REPO_ROOT
 from phone_agent.v2.evolution import (
     LESSON_EVENT_TYPES,
     LessonCandidate,
@@ -706,7 +707,7 @@ def test_lessons_never_enter_actor_initial_messages_when_injection_is_off(
     rendered = " ".join(str(message.content) for message in messages)
     assert secret_lesson not in rendered
 
-    root = Path(__file__).resolve().parents[2]
+    root = REPO_ROOT
     actor_sources = [
         root / "phone_agent/v2/agent.py",
         root / "phone_agent/v2/prompts.py",

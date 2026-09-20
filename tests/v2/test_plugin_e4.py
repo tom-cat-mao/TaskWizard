@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import sys
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+
+from tests.v2.doubles.session import FakePhoneSession
 
 
 # --------------------------------------------------------------------------
@@ -36,27 +38,6 @@ class _ScriptedModel(BaseChatModel):
     @property
     def _llm_type(self) -> str:
         return "scripted"
-
-
-@dataclass
-class _FakeObservation:
-    screenshot_b64: str = "QUJD"
-    current_app: str = "com.example.app"
-    screen_seq: int = 0
-    marks: dict = field(default_factory=dict)
-
-
-@dataclass
-class _FakeSession:
-    config: Any = None
-    marks: dict = field(default_factory=dict)
-    screen_seq: int = 0
-    launched_apps: list = field(default_factory=list)
-    finished: bool = False
-
-    def observe(self) -> _FakeObservation:
-        self.screen_seq += 1
-        return _FakeObservation(screen_seq=self.screen_seq)
 
 
 @dataclass
@@ -98,7 +79,7 @@ def captured_agent(tmp_path, monkeypatch):
 
     monkeypatch.setattr("langchain.agents.create_agent", _create_agent)
 
-    session = _FakeSession()
+    session = FakePhoneSession()
     model = _ScriptedModel(
         responses=[
             _ai_call("finish", {"summary": "done", "evidence": ["ok"]}, "c1"),
@@ -189,7 +170,7 @@ def test_extra_middleware_wraps_tool_execute_bridge(tmp_path, monkeypatch):
 
     monkeypatch.setattr("langchain.agents.create_agent", _create_agent)
 
-    session = _FakeSession()
+    session = FakePhoneSession()
     model = _ScriptedModel(responses=[AIMessage(content="完成")])
 
     model_mod = types.ModuleType("phone_agent.v2.model")

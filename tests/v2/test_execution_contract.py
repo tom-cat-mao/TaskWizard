@@ -13,32 +13,20 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 
 from phone_agent.device_factory import DeviceFactory
 from phone_agent.v2.tools.actuation import build_actuation_tools
 from phone_agent.v2.tools.control import build_control_tools
 from tests.v2._doubles import FakeDeviceFactory, FakePhoneSession, make_mark
+from tests.v2.doubles.models import ScriptedModel
 
 
-class _ScriptedModel(BaseChatModel):
-    responses: list[AIMessage]
-    i: int = 0
+class _ScriptedModel(ScriptedModel):
+    """Scripted model; the label only keeps this suite's traces readable."""
 
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
-        response = self.responses[min(self.i, len(self.responses) - 1)]
-        self.i += 1
-        return ChatResult(generations=[ChatGeneration(message=response)])
-
-    def bind_tools(self, tools, **kwargs):  # noqa: ANN001
-        return self
-
-    @property
-    def _llm_type(self) -> str:
-        return "scripted-execution-contract"
+    llm_type: str = "scripted-execution-contract"
 
 
 def _call(name: str, args: dict[str, Any], call_id: str) -> dict[str, Any]:

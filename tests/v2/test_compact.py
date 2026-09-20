@@ -25,28 +25,12 @@ from phone_agent.v2.middleware.compact import (
     infer_context_window,
 )
 from phone_agent.v2.middleware.taskdoc import TaskDocInjector
+from tests.v2.doubles.taskdoc import FakeTaskDoc, FakeTaskItem
 
 
 # --------------------------------------------------------------------------
 # fakes
 # --------------------------------------------------------------------------
-@dataclass
-class FakeTaskItem:
-    id: str
-    content: str
-    status: str = "pending"
-    reason: str | None = None
-    evidence_note: str | None = None
-
-
-@dataclass
-class FakeTaskDoc:
-    goal_base: str = "打开设置并连上 WLAN"
-    amendments: list[str] = field(default_factory=list)
-    items: list[FakeTaskItem] = field(default_factory=list)
-    facts: list[str] = field(default_factory=list)
-
-
 @dataclass
 class FakeSession:
     task_doc: Any = None
