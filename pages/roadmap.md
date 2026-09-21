@@ -9,14 +9,17 @@
 |---|---|
 | thin-loop v2 | 每步一次模型调用、一个工具动作；harness 不做工作流编排 |
 | 原子观测与参考图 | 单生产者 + epoch 批次徽章 + mark 新鲜度闸门；观测失败但已取得有效截图时返回标注过的未验证参考图（不可寻址） |
+| 同轮步骤回执 | `PHONE_AGENT_SIBLING_RECEIPTS` 默认 `on`：非最后观测的同批 sibling 只回文本回执，采样 / epoch / marks 全不动（纯呈现层） |
 | 安全 | 预警制（`wary` 默认）、四档模式、finish 两段式 + 独立验收器（故障 fail-open 并记 `skipped`） |
 | 成本 | token 预算硬上限、两级 auto-compact |
+| 边界感知压缩 | `boundary_compact` 能力（默认 `shadow`）：路线项完成时按机械经济门决定是否折叠，复用既有折叠门与容量兜底 |
 | marks 与 locate | 执行必须绑定当前批次 mark；窗口化分组展示（默认 `auto`，设备不支持自动回退）；`locate` 原图输入、可选 scope、命中开启新批次 |
 | App 名解析 | 归一化 → 多路候选 → 先验排序 → 证据分型三态；弱证据只给候选，不单独自动执行（`learned` 别名带成功计数、命中类型不是 clarify 类时例外） |
 | App-KB | 设备事实 + learned 别名（验证启动写回 + 隐式纠正）+ dream 错别名覆盖 + 用户纠正入口（最高信任） |
 | 产出物 | `write_document` / `update_document` 产出单页 HTML（路径由 run id 派生），控制台可预览/删除 |
 | 经验档案 | episode 固定 schema + 隐私白名单 + dream 归档为聚合统计 |
 | 语义回想 | 本地向量索引（sqlite-vec + MLX 嵌入），默认 shadow 只观测；统计 Hit@1 等口径 |
+| 观测存档与召回 | `obs_archive` 能力（默认 `off`）：观测全文落 `memory/obs_archive/<run_id>.jsonl` + 可重建 FTS5 索引；`recall_screen` / `search_screens` 只读工具，历史 mark 一律渲染失效；文本面，截图不落盘 |
 | 经验蒸馏与回注 | 离线 `--distill` 自判分级（auto_approved / needs_review）；`MEMORY_RAG=on` 受控注入 approved / auto_approved 经验，有上限、可撤销 |
 | 过程卡注入 | 三时机投递（开局 / mention 预取 / 进场），每包每 run 至多一次，额度独立 |
 | 模型提供方 | 单层 `models.json`、三种 API 构建器、五角色 `provider:model` 路由、`roles` 段、thinking 翻译、`--list-models`；正式 `PHONE_AGENT_STREAMING` 开关及模型/角色覆盖，默认 off，Web 可增量观察 actor 输出（协议经离线验证，未验证真实网关流式） |
