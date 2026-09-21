@@ -154,7 +154,7 @@ Token 预算在模型调用边界检查，已发生的调用与验收用量仍�
 | `PHONE_AGENT_ACCESSIBILITY_MAX_MARKS` | int | `80` | 单次观测最多输出的 mark 数 |
 | `PHONE_AGENT_OBSERVE_RETRY_MAX_LOOPS` | int | `1` | 不稳定 marks dump（`timeout` / `provider_error` / `accessibility_xml_parse_error`）的额外整轮重采上限；总轮数 = `1 + 本值`，`0` 表示单轮不重试。默认 `1` 即「最多 2 轮」 |
 | `PHONE_AGENT_OBSERVE_RETRY_BACKOFF_S` | float | `2.0` | marks dump 失败后、下一轮开始前的退避秒数，用来错开页面跳转后的忙乱窗口；重试是整轮重采（含截图），不单独重采 marks |
-| `PHONE_AGENT_MARKS_WINDOWED` | `auto`/`on`/`off` | `auto` | 窗口感知 marks（纯展示层）。`auto` 先试 `uiautomator dump --windows`，不支持则回退 legacy 单根 dump；`on` 强制 `--windows`（不支持报错可见）；`off` 只跑 legacy 单根 dump。分组条件是出现多个不同窗口或存在真窗口证据（layer/type），否则平铺渲染——legacy 单根 dump 的多个顶层 node 会各生成一个弱窗口，因此同样按分组渲染并输出 `op=` 字段。仅影响分组/标注/渲染，寻址/执行/安全门/折叠/locate 不变，`op=blocked` 仅展示不拦截 |
+| `PHONE_AGENT_MARKS_WINDOWED` | `auto`/`on`/`off` | `auto` | 窗口感知 marks（纯展示层）。`auto` 先试 `uiautomator dump --windows`，不支持则回退 legacy 单根 dump；`on` 强制 `--windows`（不支持报错可见）；`off` 只跑 legacy 单根 dump。分组条件是出现多个不同窗口或存在真窗口证据（layer/type），否则平铺渲染——legacy 单根 dump 的多个顶层 node 会各生成一个弱窗口，因此同样按分组渲染并输出 `op=` 字段。仅影响分组/标注/渲染，寻址/执行/安全门/折叠/locate 不变，`op=blocked` 仅展示不拦截。CLI 覆盖旗标 `--marks-windowed`（优先级高于本键） |
 | `PHONE_AGENT_LOCATEANYTHING_MODEL` | path | `models/LocateAnything-3B-4bit` | 本地视觉定位模型路径；留空时按该默认路径加载，路径不存在时视觉定位不可用 |
 | `PHONE_AGENT_LOCATEANYTHING_MAX_SIZE` | int | `960` | 视觉定位 provider 自身输入图的最长边上限（模型侧档位）。与工具侧 `LOCATE_MAX_SIZE` 独立 |
 | `PHONE_AGENT_LOCATE_MAX_SIZE` | int | `0` | locate 工具输入图最长边；`0` = 原图 |

@@ -69,9 +69,8 @@ entry point 也可以直接指向一个 `CapabilitySpec` 对象，不必经过 `
 
 CLI 与 runner 使用同一批授权入口，runner 启动装配时 import/apply（Web 空闲/启动只序列化配置、不执行插件代码）。
 `plugin list` 在装配之外还会把每个启用条目加载两次（一次探测装配状态、一次取 `cap_id`），路径插件每次加载
-都重新 `exec_module`；其余子命令不加载插件模块。插件不支持运行中热重载——内建能力同样是静态装配（无文件
-监视、无运行中工具表重建），要变更需重启进程。`ctx.on_dispose(...)` 可注册 release 或失败清理回调，归属当前
-capability。
+都重新 `exec_module`；其余子命令不加载插件模块。插件不支持运行中热重载，内建能力同样是静态装配，要变更需
+重启进程。`ctx.on_dispose(...)` 可注册 release 或失败清理回调，归属当前 capability。
 
 ### 授权与发现 {#plugin-authorization}
 
@@ -111,10 +110,10 @@ Web 进程没有插件加载路径，决定是否激活的是 runner 装配阶�
 `taskdoc/completed` payload 为 `{"item_ids", "screen_seq", "epoch"}`：一次提交的路线项
 `in_progress → completed` 迁移即发一次，fail-open，不改变工具回执。
 
-内建嵌套顺序（插件监听器装配期注册，居于 core 之内）：
+内建嵌套顺序（插件监听器装配期注册，位于 safety 之内；`sibling_receipts` 装配后追加，是 `tool/execute` 最内层）：
 
 ```
-tool/execute:       trace → diagnostic → admission → control_hitl → budget → safety（最内）
+tool/execute:       trace → diagnostic → admission → control_hitl → budget → safety → sibling_receipts（最内；纯呈现层，rejection / terminal skip 不运行）
 model/pre_request:  compact → taskdoc → budget → boundary_compact → procedure → diagnostic → model_limit
 model/request:      trace → diagnostic → budget（最内）
 ```

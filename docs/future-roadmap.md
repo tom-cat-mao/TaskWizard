@@ -4,11 +4,17 @@
 > docstring 为准；**公开**能力状态在 `pages/roadmap.md`。特定批次的授权、设计与验收原始记录是维护者
 > 本机的私有文档（不入库，clone 后不可见）——本文件不复制实施流水账。
 
-**状态时间：2026-09-19。主分支 `main`，HEAD `a24f9c8`（Merge PR #31）。除「SoL 启发效率包」为在途 PR（`feat/sol-efficiency-pack`）外，本文列出的能力全部在 main 上。**
+**状态时间：2026-09-21。主分支 `main`，HEAD `edeb70f`（Merge PR #36）；SoL 启发效率包已由 PR #32 合入，本文列出的能力全部在 main 上。**
 
 ## 已落地
 
 - **SoL 启发效率包**（feat/sol-efficiency-pack）：观测存档与只读召回（`obs_archive` 能力，默认 off；`session.observe()` 提交成功即落 `[OBS]` 全文到 `memory/obs_archive/<run_id>.jsonl` + 可重建 FTS5 索引，`recall_screen`/`search_screens` 只读工具，历史 mark id 一律渲染失效；文本面，截图不落盘不动 P0 #6）；边界感知在线压缩（`boundary_compact` 能力，默认 shadow；`update_task_doc` 的 `in_progress→completed` 发 `taskdoc/completed`，harness 机械经济门 horizon×净收益 vs 摘要成本，复用 `_commit_fold` 全部既有门，T1/T2 容量兜底逐字不动）；摘要逐字命中影子指标（`compact_summary_quote_check` trace 事件，只观测不拦截）；同轮中间 sibling 证据回执（`PHONE_AGENT_SIBLING_RECEIPTS` 默认 on，非最后观测 sibling 只回文本回执，采样/epoch/marks 全不动，纯呈现层）。决策笔记三篇同批入库。
+- **性能与稳健性批次**（PR #33/#34/#36/#37）：观测重试退避（`PHONE_AGENT_OBSERVE_RETRY_MAX_LOOPS`/
+  `PHONE_AGENT_OBSERVE_RETRY_BACKOFF_S`，dump 超时默认放宽到 12.0s，见 `v2/config.py`）；截图回环加固
+  （`adb/screenshot.py`）；验收器 verdict 落盘（`v2/verify.py`，诊断不再报 `verifier_status: unknown`）；
+  IME 输入法窗口 marks 折叠（`grounding/accessibility.py`：键盘键位不占配额、节点标签以 `text` 为准，
+  纯展示层，legacy 单根路径不变）；诊断证据补异常类型与 `parse_summary`（`middleware/diagnostic.py`）；
+  v2 用例按被测对象域目录化（五批，含 `.gitignore` 的 `memory/` 锚定）。
 - **Harness 契约修复 S1–S5**（PR #23）：`model/pre_request` 瀑布纯全列表变换 + 桥接唯一 `RemoveMessage`；
   token 计量计工具参数/CJK/无 usage 双向；蒸馏游标 `(ts_end, run_id)` 失败重试；任务板结构预算；S3/S4 的
   provider-plugin 实链、Web 失败分类与 core 事件边界；失败构造清理。

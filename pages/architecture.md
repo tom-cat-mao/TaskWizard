@@ -60,7 +60,7 @@ sequenceDiagram
     end
 ```
 
-每次尝试都重新静置，最多两次。触发重试的条件有三类：截图或采样抛错、前后台组件变化，以及首次尝试遇到瞬时 marks 失败（抓取超时、provider 失败、AX 解析失败；窗口化采集不支持也归为 provider 失败）。空屏（无控件可交互）属于稳定结果，不是瞬时失败，直接提交零 marks 帧。第二次尝试只在截图有效且前后台一致时提交，失败码随帧显式标注，不装成“本屏无控件”；第二次截图仍失败或前台再次漂移则作废整批 marks 并抛错，本次调用取得过的最后一张有效截图只降级为未验证参考图。
+每次尝试都重新静置，最多两次；轮数与退避可配（`PHONE_AGENT_OBSERVE_RETRY_MAX_LOOPS` 默认 1、`PHONE_AGENT_OBSERVE_RETRY_BACKOFF_S` 默认 2s，见[配置参考](configuration.md)）。触发重试的条件有三类：截图或采样抛错、前后台组件变化，以及首次尝试遇到瞬时 marks 失败（抓取超时、provider 失败、AX 解析失败；窗口化采集不支持也归为 provider 失败）。空屏（无控件可交互）属于稳定结果，不是瞬时失败，直接提交零 marks 帧。第二次尝试只在截图有效且前后台一致时提交，失败码随帧显式标注，不装成“本屏无控件”；第二次截图仍失败或前台再次漂移则作废整批 marks 并抛错，本次调用取得过的最后一张有效截图只降级为未验证参考图。
 
 每次成功观测使上一批 mark 全部过期；执行动作引用过期 mark 时在 `resolve_mark` 处拒绝。模型能寻址的始终是
 **当前已观测批次**的 mark；观测之后屏幕仍可能变化，动作是否生效以设备回执为准。
@@ -286,4 +286,4 @@ W2 TYPE_APPLICATION com.tencent.mm layer=10 covered_by=W1
 
 ## 扩展性
 
-策略层完全事件化：LangChain 中间件栈只有 5 个桥接器，另有可选的 `extra_middleware` 观察者（控制台注入 Web 事件投影）。安全预警、上下文压缩、token 预算、trace、诊断全部是事件总线上的监听器（嵌套顺序 = 注册顺序；内建链里 safety 位于 `tool/execute` 最内，插件经 `ctx.on` 追加的监听器比 safety 更内）。外部插件与内建能力共用同一装配层，可挂监听器、工具、提示块、run hooks 与 CLI 命令。详见[插件开发](plugins.md)。
+策略层完全事件化：LangChain 中间件栈只有 5 个桥接器，另有可选的 `extra_middleware` 观察者（控制台注入 Web 事件投影）。安全预警、上下文压缩、token 预算、trace、诊断全部是事件总线上的监听器（嵌套顺序 = 注册顺序；`sibling_receipts` 位于 `tool/execute` 最内，纯呈现层、rejection / terminal skip 不运行；插件经 `ctx.on` 追加者位于 safety 之内）。外部插件与内建能力共用同一装配层，可挂监听器、工具、提示块、run hooks 与 CLI 命令。详见[插件开发](plugins.md)。

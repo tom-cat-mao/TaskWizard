@@ -27,6 +27,19 @@ cp .env.example .env
 .venv/bin/python main_v2.py "打开设置进入 WLAN"
 ```
 
+常用 flag（完整清单见 `--help`）：
+
+| flag | 说明 |
+|---|---|
+| `--device-id` | ADB 设备序列号（多设备时必填） |
+| `--max-steps` | 模型调用上限（熔断） |
+| `--model` | 覆盖模型 ID |
+| `--base-url` | 覆盖网关 base URL |
+| `--grounding-provider` | 视觉定位档位 |
+| `--marks-windowed {auto,on,off}` | 窗口感知 marks 档位 |
+| `--lang` | 提示词语言（cn/en） |
+| `--trace-dir` | trace 输出目录 |
+
 本地 Web 控制台（默认只监听 `127.0.0.1:8080`）：
 
 ```bash

@@ -187,6 +187,7 @@ ls memory/lessons/lessons.json memory/experience/recall_stats.json
     ```text
     <evidence_dir>/<run_id>.evidence.jsonl   每个事件一行
     <evidence_dir>/screenshots/screen-<seq>.png
+    <evidence_dir>/xml_evidence/             原始控件树 XML（预留，当前无调用方）
     ```
 
 3. 查看：
