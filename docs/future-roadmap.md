@@ -4,7 +4,7 @@
 > docstring 为准；**公开**能力状态在 `pages/roadmap.md`。特定批次的授权、设计与验收原始记录是维护者
 > 本机的私有文档（不入库，clone 后不可见）——本文件不复制实施流水账。
 
-**状态时间：2026-09-21。主分支 `main`，HEAD `edeb70f`（Merge PR #36）；SoL 启发效率包已由 PR #32 合入，本文列出的能力全部在 main 上。**
+**状态时间：2026-09-25。主分支 `main`，HEAD `8ab9df0`（Merge PR #38）；插件平面 v2 与 systemone 插件在 `feature/plugin-plane-v2` 待 PR；SoL 启发效率包已由 PR #32 合入。**
 
 ## 已落地
 
@@ -41,6 +41,18 @@
 - **CI 与文档治理**（PR #27/#28/#29）：P0 表降级为索引、契约正文归 `pages/`、决策笔记机制；lint/docs/test
   三门流水线、`requirements.lock` 为 CI 真相源、决策笔记软门与 tag 发版；AGENTS.md 层级化（v2/、pages/、
   web/、tests/ 就近约束）、四道文档机器门禁、覆盖率进报告不设阈值。
+- **插件平面 v2 声明面 + systemone 一等插件**（feature/plugin-plane-v2，PR 评审中）：声明面开放（工具风险
+  `register_tool(risk=)` 未声明 fail-closed、内建工具全量自声明、配置键 `register_setting` 走同一优先级链、
+  记账角色 `register_usage_role(unit=tokens/calls)` calls 只记账不进裁决、脱敏字面量 `register_redaction`、
+  pin 前缀、mode 收紧 `{off,shadow,on}`）；CLI 接缝接通（外部插件 `add_cli_command` 首次可用、显式 `--`
+  分隔符）；`set_service` 归属校验；`run_context` 服务（run_id/goal/actor_model）；挂载顺序提示
+  `before/after`（拓扑排序 + 环 fail-visible）；safety hard 档中断表改活视图、与分类器同一 fail-closed；
+  observe 事件带 `screen_hash`。`plugins/systemone/`（默认 disabled）：官方 `/v1/systemone` 协议（Bearer、
+  noul/choice/score、401/422/429/529、429/529+网络重试、kev 本地串行锁）、provider 适配（jev 云端/kev 本地，
+  显式引用失败可见）、shadow 安全复核（TOOL_EXECUTE prepend、三档、on 档只加不放松、noul p≥阈值追加否决）、
+  `wait_for_stable`（readonly，screen_hash 轮询折等待）、stuck 调速器（shadow-only advisory）；协议按官方
+  API reference 实测纠偏（博客二手资料有误，见 Round 4 决策笔记对照表）；144 离线用例 + 真云端三题型 smoke
+  通过（jev-1.13.0）。决策笔记四篇同批。
 
 ## 整合验证
 
@@ -51,7 +63,11 @@
 
 ## 延期项（明确不做，不无限新增阻塞）
 
-- 全面初始化失败清理、`LessonStore` 读性能、插件 API 的真实第二实现方验证（S3 provisional 解除）。
+- 全面初始化失败清理、`LessonStore` 读性能。插件 API 已有真实第二实现方（systemone 全量 dogfood 声明面）；
+  `PLUGIN_API_VERSION` 仍 provisional=1，转正与插件分发/更新治理属独立决策。
+- recall 移植为外部插件的评估结论：systemone 已证明声明面完整（配置/记账/脱敏/工具风险/顺序/run_context/
+  manifest 全部 dogfood）；recall 移植改变的是治理（默认装载、配置键转正）而非平面能力，收益/风险比低，
+  暂不移植，保留为将来"内建能力迁出"的样板候选。
 - prefix-cache 优化（任务板版本化 + 图片批量折叠）；按任务复杂度的动态模型路由。
 - marks `op=blocked` **不计划**直接用于执行门控（当前纯展示）；若未来要启用属于独立决策，需先完成真机验证
   与授权。成功先例回注（exemplar 三闸达标前不开工）。

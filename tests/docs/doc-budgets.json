@@ -9,7 +9,7 @@
   "_recalibration_plugin_plane_round4": "plugin-plane v2 Round 4 (first-party systemone plugin): pages/plugins.md 3400 -> 3600 (2026-09-25). The page gained the first-party plugin entry — its four seams (provider family, shadow safety review with the additive-veto condition, the readonly wait_for_stable tool, the advisory governor), the disabled-by-default manifest entry and where its keys/limitations live — plus the corrected index.json line (it now registers the in-repo plugin instead of claiming an empty community index). 3600 is the post-edit size (3511 words) rounded up to the nearest hundred, the same convention as the Round 1/2/3 bumps. tests/AGENTS.md absorbed the new tests/plugins/ domain line by tightening its own wording (745 words, inside the unchanged 750 subtree cap).",
   "AGENTS.md": 2200,
   "README.md": 1900,
-  "docs/future-roadmap.md": 1700,
+  "docs/future-roadmap.md": 2100,
   "pages/AGENTS.md": 750,
   "phone_agent/v2/AGENTS.md": 750,
   "phone_agent/web/AGENTS.md": 750,
@@ -25,5 +25,6 @@
   "pages/providers.md": 4200,
   "pages/quickstart.md": 800,
   "pages/roadmap.md": 1500,
-  "pages/safety.md": 2000
+  "pages/safety.md": 2000,
+  "_recalibration_plugin_plane_round5": "docs/future-roadmap.md 1700→2100: 插件平面 v2 已落地条目 + 延期项修订（实测 2032，向上取整百）"
 }
