@@ -248,6 +248,36 @@ def test_hard_mode_interrupt_table_follows_declared_actuation() -> None:
     }
 
 
+def test_hard_mode_interrupt_table_is_unchanged_for_the_real_builtin_registry() -> None:
+    """Round 3 widened the rule; every built-in declares, so its table is 1:1.
+
+    The registry here is the one a real harness assembly builds (built-in tool
+    objects registered as core tools, their risk read back from the stamp),
+    which is the set the pre-declaration gate table was derived from.
+    """
+
+    from phone_agent.v2.events import EventBus
+    from phone_agent.v2.tools import build_base_tools
+    from tests.v2.doubles.config import FakeConfig
+    from tests.v2.doubles.session import FakePhoneSession
+
+    ctx = CapabilityAssemblyContext({"event_bus": EventBus()})
+    for index, tool in enumerate(build_base_tools(FakePhoneSession(), FakeConfig())):
+        ctx.register_core_tool(tool, order=index)
+
+    listener = build_hitl_middleware(
+        session=None,
+        config=SimpleNamespace(safety_mode="hard"),
+        risks=ctx.service("tool_risk_registry"),
+    )
+
+    assert set(listener.interrupt_on) == {
+        *LEGACY_ACTUATION_GATED_TOOLS,
+        "ask_user",
+        "take_over",
+    }
+
+
 def test_invalid_risk_value_fails_visible() -> None:
     ctx = CapabilityAssemblyContext()
 
@@ -461,14 +491,16 @@ def test_builtin_only_assembly_announces_nothing(capsys) -> None:
     assert seen == []
 
 
-def test_hard_mode_interrupt_table_does_not_cover_undeclared_tools(capsys) -> None:
-    """Locks today's behaviour, including the known gap.
+def test_hard_mode_interrupt_table_covers_undeclared_tools(capsys) -> None:
+    """Round 3 closes the gap this test used to document.
 
-    The ``hard`` interrupt table is built from *declared* actuation tools, so an
-    undeclared plugin tool is not interrupted there — the gap is scheduled for
-    Round 3 (closing it needs the assembled tool list, not just declarations).
-    The default ``wary``/``reviewer`` listener still fail-closes the same call
-    through :func:`classify_tool_call`, which this test pins alongside it.
+    Round 1 built the ``hard`` interrupt table from *declared* actuation tools
+    only, so an undeclared plugin tool was not interrupted there while
+    :func:`classify_tool_call` already fail-closed it to actuation — the table
+    was stricter than the classifier it gates.  The table is now "every
+    registered tool except the ones declared ``readonly``", so the two agree;
+    the warning flow keeps fail-closing the same call, which this test pins
+    alongside it.
     """
 
     ctx = CapabilityAssemblyContext()
@@ -490,9 +522,9 @@ def test_hard_mode_interrupt_table_does_not_cover_undeclared_tools(capsys) -> No
         session=None, config=SimpleNamespace(safety_mode="hard"), risks=risks
     )
 
-    # Only the declared actuation tool (ask_user/take_over ride the core control
-    # listener, not this one).
-    assert set(listener.interrupt_on) == {"declared_act"}
+    # Both the declared and the undeclared tool (ask_user/take_over ride the
+    # core control listener, not this one).
+    assert set(listener.interrupt_on) == {"declared_act", "undeclared_act"}
 
     # The warning flow classifies the undeclared tool fail-closed all the same.
     warn = build_safety_warning_listener(
@@ -503,6 +535,67 @@ def test_hard_mode_interrupt_table_does_not_cover_undeclared_tools(capsys) -> No
         lambda request: "executed",
     )
     assert blocked.status == "error"
+
+
+def test_hard_mode_interrupt_table_excludes_only_declared_readonly() -> None:
+    ctx = CapabilityAssemblyContext()
+
+    def apply(context: CapabilityAssemblyContext) -> None:
+        context.register_tool(SimpleNamespace(name="plugin_read"), risk="readonly")
+        context.register_tool(SimpleNamespace(name="plugin_act"), risk="actuation")
+        context.register_tool(SimpleNamespace(name="plugin_silent"))
+
+    _apply(ctx, "plug", apply)
+    listener = build_safety_hard_hitl_listener(
+        session=None,
+        config=SimpleNamespace(safety_mode="hard"),
+        risks=ctx.service("tool_risk_registry"),
+    )
+
+    assert set(listener.interrupt_on) == {"plugin_act", "plugin_silent"}
+    assert "plugin_read" not in listener.interrupt_on
+    assert callable(listener.interrupt_on["plugin_silent"]["when"])
+
+
+def test_hard_mode_interrupt_table_sees_tools_mounted_after_the_safety_cap() -> None:
+    """The safety capability mounts before plugin tools; the table must follow.
+
+    This is the fail-open hole the Round-1 note left open: a frozen table built
+    while the safety capability applies cannot know about a tool a later
+    capability (or plugin) registers, so a snapshot would classify the call in
+    ``wary`` mode but never interrupt it in ``hard``.
+    """
+
+    ctx = CapabilityAssemblyContext()
+    listener = build_safety_hard_hitl_listener(
+        session=None,
+        config=SimpleNamespace(safety_mode="hard"),
+        risks=ctx.service("tool_risk_registry"),
+    )
+    assert set(listener.interrupt_on) == set()
+
+    _apply(
+        ctx,
+        "late_plugin",
+        lambda context: context.register_tool(SimpleNamespace(name="late_tool")),
+    )
+    assert "late_tool" in listener.interrupt_on
+
+    # Release takes the name back out: interrupt coverage follows registration.
+    disabled = CapabilityRegistry()
+    disabled.register(CapabilitySpec("late_plugin", "Late", "off"))
+    assemble_capabilities(disabled, ctx)
+    assert "late_tool" not in listener.interrupt_on
+
+
+def test_legacy_hard_interrupt_table_keeps_the_gate_set_without_a_registry() -> None:
+    """``risks=None`` (direct library callers) has no registered list to widen."""
+
+    listener = build_safety_hard_hitl_listener(
+        session=None, config=SimpleNamespace(safety_mode="hard")
+    )
+
+    assert set(listener.interrupt_on) == set(LEGACY_ACTUATION_GATED_TOOLS)
 
 
 def test_core_tool_names_must_be_unique() -> None:

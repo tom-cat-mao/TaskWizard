@@ -5,6 +5,7 @@
   "_recalibration_plugin_plane": "plugin-plane v2 Round 1 (declaration plane): AGENTS.md 2100 -> 2200 and pages/plugins.md 2100 -> 2600 (2026-09-25). The P0 #18 row now carries the declaration-plane red line (declarations only classify/account, never allow, always fail-visible) because that is the wording a plugin author must be able to quote, and the Module Map gained v2/tool_risk.py (the built-in tool-risk declaration table). pages/plugins.md gained the declaration points themselves: register_tool(tool, risk=...), the fail-closed undeclared default, harness-owned service protection, register_pin_prefix, the --<name> plugin CLI commands, and the three legal CapabilitySpec.mode values. Both numbers are the post-edit size rounded up to the nearest hundred, the same convention as the pages/architecture.md step; pages/safety.md absorbed its contract change (declaration-driven classification, fail-closed undeclared default) inside its existing 1900.",
   "_subtree_agents_note": "子目录 AGENTS.md，DSH 层级：pages/AGENTS.md、phone_agent/v2/AGENTS.md、phone_agent/web/AGENTS.md 与 tests/AGENTS.md 是就近约束，沿用 DeepSeek Harness packages/AGENTS.md 的口径，各按 750 词上限校验。",
   "_recalibration_plugin_plane_round2": "plugin-plane v2 Round 2 (declaration plane, second batch): pages/plugins.md 2600 -> 3100 (2026-09-25). The page gained the three new declaration points — declared configuration keys (ctx.register_setting, its precedence chain and the read-only V2Config.plugin_settings mirror), declared accounting roles (register_usage_role, token vs calls and the budget boundary) and declared redaction literals (register_redaction, min-length guard, shared ownership) — plus the manifest [plugin.config] pass-through and the observe event's screen_hash. 3100 is the post-edit size (3033 words) rounded up to the nearest hundred, the same convention as the Round 1 bump. AGENTS.md (2177), pages/configuration.md (7191) and phone_agent/v2/AGENTS.md (735) absorbed their contract text inside their existing budgets.",
+  "_recalibration_plugin_plane_round3": "plugin-plane v2 Round 3 (run context and ordering): pages/plugins.md 3100 -> 3400 and pages/safety.md 1900 -> 2000 (2026-09-25). pages/plugins.md gained the two Runtime facts a plugin author now needs — the harness-owned read-only run_context service (run_id / actor_model fixed at assembly, goal only once a run starts, absent on the CLI maintenance path) and the before/after ordering hints (topological resolution, cycle and unknown-name failure, vacuous at a disabled target, coexistence with prepend=True) — plus the two field names in the CapabilitySpec list; pages/safety.md's classification paragraph now states that the hard-mode interrupt table covers every registered tool except the declared-readonly ones, resolved live. Both numbers are the post-edit size (3295 / 1961 words) rounded up to the nearest hundred, the same convention as the Round 1/2 bumps. AGENTS.md (2190) and phone_agent/v2/AGENTS.md (745) absorbed the declaration-list wording inside their existing budgets.",
   "AGENTS.md": 2200,
   "README.md": 1900,
   "docs/future-roadmap.md": 1700,
@@ -19,9 +20,9 @@
   "pages/evolution.md": 3600,
   "pages/index.md": 1100,
   "pages/memory.md": 4500,
-  "pages/plugins.md": 3100,
+  "pages/plugins.md": 3400,
   "pages/providers.md": 4200,
   "pages/quickstart.md": 800,
   "pages/roadmap.md": 1500,
-  "pages/safety.md": 1900
+  "pages/safety.md": 2000
 }

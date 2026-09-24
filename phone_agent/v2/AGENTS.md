@@ -27,11 +27,11 @@
   就是对模型的契约，改参数名或回执语义等于改 P0，须与 `pages/` 同批同步。
 - `middleware/`：`budget.py`、`compact.py`、`_tokens.py` 的预算与压缩表述有独立正文锚点，改前先读锚点。
 - **声明面**（[`tool_risk.py`](tool_risk.py) + [`capabilities.py`](capabilities.py)）：工具 `risk`、pin 前缀、
-  `mode`、配置键（[`settings.py`](settings.py)）、记账角色（[`usage_roles.py`](usage_roles.py)）与脱敏字面量
-  （[`redaction.py`](redaction.py)）都是声明，登记进装配期注册表；未声明按安全默认值处理（工具算 `actuation`），
-  声明只影响分类/记账/脱敏、不决定是否允许。装配结束会把未声明风险的工具点名
-  （stderr/trace/`capability/tools_undeclared`）。新增内建工具必须同批声明（表里缺名字即报错），新声明点必须
-  fail-visible。
+  `mode`、配置键（[`settings.py`](settings.py)）、记账角色（[`usage_roles.py`](usage_roles.py)）、脱敏字面量
+  （[`redaction.py`](redaction.py)）与 `before`/`after` 挂载顺序提示都是声明，登记进装配期注册表；未声明按安全
+  默认值处理（工具算 `actuation`），声明只影响分类/记账/脱敏/顺序、不决定是否允许。装配结束会把未声明风险的
+  工具点名（stderr/trace/`capability/tools_undeclared`）。新增内建工具必须同批声明（表里缺名字即报错），新声明
+  点必须 fail-visible。
 - `providers/`：网关差异（认证头、采样上限、流式协议、能力旗标）只在 builders 里翻译成协议参数，
   调用点不做分支（[P0 #22](../../AGENTS.md)）。
 - `runner.py`、`run_ipc.py`、`run_events.py` 是 Web 观察面：Web 进程不拥有设备访问、工具执行或工作流路由，

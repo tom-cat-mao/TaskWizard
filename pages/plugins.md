@@ -1,9 +1,9 @@
 # 插件开发
 
 插件是一个导出 `CapabilitySpec` 的 Python 模块（例如 `my-plugin/plugin.py`），与内建能力走同一装配层。
-`CapabilitySpec` 字段：`cap_id`、`title`、`mode`、`deps=()`、`apply=None`、`release=None`、
-`provides=None`。`mode` 只有 `off` / `shadow` / `on` 三个合法值，其余字符串装配期报错（内建把
-`safety_mode`、`finish_verify`、`dream_mode` 这类域内档位翻译成 `on`，状态不变）。
+`CapabilitySpec` 字段：`cap_id`、`title`、`mode`、`deps=()`、`before=()`、`after=()`、`apply=None`、
+`release=None`、`provides=None`。`mode` 只有 `off` / `shadow` / `on` 三个合法值，其余字符串装配期报错
+（内建把 `safety_mode`、`finish_verify`、`dream_mode` 这类域内档位翻译成 `on`，状态不变）。
 
 ```python
 from phone_agent.v2.capabilities import CapabilitySpec
@@ -30,9 +30,13 @@ CAPABILITY = CapabilitySpec(
 )
 ```
 
-`deps` 同时约束装配顺序与状态：依赖 off 或待定时本能力为 pending，装配时依赖先行。`provides` 与
-`ctx.register_service(name, value)` 配套，声明了服务却没有真正注册会在装配期报错。`ctx.on(...)` 会把监听器
-归属到当前 capability；正常 release 或 `apply` 失败时，装配层都会清理该监听器。
+`deps` 同时约束装配顺序与状态：依赖 off 或待定时本能力为 pending，装配时依赖先行。`before` / `after` 是
+**纯排序提示**：`after=("compact",)` 表示本能力排在 `compact` 之后 apply（它的监听器因此注册在后者内层），
+`before` 相反；装配期按注册顺序做一次确定性拓扑排序，提示互指成环、或与 `deps` 冲突、或指向未注册的能力名
+都在装配期报错，指向已关闭能力则视为无约束（`pending` 语义仍只由 `deps` 决定）。`ctx.on(..., prepend=True)`
+把单个监听器插到最外层，与排序提示并存。`provides` 与 `ctx.register_service(name, value)` 配套，声明了服务
+却没有真正注册会在装配期报错。`ctx.on(...)` 会把监听器归属到当前 capability；正常 release 或 `apply` 失败
+时，装配层都会清理该监听器。
 
 目录只需一个导出 `CAPABILITY` 的 `plugin.py`：
 
@@ -142,6 +146,13 @@ budget 的 tool 闸以 `prepend=True` 注册，位于 safety 之外；`safety_mo
   `=VALUE`）调用，名字按 `-`/`_` 归一，handler 收到解析后的命名空间、返回值即退出码。内建命令
   （`--dream`、`--learn-alias` 等）走同一张注册表，多个命令同时给出即报错；`--` 之后的 token 一律算任务
   文本，不会被匹配成命令；
+- **运行身份**（harness 发布的只读服务 `run_context`）：`ctx.service("run_context")` 返回一个 `RunContext`，
+  属性 `run_id`、`actor_model`、`goal`、`started`，另有 `require_goal()`。服务随装配上下文一起发布，
+  `run_id` 在任何 `apply` 里都可读；`actor_model` 在 actor 模型构建后填入（provider bootstrap 阶段挂载的
+  能力读到的是 `""`）；`goal` 只在 run 启动那一刻填入、且早于任何 run hook。未启动时 `goal` 为 `""`、
+  `started` 为 `False`，需要 goal 又不想自己判 `started` 的用 `require_goal()`，未启动直接报错。CLI
+  维护路径没有 run，该服务不存在（`None`）；Web runner 与 headless 走同一个构造函数，发布方式一致；服务
+  属 harness，能力不能覆盖；
 - **服务**（`register_service`）：进入共享服务命名空间、按 `cap_id` 记录 owner，release 时零残留；同名 key 被两个挂载能力注册即 fail-visible 冲突；harness 发布的服务（`event_bus` / `session` / `config` 及各工厂）登记为 harness owner，能力（含插件）不能覆盖，只能写入自己名下的 key；
 - **pin 前缀**（`register_pin_prefix`）：pinned 消息块的前缀从 `phone_agent/v2/pins.py` 取；声明后可用
   `pin_prefix_registry` 服务的 `pin_id(prefix, suffix)` 铸 id，未声明前缀会报错，harness 的

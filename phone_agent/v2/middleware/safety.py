@@ -23,7 +23,10 @@ Which tools the gate looks at comes from the **assembly declaration plane**
 service (``actuation`` / ``readonly``), and only ``actuation`` tools are
 classified.  Undeclared tools — the default for anything a plugin registers
 without saying otherwise — fail **closed** to ``actuation``, so staying silent
-can never buy a tool the observation-only fast path.  A caller that passes no
+can never buy a tool the observation-only fast path.  ``hard`` mode's interrupt
+table follows the same rule (:class:`ActuationInterruptTable`): every registered
+tool except the explicitly ``readonly`` ones, resolved live so tools mounted
+after the safety capability are covered as well.  A caller that passes no
 registry (direct library use, legacy integrations) keeps the pre-declaration
 gate set in :data:`LEGACY_ACTUATION_GATED_TOOLS`
 (``tap``/``long_press``/``type_text``/``launch_app``), which is exactly what the
@@ -57,7 +60,7 @@ carries no app inventory (documented deviation).
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -230,21 +233,67 @@ def _is_actuation(
     return str(risks.get(name, "actuation")).strip().lower() != "readonly"
 
 
-def _actuation_tool_names(risks: Mapping[str, str] | None) -> tuple[str, ...]:
-    """Every tool name the hard-mode interrupt table covers.
+class ActuationInterruptTable(Mapping[str, dict[str, Any]]):
+    """``hard``-mode ``interrupt_on`` table: every tool except declared-readonly ones.
 
-    With a registry these are the declared ``actuation`` names — undeclared
-    tools are not listed here; the warning flow still fail-closes them through
-    :func:`classify_tool_call`.  Without a registry the legacy gate set applies.
+    Membership is decided **live** against the ``tool_risk_registry`` — every
+    ``in``/``[]`` re-reads it — because the safety capability applies before the
+    tools that register later in the same assembly pass (capability tools and
+    plugin tools both).  A table snapshotted at build time would silently miss
+    all of them, which is exactly the fail-open inconsistency this replaces:
+    :func:`classify_tool_call` already treats an undeclared tool as
+    ``actuation`` (fail-closed), so the interrupt table must interrupt it too.
+    Only an explicit ``readonly`` declaration takes a name out of the table.
+
+    ``controls`` carries the mode-independent ``ask_user``/``take_over`` entries
+    verbatim.  With ``risks=None`` (direct library callers, no registry) the
+    legacy gate set stands, since there is no registered-tool list to enumerate.
     """
 
-    if risks is None:
-        return LEGACY_ACTUATION_GATED_TOOLS
-    return tuple(
-        name
-        for name, risk in risks.items()
-        if str(risk).strip().lower() != "readonly"
-    )
+    def __init__(
+        self,
+        risks: Mapping[str, str] | None,
+        *,
+        gate: Callable[[Any], bool],
+        controls: Mapping[str, Any] | None = None,
+    ) -> None:
+        self._risks = risks
+        self._gate = gate
+        self._controls = dict(controls or {})
+
+    def _covered(self) -> tuple[str, ...]:
+        if self._risks is None:
+            return LEGACY_ACTUATION_GATED_TOOLS
+        names = getattr(self._risks, "actuation_names", None)
+        if callable(names):
+            return tuple(names())
+        return tuple(
+            name
+            for name, risk in self._risks.items()
+            if str(risk).strip().lower() != "readonly"
+        )
+
+    def __contains__(self, name: object) -> bool:
+        key = str(name)
+        return key in self._controls or key in self._covered()
+
+    def __getitem__(self, name: str) -> dict[str, Any]:
+        key = str(name)
+        if key in self._controls:
+            return self._controls[key]
+        if key not in self._covered():
+            raise KeyError(name)
+        return {
+            "when": self._gate,
+            "allowed_decisions": ["approve", "reject"],
+        }
+
+    def __iter__(self) -> Iterator[str]:
+        yield from self._controls
+        yield from (name for name in self._covered() if name not in self._controls)
+
+    def __len__(self) -> int:
+        return len(set(self._controls) | set(self._covered()))
 
 
 def _normalize(text: str | None) -> str:
@@ -748,12 +797,16 @@ class ControlHitlListener:
 
     def __init__(
         self,
-        interrupt_on: dict[str, Any] | None = None,
+        interrupt_on: Mapping[str, Any] | None = None,
     ) -> None:
-        self.interrupt_on = interrupt_on or {
-            "ask_user": {"allowed_decisions": ["respond"]},
-            "take_over": {"allowed_decisions": ["approve", "reject"]},
-        }
+        self.interrupt_on: Mapping[str, Any] = (
+            interrupt_on
+            if interrupt_on is not None
+            else {
+                "ask_user": {"allowed_decisions": ["respond"]},
+                "take_over": {"allowed_decisions": ["approve", "reject"]},
+            }
+        )
 
     @staticmethod
     def _tool_call_id(request: Any) -> str:
@@ -854,29 +907,29 @@ def build_hitl_middleware(
     and external callers can still inspect ``listener.interrupt_on``.
 
     * ``ask_user`` / ``take_over`` always interrupt.
-    * Tools declared ``actuation`` interrupt for ``approve``/``reject`` only in
-      ``hard`` mode.  Without a ``risks`` mapping the legacy gate set is used.
+    * In ``hard`` mode every tool **except** one declared ``readonly`` interrupts
+      for ``approve``/``reject`` — an undeclared tool counts as actuation, the
+      same fail-closed default :func:`classify_tool_call` uses.  The table is
+      live (see :class:`ActuationInterruptTable`); with no ``risks`` mapping the
+      legacy gate set stands.
     """
 
     mode = _safety_mode(config)
-    interrupt_on: dict[str, Any] = {}
+    controls: dict[str, Any] = {
+        "ask_user": {"allowed_decisions": ["respond"]},
+        "take_over": {"allowed_decisions": ["approve", "reject"]},
+    }
+    if mode != "hard":
+        return ControlHitlListener(interrupt_on=controls)
 
-    if mode == "hard":
-        def _gate(req: Any) -> bool:
-            return classify_tool_call(
-                req, session, config, reviewer=None, risks=risks
-            ).should_gate
+    def _gate(req: Any) -> bool:
+        return classify_tool_call(
+            req, session, config, reviewer=None, risks=risks
+        ).should_gate
 
-        for tool in _actuation_tool_names(risks):
-            interrupt_on[tool] = {
-                "when": _gate,
-                "allowed_decisions": ["approve", "reject"],
-            }
-
-    interrupt_on["ask_user"] = {"allowed_decisions": ["respond"]}
-    interrupt_on["take_over"] = {"allowed_decisions": ["approve", "reject"]}
-
-    return ControlHitlListener(interrupt_on=interrupt_on)
+    return ControlHitlListener(
+        interrupt_on=ActuationInterruptTable(risks, gate=_gate, controls=controls)
+    )
 
 
 def build_control_hitl_middleware():
@@ -896,7 +949,9 @@ def build_safety_hard_hitl_listener(
     Unlike :func:`build_hitl_middleware`, this listener does **not** include
     ``ask_user``/``take_over``; those are handled by the core control listener.
     ``risks`` is the assembly-time declaration mapping; the interrupt table
-    covers exactly the declared ``actuation`` tools.
+    covers every registered tool except the ones declared ``readonly``, read
+    live so tools mounted after the safety capability (plugins included) are
+    covered too.
     """
 
     mode = _safety_mode(config)
@@ -906,13 +961,7 @@ def build_safety_hard_hitl_listener(
     def _gate(req: Any) -> bool:
         return classify_tool_call(req, session, config, reviewer=None, risks=risks).should_gate
 
-    interrupt_on: dict[str, Any] = {}
-    for tool in _actuation_tool_names(risks):
-        interrupt_on[tool] = {
-            "when": _gate,
-            "allowed_decisions": ["approve", "reject"],
-        }
-    return ControlHitlListener(interrupt_on=interrupt_on)
+    return ControlHitlListener(interrupt_on=ActuationInterruptTable(risks, gate=_gate))
 
 
 def build_capability_safety_listener(
@@ -963,6 +1012,7 @@ def register_default_safety_listener(
 
 
 __all__ = [
+    "ActuationInterruptTable",
     "ToolCallVerdict",
     "classify_tool_call",
     "is_sensitive_tool_call",

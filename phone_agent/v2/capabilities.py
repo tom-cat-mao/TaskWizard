@@ -27,6 +27,16 @@ on ``CapabilitySpec.manifest_config`` and is readable inside ``apply`` through
 :meth:`CapabilityAssemblyContext.plugin_config`, where it is also the tier that
 replaces the declared defaults of that capability's settings.
 
+Two more assembly-plane facts are declared here.  ``CapabilitySpec.before`` /
+``CapabilitySpec.after`` are **ordering hints** (G3): they say when a
+capability's ``apply`` (and therefore its listeners) runs relative to another
+one, are resolved by a deterministic topological pass at assembly time, and fail
+visibly on a hint naming an unregistered capability or on a cycle.  Unlike
+``deps`` they never gate a mount — a hint at a capability that is ``off`` is
+simply vacuous.  The run's identity travels as the harness-owned ``run_context``
+service (:class:`RunContext`), published by the agent at assembly and completed
+with the goal when the run starts.
+
 This is intentionally a static assembly layer.  Reconciliation is useful while
 building agents and in tests/consoles, but it does not mutate a compiled agent's
 tool table while a run is in progress.
@@ -34,7 +44,7 @@ tool table while a run is in progress.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import re
@@ -94,6 +104,95 @@ _RUN_HOOK_ORDER = {
         "dream": 90,
     },
 }
+# The harness-owned service carrying a run's identity (G2).
+RUN_CONTEXT_SERVICE = "run_context"
+
+
+class RunContext:
+    """Harness-owned identity of the run an agent is executing (G2).
+
+    Published as the ``run_context`` service so a capability or plugin reads the
+    run through the ordinary service plane instead of reaching into private
+    agent factories (``compact``'s memory-state provider, ``deliverable``'s
+    run-id factory, ...).  Each field is filled at the moment it first exists:
+
+    * :attr:`run_id` — fixed when the agent is assembled (`ThinPhoneAgent`
+      mints one or takes the runner's), so an ``apply`` hook can read it;
+    * :attr:`actor_model` — the reference the actor model was built from, filled
+      once that model exists; ``""`` before then and when no ref resolved;
+    * :attr:`goal` — the task text, which exists only once ``run()`` starts.
+
+    Lifecycle, and what a consumer must handle:
+
+    * outside a run-assembling harness the service is **absent** — the CLI
+      maintenance context of ``main_v2.py`` has no run, so
+      ``ctx.service("run_context")`` is ``None`` there;
+    * a run-assembling harness publishes it with the assembly context itself,
+      i.e. before the provider bootstrap pass, so even a plugin mounted in that
+      pass reads the real ``run_id``;
+    * between assembly and the first ``run()`` the service exists but
+      :attr:`started` is ``False``, :attr:`goal` is ``""`` and
+      :attr:`actor_model` may still be ``""`` (bootstrap-pass readers);
+    * ``run()`` records the goal *before* any run hook or listener fires, so
+      everything reached through the run itself sees the real task.
+
+    An empty goal therefore never means "a run with an empty task": it means no
+    run has started on this context.  A consumer that needs the goal without
+    checking :attr:`started` should call :meth:`require_goal`, which turns the
+    misuse into a visible ``RuntimeError`` instead of a silently empty prompt.
+    """
+
+    def __init__(self, run_id: str, *, actor_model: str = "") -> None:
+        self._run_id = str(run_id)
+        self._actor_model = str(actor_model or "")
+        self._goal = ""
+        self._started = False
+
+    @property
+    def run_id(self) -> str:
+        """Stable id of this run (also the trace/thread id)."""
+
+        return self._run_id
+
+    @property
+    def actor_model(self) -> str:
+        """The actor's model reference (``""`` when none resolved yet)."""
+
+        return self._actor_model
+
+    @property
+    def goal(self) -> str:
+        """The task text; ``""`` until a run starts (see :attr:`started`)."""
+
+        return self._goal
+
+    @property
+    def started(self) -> bool:
+        """Whether a run has begun on this context (``goal`` is real)."""
+
+        return self._started
+
+    def require_goal(self) -> str:
+        """Return :attr:`goal`, or raise when no run has started yet."""
+
+        if not self._started:
+            raise RuntimeError(
+                "run_context.goal is not set: no run has started on this context "
+                "(read it from a run hook or a run-time listener, or gate on "
+                "run_context.started)"
+            )
+        return self._goal
+
+    def _set_actor_model(self, actor_model: str) -> None:
+        """Fill the actor's model reference (harness-only, after the build)."""
+
+        self._actor_model = str(actor_model or "")
+
+    def _begin(self, goal: str) -> None:
+        """Record the goal of the run starting now (harness-only)."""
+
+        self._goal = str(goal)
+        self._started = True
 
 
 @runtime_checkable
@@ -223,6 +322,23 @@ class ToolRiskRegistry(Mapping[str, str]):
             if entries[-1][1] is None
         }
 
+    def actuation_names(self) -> tuple[str, ...]:
+        """Every registered tool the classifier must treat as ``actuation``.
+
+        Declared ``actuation`` **plus** every undeclared registration (the
+        fail-closed default); only an explicit ``readonly`` declaration takes a
+        name out.  The ``hard``-mode interrupt table is built from this set, so a
+        tool that stays silent interrupts exactly like one that declares
+        ``actuation``.  Released capabilities withdraw their entries, so a tool
+        that is gone no longer appears.
+        """
+
+        return tuple(
+            name
+            for name, entries in self._declared.items()
+            if str(entries[-1][1] or "actuation").strip().lower() != "readonly"
+        )
+
     def __getitem__(self, name: str) -> str:
         risk = self.risk_for(name)
         if risk is None:
@@ -238,7 +354,7 @@ class ToolRiskRegistry(Mapping[str, str]):
 
 @dataclass(frozen=True)
 class CapabilitySpec:
-    """Stable identity, configured mode, dependencies, and lifecycle hooks."""
+    """Stable identity, configured mode, dependencies, order hints, hooks."""
 
     cap_id: str
     title: str
@@ -256,6 +372,15 @@ class CapabilitySpec:
     manifest_config: Mapping[str, Any] = field(
         default_factory=dict, repr=False, compare=False, hash=False
     )
+    # Ordering hints (G3): ``after=("compact",)`` runs this capability's apply
+    # after ``compact``'s, ``before=("x",)`` before it — and because listeners
+    # register during apply, that also fixes their relative bus order.  Hints
+    # order only: unlike ``deps`` they never gate the mount, so a hint at a
+    # capability that is off is vacuous, and a hint naming a capability that is
+    # not registered at all is a fail-visible assembly error.  Ties (and every
+    # capability without hints) keep the registry's registration order.
+    before: tuple[str, ...] = ()
+    after: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _CAPABILITY_ID.fullmatch(self.cap_id):
@@ -280,6 +405,23 @@ class CapabilitySpec:
             raise TypeError(
                 "capability manifest_config must be a mapping of declared "
                 f"[plugin.config] values, got {type(self.manifest_config).__name__}"
+            )
+        for hint, label in ((self.before, "before"), (self.after, "after")):
+            for target in hint:
+                if not _CAPABILITY_ID.fullmatch(target):
+                    raise ValueError(
+                        f"invalid {label} ordering hint: {target!r} "
+                        "(expected a capability id)"
+                    )
+                if target == self.cap_id:
+                    raise ValueError(
+                        f"capability {self.cap_id!r} cannot order itself {label} itself"
+                    )
+        contradictory = set(self.before) & set(self.after)
+        if contradictory:
+            raise ValueError(
+                f"capability {self.cap_id!r} declares "
+                f"{', '.join(sorted(contradictory))} both before and after itself"
             )
         if self.apply is not None and not callable(self.apply):
             raise TypeError("capability apply hook must be callable")
@@ -385,7 +527,9 @@ class CapabilityAssemblyContext:
     ``usage_role_registry`` (declared accounting roles) and
     ``redaction_registry`` (declared egress redaction literals).  All start
     harness-owned, so a capability can read them but not silently replace them
-    (see :meth:`register_service`).
+    (see :meth:`register_service`).  A run-assembling harness adds
+    ``run_context`` there too (:class:`RunContext`); the CLI maintenance context
+    has no run and publishes none.
     """
 
     def __init__(self, services: Mapping[str, Any] | None = None) -> None:
@@ -1346,13 +1490,91 @@ def _report_undeclared_tools(ctx: CapabilityAssemblyContext) -> None:
         pass
 
 
+def _mount_order(
+    specs: Sequence[CapabilitySpec], active: Collection[str]
+) -> list[CapabilitySpec]:
+    """Order the capabilities that will mount this pass (G3).
+
+    Edges come from three declarations: ``deps`` (gating — and, since a
+    dependency is mounted first, ordering), ``after`` and ``before``.  All edges
+    are resolved together by one topological pass whose tie-break is
+    registration order, so a capability without hints keeps exactly the position
+    it had before hints existed.
+
+    Fail-visible, and only for the capabilities that actually mount (``active``):
+    a hint naming a capability that is not registered raises, and a cycle among
+    the mounting capabilities raises.  A hint at a registered capability that is
+    not mounting (``off``/``pending``) is vacuous, and a capability that is off
+    is not validated at all — turning a capability off must be able to un-break
+    an assembly that its hints would fail.
+    """
+
+    registered = {spec.cap_id: spec for spec in specs}
+    position = {spec.cap_id: index for index, spec in enumerate(specs)}
+    edges: dict[str, set[str]] = {cap_id: set() for cap_id in active}
+    indegree: dict[str, int] = dict.fromkeys(active, 0)
+
+    def add_edge(before_id: str, after_id: str) -> None:
+        if before_id == after_id or after_id in edges[before_id]:
+            return
+        edges[before_id].add(after_id)
+        indegree[after_id] += 1
+
+    def require_registered(owner: str, target: str, label: str) -> None:
+        if target not in registered:
+            raise ValueError(
+                f"capability {owner!r} declares {label}=({target!r},) but no "
+                "capability with that id is registered"
+            )
+
+    for spec in specs:
+        if spec.cap_id not in active:
+            continue
+        for dependency in spec.deps:
+            if dependency in active:
+                add_edge(dependency, spec.cap_id)
+        for target in spec.after:
+            require_registered(spec.cap_id, target, "after")
+            if target in active:
+                add_edge(target, spec.cap_id)
+        for target in spec.before:
+            require_registered(spec.cap_id, target, "before")
+            if target in active:
+                add_edge(spec.cap_id, target)
+
+    ready = [
+        spec.cap_id
+        for spec in specs
+        if spec.cap_id in active and indegree[spec.cap_id] == 0
+    ]
+    ordered: list[CapabilitySpec] = []
+    while ready:
+        cap_id = ready.pop(0)
+        ordered.append(registered[cap_id])
+        for successor in edges[cap_id]:
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                ready.append(successor)
+        ready.sort(key=position.__getitem__)
+
+    if len(ordered) != len(active):
+        remaining = sorted(
+            set(active) - {spec.cap_id for spec in ordered}, key=position.__getitem__
+        )
+        raise ValueError(
+            "capability ordering is unsatisfiable: deps/ordering hints form a "
+            "cycle among " + ", ".join(remaining)
+        )
+    return ordered
+
+
 def assemble_capabilities(
     registry: CapabilityRegistry, ctx: CapabilityAssemblyContext
 ) -> CapabilityAssemblyContext:
     """Reconcile ``ctx`` to active/shadow specs using a cap-id/mode diff.
 
     Removed and changed-mode capabilities release first; changed/new specs then
-    apply in registry order.  ``pending`` and ``off`` specs never apply.
+    apply in mount order.  ``pending`` and ``off`` specs never apply.
     """
 
     if not isinstance(registry, CapabilityRegistry):
@@ -1367,22 +1589,7 @@ def assemble_capabilities(
         for cap_id, row in rows.items()
         if row["state"] in {"active", "shadow"}
     }
-    ordered_specs: list[CapabilitySpec] = []
-    pending = list(registry.specs())
-    ordered_ids: set[str] = set()
-    while pending:
-        ready = [
-            spec
-            for spec in pending
-            if all(dep not in desired or dep in ordered_ids for dep in spec.deps)
-        ]
-        if not ready:
-            ordered_specs.extend(pending)
-            break
-        for spec in ready:
-            ordered_specs.append(spec)
-            ordered_ids.add(spec.cap_id)
-            pending.remove(spec)
+    ordered_specs = _mount_order(registry.specs(), set(desired))
     ctx._capability_order = {
         spec.cap_id: index for index, spec in enumerate(ordered_specs)
     }
@@ -1503,6 +1710,12 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
                 getattr(config, "boundary_compact_mode", "shadow"), default="shadow"
             ),
             deps=("compact",),
+            # The handler mounts *on top of* the compact instance (it folds
+            # through it and sits inside its ``model/pre_request`` listener), so
+            # compact's apply must have run first.  ``deps`` already enforces
+            # that as a side effect of gating; the ordering hint declares it as
+            # an ordering fact in its own right, resolved by ``_mount_order``.
+            after=("compact",),
             apply=_owned_apply("boundary_compact", _apply_boundary_compact),
             release=_owned_release("boundary_compact"),
         ),
@@ -1566,12 +1779,14 @@ __all__ = [
     "CAPABILITY_MODES",
     "HARNESS_OWNER",
     "PLUGIN_API_VERSION",
+    "RUN_CONTEXT_SERVICE",
     "CapabilityAssemblyContext",
     "CapabilityContext",
     "CapabilityRegistry",
     "CapabilitySpec",
     "MiddlewareReplacement",
     "PromptBlock",
+    "RunContext",
     "ToolRisk",
     "ToolRiskRegistry",
     "assemble_capabilities",
