@@ -1,0 +1,10 @@
+# 项目级插件清单（user 级在 ~/.taskwizard/profile.toml，同名条目项目级优先）。
+#
+# 登记不等于启用：enabled = false 的条目不会被加载，插件代码一行都不会执行。
+# systemone 是一等插件（plugins/systemone/），默认关闭；启用前先准备后端
+# （kev 本机 server 或 jev 云端 TYPESAFE_API_KEY），步骤见插件自带 README。
+
+[[plugin]]
+name = "systemone"
+enabled = false
+path = "plugins/systemone"
