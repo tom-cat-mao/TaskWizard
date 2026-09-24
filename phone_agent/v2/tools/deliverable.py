@@ -18,6 +18,8 @@ from typing import Callable
 
 from langchain_core.tools import StructuredTool
 
+from phone_agent.v2.tool_risk import declare_builtin_risks
+
 MAX_DOCUMENT_BYTES = 256 * 1024
 _RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
@@ -185,10 +187,12 @@ def make_deliverable_tools(
             pass
         return f"OK. 已更新文档：{target}（{len(payload)} bytes）"
 
-    return [
-        StructuredTool.from_function(write_document, parse_docstring=True),
-        StructuredTool.from_function(update_document, parse_docstring=True),
-    ]
+    return declare_builtin_risks(
+        [
+            StructuredTool.from_function(write_document, parse_docstring=True),
+            StructuredTool.from_function(update_document, parse_docstring=True),
+        ]
+    )
 
 
 __all__ = ["MAX_DOCUMENT_BYTES", "make_deliverable_tools"]

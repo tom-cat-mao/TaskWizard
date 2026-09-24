@@ -24,6 +24,7 @@ from phone_agent.v2.obs_archive import (
     SEARCH_LIMIT_DEFAULT,
     ObsArchiveError,
 )
+from phone_agent.v2.tool_risk import declare_builtin_risks
 
 _READ_ONLY_NOTE = (
     "历史证据，只读；帧内 mark 已失效（渲染为 历史:<id>（已失效）），"
@@ -149,10 +150,12 @@ def make_obs_archive_tools(session: Any, archive: Any) -> list[StructuredTool]:
             )
         return "\n".join(lines)
 
-    return [
-        StructuredTool.from_function(recall_screen, parse_docstring=True),
-        StructuredTool.from_function(search_screens, parse_docstring=True),
-    ]
+    return declare_builtin_risks(
+        [
+            StructuredTool.from_function(recall_screen, parse_docstring=True),
+            StructuredTool.from_function(search_screens, parse_docstring=True),
+        ]
+    )
 
 
 __all__ = ["make_obs_archive_tools"]

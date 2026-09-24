@@ -537,12 +537,15 @@ def _mount_context(mode: str):
     config = FakeConfig(boundary_compact_mode=mode)
     session = FakeSession(event_bus=bus)
     compact = StubCompact(result=None)
+    # The stub is injected through the factory, not by pre-seeding
+    # ``compact_instance``: the assembly context marks harness-published
+    # services as harness-owned, and the ``compact`` capability owns that key
+    # itself (G6).  All assertions below are unchanged.
     ctx = CapabilityAssemblyContext(
         {
             "event_bus": bus,
             "session": session,
             "config": config,
-            "compact_instance": compact,
             "compact_middleware_factory": lambda **_kw: compact,
         }
     )

@@ -2,7 +2,8 @@
 
 插件是一个导出 `CapabilitySpec` 的 Python 模块（例如 `my-plugin/plugin.py`），与内建能力走同一装配层。
 `CapabilitySpec` 字段：`cap_id`、`title`、`mode`、`deps=()`、`apply=None`、`release=None`、
-`provides=None`。
+`provides=None`。`mode` 只有 `off` / `shadow` / `on` 三个合法值，其余字符串装配期报错（内建把
+`safety_mode`、`finish_verify`、`dream_mode` 这类域内档位翻译成 `on`，状态不变）。
 
 ```python
 from phone_agent.v2.capabilities import CapabilitySpec
@@ -99,6 +100,7 @@ Web 进程没有插件加载路径，决定是否激活的是 runner 装配阶�
 | 事件 | 类型 | 返回契约 |
 |---|---|---|
 | `run/start` / `run/end` / `observe` / `app/launched` / `taskdoc/completed` / `model/post_request` / `agent/after` | emit | 忽略 |
+| `capability/tools_undeclared` | emit | 忽略；未声明 `risk` 的工具装配期点名一次（另发 stderr/trace），payload 为 `{"tools", "owners"}`，分类行为不变 |
 | `tool/pre_execute` | 洋葱 | 与 `tool/execute` 同形；已定义、保留并导出，当前没有生产代码 emit |
 | `tool/execute` | 洋葱 | `next(request)` 的结果，或返回 `REJECT` 短路（桥转成"已拦截"ToolMessage） |
 | `model/pre_request` | 洋葱 | 返回变换后的完整消息列表；插件**不得**返回 `RemoveMessage`，也不要用 `jump_to` 做流程控制。桥接器对历史形态（含 `jump_to:"end"` 的 dict）保持宽容兼容，`JUMP_END` 是 core 熔断用的哨兵——兼容不等于推荐用法 |
@@ -126,11 +128,21 @@ budget 的 tool 闸以 `prepend=True` 注册，位于 safety 之外；`safety_mo
 
 除监听器外，`apply(ctx)` 里还可以挂：
 
-- **工具**（`register_tool`，模型可见）：同名工具覆盖 baseline，release 后 baseline 回到原位；
+- **工具**（`register_tool(tool, risk=...)`，模型可见）：同名工具覆盖 baseline，release 后 baseline 回到原位；
+  同一能力重名、或两个挂载能力抢同一名字都在装配期报错。`risk` 取 `actuation`（进安全分类器）或
+  `readonly`（只读、不判定），省略时读工具自带的 `metadata["risk"]`（内建工具在 builder 里自声明）；
+  **未声明按 `actuation` 分类（fail-closed）**，所以沉默换不到只读通道。装配结束时未声明的工具会被点名
+  （stderr/trace/`capability/tools_undeclared`），提醒补声明；
 - **提示块**（`add_prompt_block`）：只有 `system_suffix` 与 `system_message` 两种 placement，provider 可返回裸字符串（按 `system_message` 处理）；
 - **run hooks**（`add_run_hook`，相位 `start`/`end`）：内建排序 start 为 taskdoc 10 → app_kb 20 → experience 35 → recall 40，end 为 experience 40 → recall 50 → dream 90，未列出的 owner 默认 50、同序按注册先后；
-- **CLI 子命令**（`add_cli_command`）；
-- **服务**（`register_service`）：进入共享服务命名空间、按 `cap_id` 记录 owner，release 时零残留；同名 key 被两个挂载能力注册即 fail-visible 冲突；
+- **CLI 子命令**（`add_cli_command`）：能力在装配期注册名字与 handler，维护路径用 `--<name>`（可带
+  `=VALUE`）调用，名字按 `-`/`_` 归一，handler 收到解析后的命名空间、返回值即退出码。内建命令
+  （`--dream`、`--learn-alias` 等）走同一张注册表，多个命令同时给出即报错；`--` 之后的 token 一律算任务
+  文本，不会被匹配成命令；
+- **服务**（`register_service`）：进入共享服务命名空间、按 `cap_id` 记录 owner，release 时零残留；同名 key 被两个挂载能力注册即 fail-visible 冲突；harness 发布的服务（`event_bus` / `session` / `config` 及各工厂）登记为 harness owner，能力（含插件）不能覆盖，只能写入自己名下的 key；
+- **pin 前缀**（`register_pin_prefix`）：pinned 消息块的前缀从 `phone_agent/v2/pins.py` 取；声明后可用
+  `pin_prefix_registry` 服务的 `pin_id(prefix, suffix)` 铸 id，未声明前缀会报错，harness 的
+  `__taskdoc__` / `__compact__` 不许被能力认领；
 - `ctx.on(..., prepend=True)` 把监听器插到最外层，返回的 disposer 幂等可重复调用。
 
 core 侧另有 `register_core_middleware` / `register_core_tool` / `add_core_run_hook`：同一有序集合、owner 为
@@ -139,7 +151,8 @@ core 侧另有 `register_core_middleware` / `register_core_tool` / `add_core_run
 （如 `register_api_builder` 的传输）同样不被 release 管理，需自行 `ctx.on_dispose` 清理。
 
 跨模块共享的 pinned id 前缀从 `phone_agent/v2/pins.py` 导入（`TASKDOC_ID_PREFIX`、`COMPACT_ID_PREFIX`），不要
-硬编码字符串。
+硬编码字符串；插件要自己的 pinned 块时先 `ctx.register_pin_prefix("__my_plugin__")` 认领（形状
+`__小写标识符__`），再经 `pin_prefix_registry.pin_id(...)` 铸 id。当前折叠保护仍只认两个内建前缀。
 
 provider 侧还有可选的模型上下文支持接缝：自定义 API builder 用 `bind_context_support` 挂 profile/estimate/
 prepare/usage 支持对象，缓存参数白名单见[模型提供方与路由](providers.md#context-support)。
@@ -147,6 +160,11 @@ prepare/usage 支持对象，缓存参数白名单见[模型提供方与路由](
 ## 装配契约 {#capability-mount}
 
 `phone_agent/v2/capabilities.py` 是唯一装配器：十三个内建能力（providers、taskdoc、safety、budget、compact、boundary_compact、finish_verify、deliverable、app_kb、dream、experience、recall、obs_archive）经五条接缝挂载——`register_middleware`、`register_tool`、`add_prompt_block`、`add_run_hook`、`add_cli_command`；`register_service` 是第六接缝，把能力服务发布进 harness 服务命名空间。内建策略全部是事件总线监听器，因此策略顺序由注册顺序决定。
+
+除挂载外，装配上下文还是**声明面**：工具的 `risk`、pin 前缀、能力 `mode` 在装配期登记进
+`tool_risk_registry` / `pin_prefix_registry` 服务（`ctx.service(...)` 可读），缺失声明按安全默认值处理
+（工具算 `actuation`）。重复声明、非法值、覆盖 harness 服务都在装配期报错。声明只决定“是否被分类 /
+记账”，不决定“是否被允许”，也不提供任何放行开关。
 
 - **core 监听器顺序**：见上表；插件在能力链之后注册，因此插件的 `tool/execute` 监听器排在 safety 之内；
 - **归属与释放**：`ctx.on` / `ctx.on_dispose` 把订阅与清理绑定到当前 capability。`release` 先反序跑清理回调，再摘除该能力注册的中间件、工具、提示块、run hooks、CLI 命令与服务；正常模式变更在该 release 之后仍会 apply 新能力，只有在清理报错时才不再替换<!-- allow:不再 -->；

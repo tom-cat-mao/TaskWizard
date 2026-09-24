@@ -79,6 +79,16 @@ Payload contracts for the plugin events:
     is a terminal state summary containing ``run_id`` and the final
     ``messages``.
 
+``CAPABILITY_TOOLS_UNDECLARED`` / ``"capability/tools_undeclared"``
+    Observed with :meth:`EventBus.emit` at the end of an assembly pass, once,
+    and only when at least one registered tool carries no risk declaration.
+    Payload is ``{"tools": [<tool names>], "owners": {<tool name>: <owner>}}``
+    — never tool arguments, paths or screenshots.  Classification is unaffected
+    (an undeclared tool stays fail-closed as ``actuation``); this event exists so
+    plugin authors learn the names at assembly time instead of in a run trace.
+    The same list is also printed to stderr and recorded through the session's
+    ``resolution_trace_recorder`` when the harness provides one.
+
 ``REJECT``
     Policy-rejection sentinel for waterfall short-circuits.
 
@@ -106,6 +116,7 @@ MODEL_REQUEST = "model/request"
 MODEL_POST_REQUEST = "model/post_request"
 TOOL_EXECUTE = "tool/execute"
 AGENT_AFTER = "agent/after"
+CAPABILITY_TOOLS_UNDECLARED = "capability/tools_undeclared"
 
 _EVENT_RE = re.compile(r"^[a-z]+/[a-z_]+$")
 _RESERVED_EVENTS = frozenset(
@@ -121,6 +132,7 @@ _RESERVED_EVENTS = frozenset(
         MODEL_POST_REQUEST,
         TOOL_EXECUTE,
         AGENT_AFTER,
+        CAPABILITY_TOOLS_UNDECLARED,
     }
 )
 

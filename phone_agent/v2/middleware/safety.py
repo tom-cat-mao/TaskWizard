@@ -18,6 +18,18 @@ the same three-layer detection cascade — broad *recall* → optional *reviewer
   ``approve``/``reject`` (for unattended runs). No warning middleware.
 * ``off``: no gate at all.
 
+Which tools the gate looks at comes from the **assembly declaration plane**
+(P0 #18): every tool carries a declared risk in the ``tool_risk_registry``
+service (``actuation`` / ``readonly``), and only ``actuation`` tools are
+classified.  Undeclared tools — the default for anything a plugin registers
+without saying otherwise — fail **closed** to ``actuation``, so staying silent
+can never buy a tool the observation-only fast path.  A caller that passes no
+registry (direct library use, legacy integrations) keeps the pre-declaration
+gate set in :data:`LEGACY_ACTUATION_GATED_TOOLS`
+(``tap``/``long_press``/``type_text``/``launch_app``), which is exactly what the
+built-in tools declare, so harness-assembled runs are byte-for-byte identical to
+the pre-declaration behaviour.
+
 Detection cascade (unchanged from S2 §3.1)::
 
     recall(policy vocab / password box / self-declaration)
@@ -45,6 +57,7 @@ carries no app inventory (documented deviation).
 from __future__ import annotations
 
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -85,16 +98,21 @@ SENSITIVE_APP_KEYWORDS: tuple[str, ...] = (
     "转账",
 )
 
-# Tools that participate in the HITL safety gate. All except take_over/ask_user
-# only interrupt when the classifier gates the call (via ``when``). launch_app
-# stays here so reviewer mode can still judge a sensitive-app launch, but its
-# candidates never reach the hard gate (§3.6).
-ACTUATION_GATED_TOOLS: tuple[str, ...] = (
+# The pre-declaration gate set.  It is the **compat fallback** for callers that
+# pass no risk registry (direct library calls, legacy integrations, tests) and
+# stays byte-for-byte what the built-in tools declare through the assembly seam
+# (``phone_agent/v2/tool_risk.py``).  Harness-assembled runs always carry the
+# registry, where undeclared tools fail closed to actuation.
+LEGACY_ACTUATION_GATED_TOOLS: tuple[str, ...] = (
     "tap",
     "long_press",
     "type_text",
     "launch_app",
 )
+
+# Backward-compatible alias: existing importers keep working, new code should
+# read the declaration plane instead of naming tools.
+ACTUATION_GATED_TOOLS: tuple[str, ...] = LEGACY_ACTUATION_GATED_TOOLS
 
 # --- irreversible-commit vocabulary (S2 §3.4) ------------------------------
 # A hard gate requires a COMMIT term AND an IRREVERSIBLE OBJECT to co-occur
@@ -194,6 +212,39 @@ def _safety_mode(config: Any | None) -> str:
     mode = getattr(config, "safety_mode", None) or "wary"
     mode = str(mode).strip().lower()
     return mode if mode in {"off", "wary", "hard", "reviewer"} else "wary"
+
+
+def _is_actuation(
+    name: str, risks: Mapping[str, str] | None
+) -> bool:
+    """Whether ``name`` is routed through the actuation risk classifier.
+
+    Lookup order (P0 #18 declaration plane): the assembly-time
+    ``tool_risk_registry`` declaration first; an undeclared tool fails closed to
+    ``actuation``, so silence never skips classification.  ``risks=None`` keeps
+    the pre-declaration gate set for direct library callers.
+    """
+
+    if risks is None:
+        return name in LEGACY_ACTUATION_GATED_TOOLS
+    return str(risks.get(name, "actuation")).strip().lower() != "readonly"
+
+
+def _actuation_tool_names(risks: Mapping[str, str] | None) -> tuple[str, ...]:
+    """Every tool name the hard-mode interrupt table covers.
+
+    With a registry these are the declared ``actuation`` names — undeclared
+    tools are not listed here; the warning flow still fail-closes them through
+    :func:`classify_tool_call`.  Without a registry the legacy gate set applies.
+    """
+
+    if risks is None:
+        return LEGACY_ACTUATION_GATED_TOOLS
+    return tuple(
+        name
+        for name, risk in risks.items()
+        if str(risk).strip().lower() != "readonly"
+    )
 
 
 def _normalize(text: str | None) -> str:
@@ -340,6 +391,7 @@ def classify_tool_call(
     *,
     reviewer: Callable[[str, str], bool] | None = None,
     policy: SafetyPolicyRegistry = DEFAULT_SAFETY_POLICY,
+    risks: Mapping[str, str] | None = None,
 ) -> ToolCallVerdict:
     """Classify one tool call into a :class:`ToolCallVerdict` (S2 §3.2).
 
@@ -347,6 +399,11 @@ def classify_tool_call(
     is *reversible* (safe, no gate). It is only consulted for soft candidates in
     ``reviewer`` mode. ``take_over`` / ``ask_user`` are control interrupts, not
     safety, and are handled directly by :func:`build_hitl_middleware`.
+
+    ``risks`` is the assembly-time tool-risk declaration mapping (the
+    ``tool_risk_registry`` service). A tool that declares ``readonly`` never
+    enters the classifier; an **undeclared** tool is treated as ``actuation``
+    (fail-closed). ``None`` keeps the legacy gate set for direct callers.
     """
 
     name, args = _extract_call(request)
@@ -354,7 +411,7 @@ def classify_tool_call(
 
     if mode == "off":
         return ToolCallVerdict(False, "none", None, "mode_off")
-    if name not in ACTUATION_GATED_TOOLS:
+    if not _is_actuation(name, risks):
         return ToolCallVerdict(False, "none", None, "not_actuation")
 
     # Self-declared sensitivity always escalates (§3.4) — checked first so it
@@ -595,11 +652,13 @@ class SafetyWarningListener:
         *,
         reviewer: Callable[[str, str], bool] | None = None,
         notify: Callable[[str], None] | None = None,
+        risks: Mapping[str, str] | None = None,
     ) -> None:
         self.session = session
         self.config = config
         self._reviewer = reviewer
         self._notify = notify if notify is not None else _default_notify
+        self.risks = risks
         self.warning_count = 0
         # Backward-compat attribute: the warning listener does not HITL-interrupt.
         self.interrupt_on: dict[str, Any] = {}
@@ -608,12 +667,12 @@ class SafetyWarningListener:
         """Return a warning ToolMessage if the call must be blocked, else ``None``."""
 
         name, args = _extract_call(request)
-        if name not in ACTUATION_GATED_TOOLS:
+        if not _is_actuation(name, self.risks):
             return None
         if _confirmed_irreversible(args):
             return None
         verdict = classify_tool_call(
-            request, self.session, self.config, reviewer=self._reviewer
+            request, self.session, self.config, reviewer=self._reviewer, risks=self.risks
         )
         if not verdict.should_gate:
             return None
@@ -652,11 +711,14 @@ def _default_notify(message: str) -> None:
 def build_safety_warning_listener(
     session: Any | None = None,
     config: Any | None = None,
+    *,
+    risks: Mapping[str, str] | None = None,
 ) -> SafetyWarningListener | None:
     """Build the warning listener for ``wary``/``reviewer`` mode, else ``None``.
 
     ``off``/``hard`` mode returns ``None``. In ``reviewer`` mode a lazily built
-    second-model reviewer is attached for soft-candidate precision.
+    second-model reviewer is attached for soft-candidate precision.  ``risks``
+    is the live ``tool_risk_registry`` mapping (see :func:`classify_tool_call`).
     """
 
     mode = _safety_mode(config)
@@ -665,7 +727,7 @@ def build_safety_warning_listener(
     reviewer = (
         build_safety_reviewer(config, session=session) if mode == "reviewer" else None
     )
-    return SafetyWarningListener(session, config, reviewer=reviewer)
+    return SafetyWarningListener(session, config, reviewer=reviewer, risks=risks)
 
 
 class ControlHitlListener:
@@ -779,7 +841,12 @@ class ControlHitlListener:
         )
 
 
-def build_hitl_middleware(session: Any | None = None, config: Any | None = None):
+def build_hitl_middleware(
+    session: Any | None = None,
+    config: Any | None = None,
+    *,
+    risks: Mapping[str, str] | None = None,
+):
     """Build a HITL listener for v2 control + legacy hard mode.
 
     Backward-compat factory: returns a :class:`ControlHitlListener` with the same
@@ -787,7 +854,8 @@ def build_hitl_middleware(session: Any | None = None, config: Any | None = None)
     and external callers can still inspect ``listener.interrupt_on``.
 
     * ``ask_user`` / ``take_over`` always interrupt.
-    * Actuation tools interrupt for ``approve``/``reject`` only in ``hard`` mode.
+    * Tools declared ``actuation`` interrupt for ``approve``/``reject`` only in
+      ``hard`` mode.  Without a ``risks`` mapping the legacy gate set is used.
     """
 
     mode = _safety_mode(config)
@@ -795,9 +863,11 @@ def build_hitl_middleware(session: Any | None = None, config: Any | None = None)
 
     if mode == "hard":
         def _gate(req: Any) -> bool:
-            return classify_tool_call(req, session, config, reviewer=None).should_gate
+            return classify_tool_call(
+                req, session, config, reviewer=None, risks=risks
+            ).should_gate
 
-        for tool in ACTUATION_GATED_TOOLS:
+        for tool in _actuation_tool_names(risks):
             interrupt_on[tool] = {
                 "when": _gate,
                 "allowed_decisions": ["approve", "reject"],
@@ -818,11 +888,15 @@ def build_control_hitl_middleware():
 def build_safety_hard_hitl_listener(
     session: Any | None = None,
     config: Any | None = None,
+    *,
+    risks: Mapping[str, str] | None = None,
 ) -> ControlHitlListener | None:
     """Build the hard-mode actuation HITL listener registered by the safety cap.
 
     Unlike :func:`build_hitl_middleware`, this listener does **not** include
     ``ask_user``/``take_over``; those are handled by the core control listener.
+    ``risks`` is the assembly-time declaration mapping; the interrupt table
+    covers exactly the declared ``actuation`` tools.
     """
 
     mode = _safety_mode(config)
@@ -830,10 +904,10 @@ def build_safety_hard_hitl_listener(
         return None
 
     def _gate(req: Any) -> bool:
-        return classify_tool_call(req, session, config, reviewer=None).should_gate
+        return classify_tool_call(req, session, config, reviewer=None, risks=risks).should_gate
 
     interrupt_on: dict[str, Any] = {}
-    for tool in ACTUATION_GATED_TOOLS:
+    for tool in _actuation_tool_names(risks):
         interrupt_on[tool] = {
             "when": _gate,
             "allowed_decisions": ["approve", "reject"],
@@ -844,24 +918,32 @@ def build_safety_hard_hitl_listener(
 def build_capability_safety_listener(
     session: Any | None = None,
     config: Any | None = None,
+    *,
+    risks: Mapping[str, str] | None = None,
 ):
     """Build the mode-specific safety listener mounted by the safety cap.
 
     * ``wary``/``reviewer`` -> warning listener.
     * ``hard`` -> actuation HITL listener.
     * ``off`` -> ``None``.
+
+    ``risks`` is the ``tool_risk_registry`` service registered by the assembly
+    context; the listener keeps the reference, so tools mounted later in the
+    same assembly pass are classified through their own declarations.
     """
 
     mode = _safety_mode(config)
     if mode == "hard":
-        return build_safety_hard_hitl_listener(session, config)
-    return build_safety_warning_listener(session, config)
+        return build_safety_hard_hitl_listener(session, config, risks=risks)
+    return build_safety_warning_listener(session, config, risks=risks)
 
 
 def register_default_safety_listener(
     event_bus: EventBus,
     session: Any | None = None,
     config: Any | None = None,
+    *,
+    risks: Mapping[str, str] | None = None,
 ):
     """Register the default warning-flow safety listener on ``event_bus``.
 
@@ -875,7 +957,7 @@ def register_default_safety_listener(
     reviewer = (
         build_safety_reviewer(config, session=session) if mode == "reviewer" else None
     )
-    listener = SafetyPreExecuteListener(session, config, reviewer=reviewer)
+    listener = SafetyPreExecuteListener(session, config, reviewer=reviewer, risks=risks)
     disposer = event_bus.on(TOOL_EXECUTE, listener)
     return listener, disposer
 
@@ -896,5 +978,6 @@ __all__ = [
     "SafetyPreExecuteListener",
     "format_warning",
     "SENSITIVE_APP_KEYWORDS",
+    "LEGACY_ACTUATION_GATED_TOOLS",
     "ACTUATION_GATED_TOOLS",
 ]
