@@ -33,8 +33,9 @@
   runner（观测域＝会话帧/标记/截图）；双打统一在 `tests/v2/doubles/`（唯一事实源，别再抄一份）。
   新文件进对应域目录、按被测对象命名——名字带批次编号（`_wp1`、`_wf3`、`_s2`、`_e1`）会被
   `tests/v2/harness/test_suite_layout.py` 拒绝。
-- `tests/skill/`：真机诊断 skill 的离线冒烟（20 个文件、自带 `conftest.py` 把 skill 的 scripts 目录放进
+- `tests/skill/`：真机诊断 skill 的离线冒烟（20 个文件、自带 `conftest.py` 把 scripts 目录放进
   `sys.path`），随 CI 的全量 `pytest tests` 跑，没有自己的分层命令。
+- `tests/plugins/`：一等插件 `plugins/systemone/` 的离线测试。
 - `tests/` 根：保留库的测试——`phone_agent/adb/`（test_adb_app_labels.py、test_adb_device_signals.py、
   test_adb_execution_contract.py）与 `phone_agent/config/` 的注册表（test_app_registry.py、
   test_policy_registry.py）；改动这些代码时跑全量或点名文件。

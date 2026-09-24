@@ -201,10 +201,22 @@ prepare/usage 支持对象，缓存参数白名单见[模型提供方与路由](
 - **provider bootstrap**：只支持声明 `providers` 与外部 helper，缺失、循环依赖或依赖 runtime 内建能力都在启动时可见失败，不做静默降级；
 - **in-run 控制**：runner 唯一的运行中能力变更控制是 `revoke_lesson`——撤销 lesson 只影响后续投递，已经发送出去的上下文不可撤回；停止与 HITL 等既有控制照常存在。
 
+## 一等插件（systemone） {#first-party-systemone}
+
+`plugins/systemone/` 是仓库内的一等插件，也是声明面的完整 dogfood：System One 决策模型（结构化提问进、
+带校准概率的类型化答案出，无自由文本、无图像）走四条接缝——(a) provider 家族 `systemone`（`jev:` 云端 /
+`kev:` 本机，`provider:model` 可 pin 版本）、(b) `tool/execute` 前置的 shadow 安全复核
+（`PHONE_AGENT_SYSTEMONE_REVIEW` 取 `off`/`shadow`/`on`；`on` 只在既有安全放行且
+`p ≥ PHONE_AGENT_SYSTEMONE_CONFIDENCE` 时**追加**否决，绝不放松既有闸门）、(c) 只读工具 `wait_for_stable`
+（比 `observe` 事件的 `screen_hash`）、(d) `model/pre_request` 卡死调速器（advisory，不注入提示词）。
+.taskwizard.toml` 里默认 `enabled = false`；配置键、启用步骤与诚实限制见 `plugins/systemone/README.md`，
+协议 wire 形状（鉴权头、题型与 criteria、错误码）也以该 README 为准——它记录的是实测过的官方规范，
+不是博客二手资料；离线契约测试在 `tests/plugins/`。
+
 ## 打包分发
 
-`plugin add` 只做 pip 安装或登记 `path=`，不注入其它资源（包括应用词表）；社区仓库 `plugins/index.json`
-暂未上架任何包。
+`plugin add` 只做 pip 安装或登记 `path=`，不注入其它资源（包括应用词表）；`plugins/index.json` 目前只登记
+仓库内的一等插件（`systemone`，默认 `enabled = false`）。
 
 !!! note
     `PLUGIN_API_VERSION = 1` 为 provisional：出现第二个真实实现方并完成验证前，事件与契约可能调整。

@@ -1,1 +1,9 @@
-[]
+[
+  {
+    "name": "systemone",
+    "summary": "一等插件：System One 决策模型接入（provider / shadow 安全复核 / wait_for_stable / 卡死调速器）",
+    "description": "把「结构化问题进、带校准概率的答案出」的决策模型接成模型提供方（jev 云端 / kev 本机），并提供 shadow 安全复核、只读的 wait_for_stable 工具与卡死调速器。该条目是仓库内 path 插件，默认 enabled = false。",
+    "path": "plugins/systemone",
+    "keywords": ["systemone", "safety", "provider", "stability", "first-party"]
+  }
+]
