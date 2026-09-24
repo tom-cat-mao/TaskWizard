@@ -84,8 +84,8 @@ CLI 与 runner 使用同一批授权入口，runner 启动装配时 import/apply
 | 总开关 | `PHONE_AGENT_PLUGINS=false` 关闭全部外部插件，内建能力不受影响 |
 
 manifest 条目字段：`name`、`version`、`enabled`（默认 `true`）、`path`、`[plugin.config]` 键值表。读写往返支持
-`[plugin.config]`，但 emitter 只接受 string/bool 值；加载路径不把 config 传给插件——`plugin.py` 当前拿不到
-manifest 里配的值（已知限制）。
+`[plugin.config]`，但 emitter 只接受 string/bool 值。加载时该表随 spec 透传进插件：`apply(ctx)` 里用
+`ctx.plugin_config()` 读取任意键，同时它是本插件**声明配置键**的覆盖层（见[其他接缝](#other-seams)）。
 
 `REQUIRES_API` 是受限 PEP-440 子集：逗号组合 `>=`、`<=`、`==`、`=`、`>`、`<`、`!=`，裸版本号视为 `==`，
 缺省或空字符串放行任意版本。模块级 `REQUIRES_API` 优先于 spec 对象上的同名属性；不满足即报错。
@@ -111,6 +111,9 @@ Web 进程没有插件加载路径，决定是否激活的是 runner 装配阶�
 
 `taskdoc/completed` payload 为 `{"item_ids", "screen_seq", "epoch"}`：一次提交的路线项
 `in_progress → completed` 迁移即发一次，fail-open，不改变工具回执。
+
+`observe` payload 为 `{"epoch", "screen_seq", "marks_count", "marks_failure_code", "screen_hash"}`：
+`screen_hash` 是已提交观测帧截图的短 sha256，供监听器判断“画面是否实质变化”，事件本体不含图像或 base64。
 
 内建嵌套顺序（插件监听器装配期注册，位于 safety 之内；`sibling_receipts` 装配后追加，是 `tool/execute` 最内层）：
 
@@ -143,6 +146,19 @@ budget 的 tool 闸以 `prepend=True` 注册，位于 safety 之外；`safety_mo
 - **pin 前缀**（`register_pin_prefix`）：pinned 消息块的前缀从 `phone_agent/v2/pins.py` 取；声明后可用
   `pin_prefix_registry` 服务的 `pin_id(prefix, suffix)` 铸 id，未声明前缀会报错，harness 的
   `__taskdoc__` / `__compact__` 不许被能力认领；
+- **配置键**（`register_setting(key, env_var=..., default=..., description=...)`）：声明本能力的配置键并直接拿到
+  解析值。`env_var` 必须以 `PHONE_AGENT_` 开头（`.env` 只加载该前缀），默认值只支持 str/bool/int/float/None；
+  解析顺序与内建键同链——harness CLI 覆盖（`setting_overrides` 服务）> shell 环境变量 / `.env` > 本插件 manifest
+  `[plugin.config]` 同名值 > 声明的默认值。结果写进 `V2Config.plugin_settings` 只读映射、release 时随能力撤销；
+  第二个能力声明同一键即报错，取值读不成声明类型（如 int 键写成 `abc`）也装配期报错，不静默回落默认值；
+- **记账角色**（`register_usage_role(role, unit="tokens"|"calls")`）：harness 预注册
+  `actor`/`compact`/`verifier`/`reviewer`/`distill`（均为 token），插件再加自己的角色。`tokens` 角色进 token
+  预算裁决；`calls` 角色按调用次数记账（`UsageLedger.calls_by_role()` / `calls_total`）、**不进** token 总额，
+  因此预算裁决点仍归 harness。未声明角色调 `record()` 仍报错；两能力抢同名角色、非法单位均装配期报错；
+- **脱敏字面量**（`register_redaction(literal)`）：把本能力自己的敏感子串交给 v2 出口脱敏（trace / 诊断证据流 /
+  Web 事件 / 流式预览共用的 `redact_text`），命中替换为 `<redacted>`。字面量不是正则，必须单行、至少 4 字符
+  （更短会误伤无关文本）；只改脱敏——安全分类与提示词侧清洗仍用内建 pattern；release 时撤销，同一字面量可被
+  多个能力共同持有；
 - `ctx.on(..., prepend=True)` 把监听器插到最外层，返回的 disposer 幂等可重复调用。
 
 core 侧另有 `register_core_middleware` / `register_core_tool` / `add_core_run_hook`：同一有序集合、owner 为
@@ -161,10 +177,11 @@ prepare/usage 支持对象，缓存参数白名单见[模型提供方与路由](
 
 `phone_agent/v2/capabilities.py` 是唯一装配器：十三个内建能力（providers、taskdoc、safety、budget、compact、boundary_compact、finish_verify、deliverable、app_kb、dream、experience、recall、obs_archive）经五条接缝挂载——`register_middleware`、`register_tool`、`add_prompt_block`、`add_run_hook`、`add_cli_command`；`register_service` 是第六接缝，把能力服务发布进 harness 服务命名空间。内建策略全部是事件总线监听器，因此策略顺序由注册顺序决定。
 
-除挂载外，装配上下文还是**声明面**：工具的 `risk`、pin 前缀、能力 `mode` 在装配期登记进
-`tool_risk_registry` / `pin_prefix_registry` 服务（`ctx.service(...)` 可读），缺失声明按安全默认值处理
-（工具算 `actuation`）。重复声明、非法值、覆盖 harness 服务都在装配期报错。声明只决定“是否被分类 /
-记账”，不决定“是否被允许”，也不提供任何放行开关。
+除挂载外，装配上下文还是**声明面**：工具的 `risk`、pin 前缀、能力 `mode`、配置键、记账角色与脱敏字面量都在
+装配期登记进对应注册表（`tool_risk_registry` / `pin_prefix_registry` / `setting_registry` /
+`usage_role_registry` / `redaction_registry`，均可经 `ctx.service(...)` 读取），缺失声明按安全默认值处理
+（工具算 `actuation`）。重复声明、非法值、覆盖 harness 服务都在装配期报错。声明只决定“是否被分类 / 记账 /
+脱敏”，不决定“是否被允许”，也不提供任何放行开关。
 
 - **core 监听器顺序**：见上表；插件在能力链之后注册，因此插件的 `tool/execute` 监听器排在 safety 之内；
 - **归属与释放**：`ctx.on` / `ctx.on_dispose` 把订阅与清理绑定到当前 capability。`release` 先反序跑清理回调，再摘除该能力注册的中间件、工具、提示块、run hooks、CLI 命令与服务；正常模式变更在该 release 之后仍会 apply 新能力，只有在清理报错时才不再替换<!-- allow:不再 -->；

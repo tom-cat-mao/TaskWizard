@@ -31,7 +31,7 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any
@@ -372,13 +372,22 @@ def _spec_from_path(name: str, path: str | Path) -> tuple[CapabilitySpec, Any]:
 
 
 def load_plugin_spec(entry: PluginEntry) -> CapabilitySpec:
-    """Load one enabled entry into a gated ``CapabilitySpec`` (fail-visible)."""
+    """Load one enabled entry into a gated ``CapabilitySpec`` (fail-visible).
+
+    The entry's ``[plugin.config]`` table is attached to the spec as
+    ``manifest_config`` so the assembly context can hand it back inside the
+    ``apply`` hook (``ctx.plugin_config()``) and use it as the per-plugin
+    override tier for the settings the plugin declares.  An entry without a
+    config table returns the loaded spec unchanged.
+    """
 
     if entry.path:
         spec, requires_api = _spec_from_path(entry.name, entry.path)
     else:
         spec, requires_api = _spec_from_entry_point(entry.name)
     _check_api_gate(entry.name, requires_api)
+    if entry.config:
+        spec = replace(spec, manifest_config=dict(entry.config))
     return spec
 
 

@@ -981,6 +981,11 @@ class PhoneSession:
                         "screen_seq": observation.screen_seq,
                         "marks_count": len(observation.marks),
                         "marks_failure_code": observation.marks_failure_code,
+                        # Short sha256 of the committed frame's screenshot
+                        # payload (never the image itself, P0 #6): listeners use
+                        # it to answer "did the picture materially change?"
+                        # without re-reading pixels.
+                        "screen_hash": observation.screen_hash,
                     },
                 )
             except Exception:  # noqa: BLE001 - event bus must never alter observation semantics

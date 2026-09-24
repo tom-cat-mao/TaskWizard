@@ -2,8 +2,9 @@
 
 The JSONL log is the source of truth.  ``episodes.json`` is only a materialized
 view keyed by ``run_id`` and can always be rebuilt by replaying that log.  This
-module intentionally uses only the Python standard library and never feeds
-experience back into the actor; it is an observe-only data plane.
+module intentionally uses only the Python standard library plus the
+dependency-free accounting-role registry (:mod:`phone_agent.v2.usage_roles`) and
+never feeds experience back into the actor; it is an observe-only data plane.
 
 Records are validated, not transformed: strings are stored verbatim and every
 field outside the fixed schema is discarded.
@@ -18,6 +19,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
+
+from phone_agent.v2.usage_roles import registered_usage_roles
 
 EPISODE_OUTCOME_FIELDS = (
     "type",
@@ -60,7 +63,6 @@ EXPERIENCE_EVENT_FIELDS = (
 _TIME_BUCKETS = ("night", "morning", "afternoon", "evening")
 _RESULT_CLASSES = frozenset({"ok", "error", "warned"})
 _VERIFIER_RESULTS = frozenset({"pass", "fail", "skipped"})
-_TOKEN_ROLES = frozenset({"actor", "compact", "verifier", "reviewer", "distill"})
 _TOOLS = frozenset(
     {
         "tap",
@@ -159,10 +161,11 @@ def _classify_and_clean(record: Mapping[str, Any]) -> dict[str, Any]:
                     apps.append(package)
 
         raw_roles = record.get("tokens_by_role", {})
+        token_roles = registered_usage_roles(unit="tokens")
         tokens_by_role = {}
         for role, tokens in raw_roles.items() if isinstance(raw_roles, Mapping) else ():
             clean_role = _clean_text(role)
-            if clean_role in _TOKEN_ROLES:
+            if clean_role in token_roles:
                 tokens_by_role[clean_role] = max(0, int(tokens))
         takeover = record.get("takeover")
         clean_takeover = None if takeover is None else _clean_text(takeover)

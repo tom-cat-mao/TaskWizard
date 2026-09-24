@@ -14,8 +14,11 @@ Payload contracts for the plugin events:
 
 ``OBSERVE`` / ``"observe"``
     Observed with :meth:`EventBus.emit` after an observation is committed.
-    Payload contains ``epoch``, ``screen_seq``, ``marks_count``, and
-    ``marks_failure_code``.
+    Payload contains ``epoch``, ``screen_seq``, ``marks_count``,
+    ``marks_failure_code`` and ``screen_hash`` — the short sha256 of the
+    committed frame's screenshot payload (never the image itself, P0 #6), so a
+    listener can tell whether the picture materially changed without touching
+    pixels.
 
 ``APP_LAUNCHED`` / ``"app/launched"``
     Observed with :meth:`EventBus.emit` from two sources (WP-WF4-A scheme C):

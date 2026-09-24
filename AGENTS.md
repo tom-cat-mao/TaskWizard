@@ -51,7 +51,7 @@ CI 门禁见 [.github/workflows/ci.yml](.github/workflows/ci.yml)：`lint` / `do
 | 11 | **TaskDoc Board + Flow Line** | `goal_base` 只由 harness 播种；有 open 路线项时 `finish` fail-closed；迁移必须经 `in_progress`。 | [#taskdoc-board](pages/architecture.md#taskdoc-board) |
 | 11b | **Output Contract** | 每个工具带 `intent`（本步目标）+ `note`；回执写实际发生了什么，流程线据此派生。 | [#output-contract](pages/architecture.md#output-contract) |
 | 12 | **Finish Two-Step + Verifier** | `finish` 两段式（复核包 → `confirm=true`）；被接受即终局；验收器不看 actor transcript，故障 fail-open。 | [#finish-two-step](pages/architecture.md#finish-two-step) |
-| 13 | **Token Budget** | 成本按 token 计；无 usage 时回退 CJK 感知估算 + 每图 1500。达阈值停止，不承诺零超额。 | [#token-budget](pages/configuration.md#token-budget) |
+| 13 | **Token Budget** | 成本按 token 计；无 usage 时回退 CJK 感知估算 + 每图 1500。达阈值停止，不承诺零超额；`unit=calls` 记账角色只记账不参与裁决。 | [#token-budget](pages/configuration.md#token-budget) |
 | 14 | **Context Work Target + Auto-Compact** | 软工作目标默认 32k；micro 先行、保护组不被截断；`model/pre_request` 监听器是纯全列表变换。 | [#auto-compact](pages/configuration.md#auto-compact) |
 | 15 | **Atomic Observation** | `session.observe()` 是唯一观测生产者；单批执行由 admission 互斥 + `max_concurrency=1` 保序。 | [#atomic-observation](pages/architecture.md#atomic-observation)、[#single-batch-execution](pages/architecture.md#single-batch-execution) |
 | 16 | **Experience Plane** | 每个完成的 run 恰好追加一条固定 schema 事件；observe-only、fail-open，校验而不转换。 | [#experience-schema](pages/memory.md#experience-schema) |
@@ -59,7 +59,7 @@ CI 门禁见 [.github/workflows/ci.yml](.github/workflows/ci.yml)：`lint` / `do
 | 16b | **Implicit App Alias** | unknown `launch_app` 失败回执里真实出现的包名才是 run 内证据；设备确认后才可写 `learned`。 | [#implicit-alias](pages/memory.md#implicit-alias) |
 | 16c | **Alias Correction** | dream 只对同 run 签名覆盖 `learned` 别名，绝不覆盖 `kind=user`。 | [#alias-correction](pages/memory.md#alias-correction) |
 | 17 | **Lesson Evolution** | 蒸馏/晋升写入保持离线；运行期只读 + 应急撤销；语义判断归模型自评，harness 只拒客观假话；撤销的 id 重提即降级。 | [#lesson-evolution](pages/evolution.md#lesson-evolution) |
-| 18 | **Capability Mount + Plugins** | 十三个能力经五接缝挂载（middleware / tool / prompt / hook / CLI，另有 `register_service`）；声明面（工具风险、pin 前缀、mode）只影响分类记账且 fail-visible，绝不放行；插件是外部代码，`plugin add` 即执行授权。 | [#capability-mount](pages/plugins.md#capability-mount)、[#plugin-authorization](pages/plugins.md#plugin-authorization) |
+| 18 | **Capability Mount + Plugins** | 十三个能力经五接缝挂载（middleware / tool / prompt / hook / CLI，另有 `register_service`）；声明面（工具风险、pin 前缀、mode、配置键、记账角色、脱敏字面量）只影响分类记账脱敏且 fail-visible，绝不放行；插件是外部代码，`plugin add` 即执行授权。 | [#capability-mount](pages/plugins.md#capability-mount)、[#plugin-authorization](pages/plugins.md#plugin-authorization) |
 | 19 | **Run-bound Deliverable** | 模型只给 HTML、绝不给路径；目标固定 `<run_id>.html`；失败返回错误字符串且不改动旧文档。 | [#deliverable](pages/architecture.md#deliverable) |
 | 20 | **Typed App Name Resolution** | `v2/names.py` 唯一归属；弱证据永不单独 auto-resolve（`learned` 别名带成功计数除外）。 | [#app-name-resolution](pages/architecture.md#app-name-resolution) |
 | 21 | **Web Projection** | 控制台只是观察层，不拥有设备/工具/路由；被动读 App-KB 表不构造 store；只有终局事件推进状态。 | [#web-projection](pages/console.md#web-projection) |
@@ -72,14 +72,14 @@ CI 门禁见 [.github/workflows/ci.yml](.github/workflows/ci.yml)：`lint` / `do
 |---|---|
 | CLI / run 入口 | `main_v2.py`（任务或离线命令） |
 | Agent 装配与终局 | `v2/agent.py`（五条桥接器、core 监听器、`RunResult`） |
-| 能力装配 | `v2/{capabilities,tool_risk}.py`（cap-id、mode、release 簿记、内建工具风险声明） |
+| 能力装配 | `v2/{capabilities,tool_risk,settings}.py`（cap-id、mode、release 簿记、内建工具风险声明、声明键解析） |
 | 观测与设备状态 | `v2/session.py`（epoch/marks/参考图/locate）、`v2/{coords,locate_scope}.py`（相对→绝对换算唯一归属；scoped-locate 裁剪几何） |
 | 工具 | `v2/tools/`（感知、操作、TaskDoc、deliverable、finish、HITL） |
-| 事件总线与插件 | `v2/{events,plugins,pins}.py` |
+| 事件总线与插件 | `v2/{events,plugins,pins,redaction}.py`（redaction 是出口脱敏字面量注册表） |
 | 策略监听器 | `v2/middleware/`（safety、images、compact、boundary_compact、budget、trace、procedure、taskdoc、context_request、context_admission、diagnostic、streaming） |
 | 任务/解析/验收 | `v2/{taskdoc,resolver,review,verify,names}.py` |
 | 经验与进化 | `v2/{experience,evolution,replay,recall,obs_archive}.py`（recall 是语义召回索引；obs_archive 是观测存档） |
-| 模型与配置 | `v2/{model,config,prompts,usage,native_content}.py`、`v2/providers/` |
+| 模型与配置 | `v2/{model,config,prompts,usage,usage_roles,native_content}.py`（usage_roles 是记账角色注册表）、`v2/providers/` |
 | App 知识 | `v2/{appkb,dream}.py` |
 | Web runner | `v2/{runner,run_ipc,run_events}.py`、`phone_agent/web/` |
 | 保留库 | `phone_agent/{adb,grounding,config}/`、`device_factory.py` |

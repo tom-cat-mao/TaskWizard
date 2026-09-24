@@ -14,8 +14,11 @@ callable they pass to :func:`redact_value_no_base64`:
 * trace caps every string at 64 chars (``…`` suffix) — see ``trace._redact_text``;
 * diagnostic keeps the full redacted string, bounded at ``DIAG_MAX_TEXT``.
 
-Neither can ever emit an image ``base64`` payload — that is enforced here,
-below both callables.
+Both go through :func:`redact_text`, which applies the two redaction tiers: the
+capability-declared literals from
+:data:`phone_agent.v2.redaction.REDACTION_REGISTRY` first (assembly-time
+declarations, P0 #18), then the built-in regex.  Neither tier can ever emit an
+image ``base64`` payload — that is enforced here, below both callables.
 """
 
 from __future__ import annotations
@@ -23,18 +26,26 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from phone_agent.config.redact import redact_context_text
+from phone_agent.v2.redaction import REDACTED_PLACEHOLDER, REDACTION_REGISTRY
 
 
 def redact_text(text: str) -> str:
     """Sensitive-substring redaction with no length cap (P0 #6 primitive).
 
-    Thin alias over :func:`phone_agent.config.redact.redact_context_text`: phone
-    numbers, emails, order/verification codes, api-keys, tokens, JWTs and long
-    base64 runs are replaced with ``<redacted>``. Callers layer their own length
-    policy (trace truncates to 64; diagnostic bounds to ``DIAG_MAX_TEXT``).
+    Two tiers, in order: every literal declared through
+    ``ctx.register_redaction(...)`` is replaced with ``<redacted>``, then
+    :func:`phone_agent.config.redact.redact_context_text` replaces the built-in
+    patterns (phone numbers, emails, order/verification codes, api-keys, tokens,
+    JWTs and long base64 runs).  Callers layer their own length policy (trace
+    truncates to 64; diagnostic bounds to ``DIAG_MAX_TEXT``).  With no declared
+    literals this is exactly the regex call it always was.
     """
 
-    return redact_context_text(text)
+    value = text if isinstance(text, str) else str(text or "")
+    for literal in REDACTION_REGISTRY.literals():
+        if literal in value:
+            value = value.replace(literal, REDACTED_PLACEHOLDER)
+    return redact_context_text(value)
 
 
 def estimate_image_bytes(url: str) -> int:

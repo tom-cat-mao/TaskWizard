@@ -7,14 +7,25 @@ later release can remove the whole contribution without guessing object names.
 
 Alongside the mount seams the context owns the **declaration plane** (P0 #18):
 ``register_tool(..., risk=...)`` records a tool's risk into the
-``tool_risk_registry`` service the safety classifier reads, and
+``tool_risk_registry`` service the safety classifier reads,
 ``register_pin_prefix`` claims a pinned message-id prefix in
-``pin_prefix_registry``.  Declarations decide *how something is classified* —
-never whether it is allowed — and every declaration point fails visibly
-(duplicate tool names, invalid modes, overwriting a harness-owned service,
-undeclared pin prefixes).  ``CapabilitySpec.mode`` is the mount mode and is
+``pin_prefix_registry``, ``register_setting`` declares a configuration key whose
+value resolves through the same CLI > env > .env > manifest > default chain as
+the built-in ``V2Config`` fields, ``register_usage_role`` extends the accounting
+roles the usage ledger and the experience schema validate against, and
+``register_redaction`` declares a sensitive literal for the v2 egress redaction
+boundary.  Declarations decide *how something is classified, charged or
+redacted* — never whether it is allowed — and every declaration point fails
+visibly (duplicate tool names, invalid modes, overwriting a harness-owned
+service, undeclared pin prefixes, unprefixed setting env vars, unknown units,
+too-short redaction literals).  ``CapabilitySpec.mode`` is the mount mode and is
 limited to ``off`` / ``shadow`` / ``on``; a domain mode (``wary``, ``auto``,
 ``manual``, ...) is translated to ``on`` by ``_capability_mode``.
+
+A capability's manifest entry may carry a ``[plugin.config]`` table; it travels
+on ``CapabilitySpec.manifest_config`` and is readable inside ``apply`` through
+:meth:`CapabilityAssemblyContext.plugin_config`, where it is also the tier that
+replaces the declared defaults of that capability's settings.
 
 This is intentionally a static assembly layer.  Reconciliation is useful while
 building agents and in tests/consoles, but it does not mutate a compiled agent's
@@ -25,7 +36,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 import sys
 from typing import Any, Protocol, runtime_checkable
@@ -38,7 +49,10 @@ from phone_agent.v2.events import (
     TOOL_EXECUTE,
 )
 from phone_agent.v2.pins import PinPrefixRegistry
+from phone_agent.v2.redaction import REDACTION_REGISTRY, RedactionRegistry
+from phone_agent.v2.settings import SettingRegistry
 from phone_agent.v2.tool_risk import TOOL_RISKS, ToolRisk, declared_risk
+from phone_agent.v2.usage_roles import USAGE_ROLE_REGISTRY, UsageRoleRegistry
 
 CapabilityHook = Callable[..., None]
 PromptProvider = Callable[..., Any]
@@ -99,6 +113,21 @@ class CapabilityContext(Protocol):
     def register_service(self, name: str, value: Any) -> None: ...
 
     def register_pin_prefix(self, prefix: str) -> None: ...
+
+    def register_setting(
+        self,
+        key: str,
+        *,
+        env_var: str,
+        default: Any,
+        description: str,
+    ) -> Any: ...
+
+    def register_usage_role(self, role: str, *, unit: str = "tokens") -> None: ...
+
+    def register_redaction(self, literal: str) -> None: ...
+
+    def plugin_config(self) -> Mapping[str, Any]: ...
 
     def on(
         self, event: str, listener: Callable[..., Any], *, prepend: bool = False
@@ -218,6 +247,15 @@ class CapabilitySpec:
     apply: CapabilityHook | None = None
     release: CapabilityHook | None = None
     provides: str | None = None
+    # ``[plugin.config]`` of the manifest entry that loaded this capability (the
+    # plugin loader attaches it; an entry without one leaves this empty, so an
+    # in-code spec and its loaded form stay equal).  It is operator metadata,
+    # not identity: excluded from equality/repr and read by the assembly layer
+    # as the plugin's own values (``ctx.plugin_config()``) and as the override
+    # tier beneath the environment for the settings the plugin declares.
+    manifest_config: Mapping[str, Any] = field(
+        default_factory=dict, repr=False, compare=False, hash=False
+    )
 
     def __post_init__(self) -> None:
         if not _CAPABILITY_ID.fullmatch(self.cap_id):
@@ -238,6 +276,11 @@ class CapabilitySpec:
                 raise ValueError(f"invalid dependency id: {dependency!r}")
         if self.provides is not None and not _SERVICE_NAME.fullmatch(self.provides):
             raise ValueError(f"invalid provides service key: {self.provides!r}")
+        if not isinstance(self.manifest_config, Mapping):
+            raise TypeError(
+                "capability manifest_config must be a mapping of declared "
+                f"[plugin.config] values, got {type(self.manifest_config).__name__}"
+            )
         if self.apply is not None and not callable(self.apply):
             raise TypeError("capability apply hook must be callable")
         if self.release is not None and not callable(self.release):
@@ -335,11 +378,14 @@ class MiddlewareReplacement:
 class CapabilityAssemblyContext:
     """Capability-owned mount ledger for the five assembly seams.
 
-    The context also owns the two declaration-plane registries the harness and
+    The context also owns the declaration-plane registries the harness and
     capabilities publish into: ``tool_risk_registry`` (P0 #18 tool risk, read by
-    the safety listener) and ``pin_prefix_registry`` (declared pinned message-id
-    prefixes).  Both start harness-owned, so a capability can read them but not
-    silently replace them (see :meth:`register_service`).
+    the safety listener), ``pin_prefix_registry`` (declared pinned message-id
+    prefixes), ``setting_registry`` (declared configuration keys),
+    ``usage_role_registry`` (declared accounting roles) and
+    ``redaction_registry`` (declared egress redaction literals).  All start
+    harness-owned, so a capability can read them but not silently replace them
+    (see :meth:`register_service`).
     """
 
     def __init__(self, services: Mapping[str, Any] | None = None) -> None:
@@ -368,9 +414,21 @@ class CapabilityAssemblyContext:
         # duplicates inside each of the two planes).
         self._tool_owners: dict[str, str] = {}
         self._core_tool_names: set[str] = set()
+        # Per-capability ``[plugin.config]`` values, published by
+        # ``assemble_capabilities`` from the spec and dropped with the mount.
+        self._manifest_configs: dict[str, Mapping[str, Any]] = {}
         for name, value in (
             ("tool_risk_registry", ToolRiskRegistry()),
             ("pin_prefix_registry", PinPrefixRegistry()),
+            # The harness CLI tier for declared settings: an operator override
+            # map (declared key -> value) a CLI entry point may publish before
+            # assembly.  Absent means the tier is empty.
+            (
+                "setting_registry",
+                SettingRegistry(overrides=self._services.get("setting_overrides")),
+            ),
+            ("usage_role_registry", USAGE_ROLE_REGISTRY),
+            ("redaction_registry", REDACTION_REGISTRY),
         ):
             self._services.setdefault(name, value)
             self._service_owners.setdefault(name, HARNESS_OWNER)
@@ -394,6 +452,24 @@ class CapabilityAssemblyContext:
         registry = self._services.get("pin_prefix_registry")
         if not isinstance(registry, PinPrefixRegistry):
             raise RuntimeError("pin_prefix_registry service is unavailable")
+        return registry
+
+    def _setting_registry(self) -> SettingRegistry:
+        registry = self._services.get("setting_registry")
+        if not isinstance(registry, SettingRegistry):
+            raise RuntimeError("setting_registry service is unavailable")
+        return registry
+
+    def _usage_role_registry(self) -> UsageRoleRegistry:
+        registry = self._services.get("usage_role_registry")
+        if not isinstance(registry, UsageRoleRegistry):
+            raise RuntimeError("usage_role_registry service is unavailable")
+        return registry
+
+    def _redaction_registry(self) -> RedactionRegistry:
+        registry = self._services.get("redaction_registry")
+        if not isinstance(registry, RedactionRegistry):
+            raise RuntimeError("redaction_registry service is unavailable")
         return registry
 
     def _guard_service_write(self, name: str, owner: str) -> None:
@@ -525,6 +601,81 @@ class CapabilityAssemblyContext:
         """
 
         self._pin_registry().declare(str(prefix), owner=self._owner())
+
+    def plugin_config(self) -> Mapping[str, Any]:
+        """The manifest ``[plugin.config]`` table of the applying capability.
+
+        Empty outside an apply hook or when the manifest entry declares none.
+        Values act as the per-plugin override tier for the settings the
+        capability declares through :meth:`register_setting` (below the
+        environment, above the declared default) and are otherwise the plugin's
+        own business: keys it never declares are simply readable here.
+        """
+
+        if self._current_cap_id is None:
+            return {}
+        return self._manifest_configs.get(self._current_cap_id, {})
+
+    def register_setting(
+        self,
+        key: str,
+        *,
+        env_var: str,
+        default: Any,
+        description: str,
+    ) -> Any:
+        """Declare one configuration key owned by the applying capability.
+
+        The declared key resolves through the built-in precedence chain —
+        harness CLI override (``setting_overrides`` service) > shell env /
+        ``.env`` > this plugin's ``[plugin.config]`` value > ``default`` — and
+        the resolved value is returned *and* recorded on
+        ``V2Config.plugin_settings`` (read-only) for the run.  ``env_var`` must
+        carry the ``PHONE_AGENT_`` prefix because only that prefix is loaded
+        from ``.env``; anything else raises at assembly time, as does a second
+        capability declaring the same key.  A declaration never grants anything:
+        it only tells the harness where a plugin's value comes from.
+        """
+
+        owner = self._owner()
+        value = self._setting_registry().declare(
+            key,
+            env_var=env_var,
+            default=default,
+            description=description,
+            owner=owner,
+            plugin_config=self._manifest_configs.get(owner),
+        )
+        declare = getattr(self._services.get("config"), "declare_plugin_setting", None)
+        if callable(declare):
+            declare(str(key).strip(), value)
+        return value
+
+    def register_usage_role(self, role: str, *, unit: str = "tokens") -> None:
+        """Declare one accounting role owned by the applying capability.
+
+        ``unit="tokens"`` roles join the token budget exactly like the harness
+        roles; ``unit="calls"`` roles are counted per invocation and reported
+        separately, never adjudicated by the budget (P0 #13).  The declaration
+        is released with the capability, and recording an undeclared role still
+        raises at ``UsageLedger.record`` time (fail-visible).
+        """
+
+        self._usage_role_registry().declare(role, unit=unit, owner=self._owner())
+
+    def register_redaction(self, literal: str) -> None:
+        """Declare one sensitive literal for the v2 egress redaction boundary.
+
+        The literal (not a regex) is replaced with ``<redacted>`` in every
+        string that goes through the shared ``redact_text`` used by trace,
+        diagnostic evidence, Web run events and the streaming preview.  It must
+        be one line and at least four characters long — a shorter one would
+        redact unrelated text — and it is released with the capability.
+        Declarations change redaction only: the safety classifier and
+        prompt-side sanitization keep the built-in patterns.
+        """
+
+        self._redaction_registry().declare(literal, owner=self._owner())
 
     def add_prompt_block(self, provider: PromptProvider) -> None:
         if not callable(provider):
@@ -743,6 +894,15 @@ class CapabilityAssemblyContext:
         # replaced core tool declared (or leaves the name undeclared).
         self._risk_registry().withdraw(cap_id)
         self._pin_registry().withdraw(cap_id)
+        self._usage_role_registry().withdraw(cap_id)
+        self._redaction_registry().withdraw(cap_id)
+        withdrawn = self._setting_registry().withdraw(cap_id)
+        config = self._services.get("config")
+        withdraw_setting = getattr(config, "withdraw_plugin_setting", None)
+        if callable(withdraw_setting):
+            for key in withdrawn:
+                withdraw_setting(key)
+        self._manifest_configs.pop(cap_id, None)
         self._mounted.pop(cap_id, None)
         if disposer_error is not None:
             raise disposer_error
@@ -1255,6 +1415,10 @@ def assemble_capabilities(
         if item is None or spec.cap_id in ctx._mounted:
             continue
         mode, active_spec = item
+        # Publish the manifest values before the apply hook runs: the plugin
+        # reads them through ctx.plugin_config() and they are the override tier
+        # for the settings it declares.  Dropped by release_capability.
+        ctx._manifest_configs[spec.cap_id] = dict(active_spec.manifest_config)
         try:
             with ctx.applying(spec.cap_id):
                 if active_spec.apply is not None:
