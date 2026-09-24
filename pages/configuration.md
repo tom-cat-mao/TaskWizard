@@ -13,6 +13,14 @@
 | 3 | `.env` | 仓库根的 `.env`；**只填充未导出的键**，不覆盖已存在的 shell 环境变量 |
 | 4 | 默认值 | `v2/config.py` 中的声明 |
 
+**能力声明的配置键**（P0 #18）：能力/插件在装配期用 `ctx.register_setting(key, env_var=..., default=...,
+description=...)` 声明自己的键，并按同一条链解析——harness CLI 覆盖（`setting_overrides` 服务）> shell 环境变量
+> `.env` > 本插件 manifest `[plugin.config]` 同名值 > 声明的默认值。链底两层这样排序：`.taskwizard.toml` 是随仓库
+提交的项目配置，环境变量是本机操作面，所以环境变量压过清单值，清单值只替换声明的默认值。`env_var` 必须以
+`PHONE_AGENT_` 开头（`.env` 只加载该前缀）、默认值只支持 str/bool/int/float/None；取值读不成声明类型（如 int 键
+写成 `abc`）即装配期报错，不静默回落默认值；解析结果同时写进 `V2Config.plugin_settings` 只读映射，release 时随
+能力撤销。仓库外插件的键名由插件自己的文档列出——本页受配置键同步门禁约束，只能点名仓库源码真实读取的键。
+
 模型层在环境变量之下再叠一层单层 `models.json`：`PHONE_AGENT_MODELS_FILE` 显式指定的文件优先，否则读运行目录下的 `.taskwizard.models.json`。它只为声明式提供方、模型条目与可选 `roles` 段服务，不是通用配置层。
 
 装配时的容错与失败边界：
@@ -122,6 +130,8 @@
 成本以 token 计，累计 `usage_metadata` 的 input + output；没有 usage 时回退到本地启发式估算：CJK 字符按约 1 token/字、其余文本按 `len // 4`，每张图片按 1500 token，工具调用参数与未识别的非空 `additional_kwargs` 也计入。用量台账跨压缩持续累加，因此压缩不会重置预算。
 
 Token 预算在模型调用边界检查，已发生的调用与验收用量仍完整累计，因此最终用量可以超过阈值；达到阈值后以 `token_budget_exhausted` 停止本轮。
+
+**记账角色与单位**：角色表归 `phone_agent/v2/usage_roles.py` 的注册表所有（`usage.py` 只再导出并消费；harness 预注册 `actor`/`compact`/`verifier`/`reviewer`/`distill`，单位都是 `tokens`），插件可经 `ctx.register_usage_role(role, unit=...)` 追加自己的角色。`unit="tokens"` 的角色按本节口径进预算裁决；`unit="calls"` 的角色只按调用次数记账与上报（`UsageLedger.calls_by_role()` / `calls_total`），**不参与** token 预算裁决——预算裁决点始终归 harness，经验档案的 `tokens_by_role` 也恒为 token 角色。未声明的角色调 `record()` 报错。
 
 唯一续办例外：若达到阈值时已有由成功观测产生的 finish 复核包，且屏幕序号、原始目标与关闭且合法的任务板仍匹配，本 run 最多再给模型一次真实回复机会，处理该复核包的 `finish(confirm=true)`；不增加 `MAX_STEPS`、不自动完成。这份续办额度只覆盖该响应中的一次有效确认，其他工具操作返回 error-status 未执行回执。以下情况不补发额度：重复复核、确认被拒、人工中断恢复、复核后再次委托执行普通工具（即使命令可能已派发但回执失败、没有新观测）；续办响应中被预算直接拒绝、未委托执行的普通工具也不会撤销同响应的合法确认机会。`FINISH_VERIFY=off` 不使用这份续办额度。独立验收器的拒绝与故障 `skipped` 语义保持原样，人工控制、`PHONE_AGENT_MAX_STEPS`（`loop_fuse` 保险丝）与已接受的终局优先。
 

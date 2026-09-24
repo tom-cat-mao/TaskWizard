@@ -2,6 +2,11 @@
 
 ``build_tools(session, config)`` returns the full LangChain tool list the thin
 agent is created with: actuation + perception + control (§7).
+
+Every built-in tool is stamped with its risk declaration (P0 #18) by the builder
+that creates it (``phone_agent.v2.tool_risk.declare_builtin_risks``); the
+assembly context records the stamp in its ``tool_risk_registry`` service and the
+safety classifier reads it back.
 """
 
 from __future__ import annotations

@@ -14,8 +14,11 @@ Payload contracts for the plugin events:
 
 ``OBSERVE`` / ``"observe"``
     Observed with :meth:`EventBus.emit` after an observation is committed.
-    Payload contains ``epoch``, ``screen_seq``, ``marks_count``, and
-    ``marks_failure_code``.
+    Payload contains ``epoch``, ``screen_seq``, ``marks_count``,
+    ``marks_failure_code`` and ``screen_hash`` — the short sha256 of the
+    committed frame's screenshot payload (never the image itself, P0 #6), so a
+    listener can tell whether the picture materially changed without touching
+    pixels.
 
 ``APP_LAUNCHED`` / ``"app/launched"``
     Observed with :meth:`EventBus.emit` from two sources (WP-WF4-A scheme C):
@@ -79,6 +82,16 @@ Payload contracts for the plugin events:
     is a terminal state summary containing ``run_id`` and the final
     ``messages``.
 
+``CAPABILITY_TOOLS_UNDECLARED`` / ``"capability/tools_undeclared"``
+    Observed with :meth:`EventBus.emit` at the end of an assembly pass, once,
+    and only when at least one registered tool carries no risk declaration.
+    Payload is ``{"tools": [<tool names>], "owners": {<tool name>: <owner>}}``
+    — never tool arguments, paths or screenshots.  Classification is unaffected
+    (an undeclared tool stays fail-closed as ``actuation``); this event exists so
+    plugin authors learn the names at assembly time instead of in a run trace.
+    The same list is also printed to stderr and recorded through the session's
+    ``resolution_trace_recorder`` when the harness provides one.
+
 ``REJECT``
     Policy-rejection sentinel for waterfall short-circuits.
 
@@ -106,6 +119,7 @@ MODEL_REQUEST = "model/request"
 MODEL_POST_REQUEST = "model/post_request"
 TOOL_EXECUTE = "tool/execute"
 AGENT_AFTER = "agent/after"
+CAPABILITY_TOOLS_UNDECLARED = "capability/tools_undeclared"
 
 _EVENT_RE = re.compile(r"^[a-z]+/[a-z_]+$")
 _RESERVED_EVENTS = frozenset(
@@ -121,6 +135,7 @@ _RESERVED_EVENTS = frozenset(
         MODEL_POST_REQUEST,
         TOOL_EXECUTE,
         AGENT_AFTER,
+        CAPABILITY_TOOLS_UNDECLARED,
     }
 )
 

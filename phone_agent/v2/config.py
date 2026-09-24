@@ -10,9 +10,12 @@ See ``AGENTS.md`` §4 for the binding contract.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 import os
-from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any
 
 # repo root = phone_agent/v2/config.py -> parents[2]
 ROOT = Path(__file__).resolve().parents[2]
@@ -484,6 +487,32 @@ class V2Config:
     plugins_enabled: bool = True
     plugin_manifest: str | None = None
     plugin_index: str = "plugins/index.json"
+    # Capability/plugin-declared settings (P0 #18 declaration plane). The
+    # assembly layer resolves each key declared through
+    # ``ctx.register_setting(...)`` with the same precedence chain as the fields
+    # above (CLI override > env > .env > manifest [plugin.config] > default) and
+    # records the result here; consumers read the read-only ``plugin_settings``
+    # view.  ``from_env`` never writes it, and releasing a capability removes
+    # the keys it declared.
+    _plugin_settings: dict[str, Any] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+    @property
+    def plugin_settings(self) -> Mapping[str, Any]:
+        """Read-only view of capability/plugin-declared setting values."""
+
+        return MappingProxyType(self._plugin_settings)
+
+    def declare_plugin_setting(self, key: str, value: Any) -> None:
+        """Record one assembly-time declared setting (harness-owned writer)."""
+
+        self._plugin_settings[str(key)] = value
+
+    def withdraw_plugin_setting(self, key: str) -> None:
+        """Drop one declared setting (its declaring capability was released)."""
+
+        self._plugin_settings.pop(str(key), None)
 
     @classmethod
     def from_env(cls, overrides: dict | None = None) -> "V2Config":

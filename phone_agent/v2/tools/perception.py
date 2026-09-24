@@ -16,6 +16,7 @@ from phone_agent.v2.session import (
     classify_locate_failure,
     normalize_locate_failure_code,
 )
+from phone_agent.v2.tool_risk import declare_builtin_risks
 from phone_agent.v2.tools._obs import (
     auto_observation,
     locate_observation,
@@ -122,12 +123,14 @@ def build_perception_tools(session, config) -> list[StructuredTool]:
         # U1: return the same frame the visual model located on (no extra observe).
         return locate_observation(session, head), _locate_artifact(session)
 
-    return [
-        StructuredTool.from_function(read_screen, parse_docstring=True),
-        StructuredTool.from_function(
-            locate, parse_docstring=True, response_format="content_and_artifact"
-        ),
-    ]
+    return declare_builtin_risks(
+        [
+            StructuredTool.from_function(read_screen, parse_docstring=True),
+            StructuredTool.from_function(
+                locate, parse_docstring=True, response_format="content_and_artifact"
+            ),
+        ]
+    )
 
 
 def _locate_artifact(session, *, failure_code: str | None = None) -> dict:

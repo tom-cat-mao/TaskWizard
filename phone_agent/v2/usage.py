@@ -7,8 +7,17 @@ from threading import Lock
 from typing import Any
 
 from phone_agent.v2.middleware._tokens import estimate_message_tokens, usage_tokens
+from phone_agent.v2.usage_roles import (
+    HARNESS_USAGE_ROLES,
+    USAGE_ROLE_REGISTRY,
+    USAGE_UNITS,
+    UsageRoleRegistry,
+    registered_usage_roles,
+)
 
-USAGE_ROLES = frozenset({"actor", "compact", "verifier", "reviewer", "distill"})
+# The roles the harness itself records; the live registry (which capabilities
+# extend with ``ctx.register_usage_role``) is ``USAGE_ROLE_REGISTRY``.
+USAGE_ROLES = frozenset(role for role, _unit in HARNESS_USAGE_ROLES)
 
 # Provider usage schemas have not converged on one cache-hit field.  Probe known
 # raw and normalized aliases, then take the largest usable value so duplicate
@@ -126,11 +135,19 @@ def _cached_tokens(message: Any) -> int:
 
 
 class UsageLedger:
-    """Thread-safe-enough token accumulator for one agent run.
+    """Thread-safe-enough accounting accumulator for one agent run.
 
     Provider-reported usage wins whenever it is available. Callers may supply a
     fuller request-plus-response estimate for providers that omit metadata; when
     they do not, the response message itself is estimated as a final fallback.
+
+    Roles come from :data:`phone_agent.v2.usage_roles.USAGE_ROLE_REGISTRY`; an
+    unregistered role still raises.  ``unit="tokens"`` roles accumulate token
+    cost (input + output, plus the provider-reported cache counts) and are what
+    the token budget adjudicates.  ``unit="calls"`` roles accumulate invocation
+    counts only — they are reported through :meth:`calls_by_role` and never
+    enter :attr:`total`, so the budget adjudication point stays token-only
+    (P0 #13).
     """
 
     def __init__(self) -> None:
@@ -139,6 +156,8 @@ class UsageLedger:
         self._by_role: dict[str, int] = {}
         self._cached_total = 0
         self._cached_by_role: dict[str, int] = {}
+        self._calls_total = 0
+        self._calls_by_role: dict[str, int] = {}
 
     def record(
         self,
@@ -147,10 +166,29 @@ class UsageLedger:
         *,
         estimate_tokens: int | None = None,
     ) -> int:
-        """Record one model call and return the number of tokens counted."""
+        """Record one model call and return the number of units counted.
 
-        if role not in USAGE_ROLES:
+        A ``unit="tokens"`` role returns the counted tokens (0 when nothing can
+        be counted).  A ``unit="calls"`` role counts the invocation itself and
+        therefore takes no payload: passing a message or an estimate raises
+        instead of silently mislabeling tokens as calls.
+        """
+
+        unit = USAGE_ROLE_REGISTRY.unit_of(role)
+        if unit is None:
             raise ValueError(f"unknown usage role: {role!r}")
+
+        if unit == "calls":
+            if message_or_none is not None or estimate_tokens is not None:
+                raise ValueError(
+                    f"usage role {role!r} is declared with unit='calls': record it "
+                    "as ledger.record(role) — one invocation per call, no message "
+                    "or token estimate"
+                )
+            with self._lock:
+                self._calls_total += 1
+                self._calls_by_role[role] = self._calls_by_role.get(role, 0) + 1
+            return 1
 
         reported = (
             usage_tokens(message_or_none) if message_or_none is not None else None
@@ -177,16 +215,34 @@ class UsageLedger:
 
     @property
     def total(self) -> int:
-        """Grand total across actor and every side-model role."""
+        """Grand token total across actor and every side-model token role."""
 
         with self._lock:
             return self._total
 
     def by_role(self) -> dict[str, int]:
-        """Return a snapshot of cumulative usage grouped by model role."""
+        """Snapshot of cumulative token usage grouped by ``unit="tokens"`` role.
+
+        Call-unit roles are excluded by design: this mapping is what the episode
+        schema stores as ``tokens_by_role``.  Read them through
+        :meth:`calls_by_role`.
+        """
 
         with self._lock:
             return dict(self._by_role)
+
+    @property
+    def calls_total(self) -> int:
+        """Grand total of recorded invocations across ``unit="calls"`` roles."""
+
+        with self._lock:
+            return self._calls_total
+
+    def calls_by_role(self) -> dict[str, int]:
+        """Snapshot of cumulative invocation counts for ``unit="calls"`` roles."""
+
+        with self._lock:
+            return dict(self._calls_by_role)
 
     @property
     def cached_total(self) -> int:
@@ -209,6 +265,16 @@ class UsageLedger:
             self._by_role.clear()
             self._cached_total = 0
             self._cached_by_role.clear()
+            self._calls_total = 0
+            self._calls_by_role.clear()
 
 
-__all__ = ["UsageLedger", "USAGE_ROLES", "usage_details"]
+__all__ = [
+    "USAGE_ROLES",
+    "USAGE_ROLE_REGISTRY",
+    "USAGE_UNITS",
+    "UsageLedger",
+    "UsageRoleRegistry",
+    "registered_usage_roles",
+    "usage_details",
+]

@@ -8,6 +8,11 @@ Usage:
 Resolution order: CLI overrides > shell env > project .env > defaults. All flags
 default to ``None`` so unset flags never clobber env-derived values.
 
+Maintenance commands are dispatched through the assembled ``cli_handlers``
+registry (the harness' own flags plus whatever external capabilities registered
+via ``ctx.add_cli_command``); a plugin command is invoked as ``--<name>`` with an
+optional ``=VALUE``.
+
 Exit codes: success 0 / error 1 / takeover 2 / budget-or-fuse exhausted 3.
 
 See ``AGENTS.md`` §11 for the binding contract.
@@ -18,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from phone_agent.v2.capabilities import (
@@ -48,17 +54,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lang", default=None, help="prompt language (cn/en)")
     parser.add_argument("--trace-dir", default=None, help="trace output directory")
     maintenance = parser.add_mutually_exclusive_group()
-    maintenance.add_argument(
+    # The dests declared here are the harness' own maintenance commands; the
+    # dispatcher resolves them (plus external plugin commands) through the
+    # assembled ``cli_handlers`` registry — see _maintenance_command.
+    maintenance_dests: list[str] = []
+
+    def _maintenance_flag(*names: str, **kwargs: Any) -> None:
+        maintenance_dests.append(maintenance.add_argument(*names, **kwargs).dest)
+
+    _maintenance_flag(
         "--dream",
         action="store_true",
         help="consolidate the local App-KB instead of running a phone task",
     )
-    maintenance.add_argument(
+    _maintenance_flag(
         "--rebuild-vec",
         action="store_true",
         help="rebuild the semantic recall index from episode/App-KB JSONL",
     )
-    maintenance.add_argument(
+    _maintenance_flag(
         "--distill",
         action="store_true",
         help=(
@@ -66,43 +80,46 @@ def build_parser() -> argparse.ArgumentParser:
             " needs_review (offline)"
         ),
     )
-    maintenance.add_argument(
+    _maintenance_flag(
         "--review-lessons",
         action="store_true",
         help="interactively review proposed/needs_review lessons",
     )
-    maintenance.add_argument(
+    _maintenance_flag(
         "--approve-lesson",
         metavar="ID",
         help="approve one lesson (human correction channel, never a gate)",
     )
-    maintenance.add_argument(
+    _maintenance_flag(
         "--revoke-lesson",
         nargs=2,
         metavar=("ID", "REASON"),
         help="revoke one lesson with a reason",
     )
-    maintenance.add_argument(
+    _maintenance_flag(
         "--supersede-lesson",
         nargs=2,
         metavar=("ID", "TEXT"),
         help="create a proposed next version of a lesson",
     )
-    maintenance.add_argument(
+    _maintenance_flag(
         "--learn-alias",
         metavar="NAME=PACKAGE",
         help="set a highest-trust global app alias",
     )
-    maintenance.add_argument(
+    _maintenance_flag(
         "--forget-alias",
         metavar="NAME",
         help="remove global learned/user aliases for a name",
     )
-    maintenance.add_argument(
+    _maintenance_flag(
         "--list-models",
         action="store_true",
         help="list the provider/model registry (S4) instead of running a phone task",
     )
+    # argparse has no public slot for custom metadata; the dispatcher reads the
+    # flag dests the parser actually declared instead of a second name list.
+    parser.maintenance_dests = tuple(maintenance_dests)  # type: ignore[attr-defined]
     return parser
 
 
@@ -272,19 +289,83 @@ def _lesson_effectiveness_by_id(config: V2Config) -> dict[str, Any]:
         return {}
 
 
-def _maintenance_requested(args: argparse.Namespace) -> bool:
-    return bool(
-        args.dream
-        or args.rebuild_vec
-        or args.distill
-        or args.review_lessons
-        or args.approve_lesson
-        or args.revoke_lesson
-        or args.supersede_lesson
-        or getattr(args, "learn_alias", None) is not None
-        or getattr(args, "forget_alias", None) is not None
-        or getattr(args, "list_models", False)
-    )
+def _split_argv(argv: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Split argv at the first bare ``--`` into (options, positional tail).
+
+    ``--`` is the standard end-of-options marker: everything after it is task
+    text, never an option and never a capability-provided command.  The caller
+    re-inserts the separator before parsing so argparse keeps assigning the tail
+    to the positional slot exactly as it would without this split.
+    """
+
+    tokens = [str(token) for token in argv]
+    if "--" not in tokens:
+        return tokens, []
+    index = tokens.index("--")
+    return tokens[:index], tokens[index + 1 :]
+
+
+def _selected_flags(args: argparse.Namespace, dests: Sequence[str]) -> list[str]:
+    """Return the flag dests set on ``args``; ``None``/``False`` means unset."""
+
+    return [
+        name
+        for name in dests
+        if getattr(args, name, None) is not None
+        and getattr(args, name, None) is not False
+    ]
+
+
+def _maintenance_command(args: argparse.Namespace, dests: Sequence[str]) -> str | None:
+    """Return the harness maintenance flag selected by argv, else ``None``.
+
+    ``dests`` are the flag dests :func:`build_parser` declared (the parser is the
+    single source of truth for them); two at once used to be resolved by a hidden
+    precedence and now raise (fail-visible).  External capability commands are not
+    flags on the harness parser; :func:`_plugin_cli_command` resolves them against
+    the assembled ``cli_handlers`` registry instead.
+    """
+
+    selected = _selected_flags(args, dests)
+    if len(selected) > 1:
+        raise ValueError(
+            "conflicting maintenance commands: "
+            + ", ".join(f"--{name.replace('_', '-')}" for name in selected)
+        )
+    return selected[0] if selected else None
+
+
+def _plugin_cli_command(
+    extra: Sequence[str],
+    commands: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> str | None:
+    """Attach/recognize an external capability's CLI command from leftover argv.
+
+    A plugin command is invoked as ``--<command>`` (with optional ``=VALUE``);
+    the handler receives the parsed namespace, so ``--<command>=VALUE`` lands as
+    ``args.<command>``.  Anything else left over is an argparse-level error
+    (fail-visible, never silently ignored).
+    """
+
+    if not extra:
+        return None
+    selected: list[str] = []
+    for token in extra:
+        raw = str(token)
+        if not raw.startswith("--"):
+            raise ValueError(f"unexpected argument: {raw}")
+        flag, _, value = raw[2:].partition("=")
+        name = flag.strip().replace("-", "_")
+        if name not in commands:
+            raise ValueError(f"unrecognized arguments: {' '.join(extra)}")
+        if len(selected) > 0:
+            raise ValueError(
+                f"conflicting maintenance commands: {' '.join(extra)}"
+            )
+        selected.append(name)
+        setattr(args, name, value if value else True)
+    return selected[0]
 
 
 def _list_models(config: V2Config) -> int:
@@ -311,26 +392,17 @@ def _list_models(config: V2Config) -> int:
     return 0
 
 
-def _maintenance_command(args: argparse.Namespace) -> str | None:
-    for name in (
-        "dream",
-        "rebuild_vec",
-        "distill",
-        "review_lessons",
-        "approve_lesson",
-        "revoke_lesson",
-        "supersede_lesson",
-        "learn_alias",
-        "forget_alias",
-    ):
-        value = getattr(args, name, None)
-        if value is not None and value is not False:
-            return name
-    return None
+def _build_cli_capability_context(
+    config: V2Config, *, external: list[Any] | None = None
+) -> CapabilityAssemblyContext:
+    """Mount maintenance commands through the same capability registry.
 
-
-def _build_cli_capability_context(config: V2Config) -> CapabilityAssemblyContext:
-    """Mount maintenance commands through the same capability registry."""
+    External plugin specs join the same registry (G1), so a plugin's
+    ``ctx.add_cli_command(...)`` actually reaches the dispatcher.  The CLI
+    assembly context publishes no device session — a plugin ``apply`` that needs
+    one must tolerate ``ctx.service("session")`` being ``None``, like every
+    other optional factory in this layer.
+    """
 
     def dream(_args: argparse.Namespace) -> int:
         _print_dream_summary(_run_dream(config, light=False))
@@ -497,7 +569,10 @@ def _build_cli_capability_context(config: V2Config) -> CapabilityAssemblyContext
             }
         }
     )
-    return assemble_capabilities(build_capability_registry(config), context)
+    registry = build_capability_registry(config)
+    for spec in _external_capabilities(config) if external is None else external:
+        registry.register(spec)
+    return assemble_capabilities(registry, context)
 
 
 def _build_plugin_parser() -> argparse.ArgumentParser:
@@ -613,19 +688,55 @@ def main(argv: list[str] | None = None) -> int:
         return _run_plugin_cli(raw_argv[1:], config)
 
     parser = build_parser()
-    args = parser.parse_args(argv)
-
-    if not args.task and not _maintenance_requested(args):
-        parser.error("a task description is required")
-    if args.task and _maintenance_requested(args):
-        parser.error("task description cannot be combined with a maintenance command")
+    # ``parse_known_args`` lets an external capability's command (``--<name>``,
+    # a cli_handler registered during assembly) through; every leftover token is
+    # validated below, so a typo is still a hard argparse-style error.  Tokens
+    # after a bare ``--`` are positional task text and are excluded from that
+    # capability-command matching on purpose.
+    options, tail = _split_argv(raw_argv)
+    args, extra = (
+        parser.parse_known_args([*options, "--", *tail])
+        if tail
+        else parser.parse_known_args(options)
+    )
+    after_separator = bool(tail)
+    maintenance_dests = getattr(parser, "maintenance_dests", ())
 
     config = V2Config.from_env(_overrides_from_args(args))
     if getattr(args, "list_models", False):
         return _list_models(config)
-    command_name = _maintenance_command(args)
+
+    # The CLI capability context (the only assembly that mounts cli_handlers) is
+    # built when argv actually asks for a maintenance command, so a task run
+    # never applies plugin code twice.
+    try:
+        command_name = _maintenance_command(args, maintenance_dests)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if extra and (
+        after_separator
+        or any(not str(token).startswith("--") for token in extra)
+    ):
+        # A stray positional, or anything after ``--``, is an argv mistake — not
+        # a capability command: report it before any plugin assembly runs.
+        parser.error(f"unrecognized arguments: {' '.join(extra)}")
+    commands: Mapping[str, Any] = {}
+    if command_name is not None or extra:
+        commands = _build_cli_capability_context(config).cli_commands
+    if extra:
+        try:
+            plugin_command = _plugin_cli_command(extra, commands, args)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if command_name is not None and plugin_command is not None:
+            parser.error("only one maintenance command may be selected")
+        command_name = command_name or plugin_command
+    if not args.task and command_name is None:
+        parser.error("a task description is required")
+    if args.task and command_name is not None:
+        parser.error("task description cannot be combined with a maintenance command")
     if command_name is not None:
-        handler = _build_cli_capability_context(config).cli_commands.get(command_name)
+        handler = commands.get(command_name)
         if handler is None:
             print(
                 f"error: capability for --{command_name.replace('_', '-')} is unavailable",

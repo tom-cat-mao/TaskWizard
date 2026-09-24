@@ -34,9 +34,11 @@ from langchain_core.messages import (
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from phone_agent.v2.capabilities import (
+    RUN_CONTEXT_SERVICE,
     CapabilityAssemblyContext,
     CapabilityRegistry,
     PromptBlock,
+    RunContext,
     assemble_capabilities,
     build_capability_registry,
 )
@@ -763,6 +765,12 @@ class ThinPhoneAgent:
     after every extra observer so they see ordinary results and policy
     short-circuits. The core agent remains headless when the argument is
     omitted.
+
+    Assembly publishes this run's identity (``run_id`` / ``actor_model`` /
+    ``goal``) as the harness-owned ``run_context`` service; see
+    :class:`phone_agent.v2.capabilities.RunContext` for the lifecycle a consumer
+    must handle.  ``runner.py`` (Web) and ``main_v2.py`` (headless) both go
+    through this constructor, so the two paths publish it identically.
     """
 
     def __init__(
@@ -819,12 +827,20 @@ class ThinPhoneAgent:
             keep_images=getattr(config, "image_keep", 2),
             keep_marks=getattr(config, "obs_marks_keep", 2),
         )
+        # G2: the run's identity travels as a harness-owned service (P0 #18), so
+        # a capability or plugin reads it through the ordinary service plane
+        # instead of a private agent factory.  It is published with the context
+        # itself, i.e. before the provider bootstrap pass (which mounts
+        # provider-contributor plugins); run_id is fixed now, actor_model is
+        # filled once the actor model is built, and run() fills the goal.
+        self._run_context = RunContext(self.run_id)
         self._capability_ctx = CapabilityAssemblyContext(
             {
                 "event_bus": self.event_bus,
                 "session": self.session,
                 "config": config,
                 "context_pruner": context_pruner,
+                RUN_CONTEXT_SERVICE: self._run_context,
             }
         )
         from phone_agent.v2.providers import (
@@ -1038,6 +1054,10 @@ class ThinPhoneAgent:
                     except Exception:  # noqa: BLE001 - diagnostics are observe-only
                         return None
                 return None
+
+        # G2: the actor model exists now, so fill the reference the identity
+        # service carries ("" when no ref resolved); ``run()`` fills the goal.
+        self._run_context._set_actor_model(str(self._actor_actual_ref or ""))
 
         for name, value in {
             "event_bus": self.event_bus,
@@ -2018,6 +2038,12 @@ class ThinPhoneAgent:
         from langgraph.types import Command
 
         ts_start = time.time()
+        # G2: the run's identity service is complete before any run hook or
+        # listener fires, so everything reached through the run sees the real
+        # goal instead of the assembly-time empty value.
+        run_context = getattr(self, "_run_context", None)
+        if run_context is not None:
+            run_context._begin(task)
         try:
             self.session.run_goal = task
         except Exception:  # noqa: BLE001 - duck-typed sessions may be immutable

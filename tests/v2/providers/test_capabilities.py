@@ -22,10 +22,10 @@ def test_registry_maps_modes_and_reports_unready_dependencies() -> None:
     registry.register(CapabilitySpec("taskdoc", "TaskDoc", "off"))
     registry.register(CapabilitySpec("recall", "Recall", "shadow"))
     registry.register(
-        CapabilitySpec("dream", "Dream", "manual", deps=("app_kb",))
+        CapabilitySpec("dream", "Dream", "on", deps=("app_kb",))
     )
     registry.register(
-        CapabilitySpec("planner", "Planner", "custom", deps=("taskdoc",))
+        CapabilitySpec("planner", "Planner", "on", deps=("taskdoc",))
     )
 
     rows = _by_id(registry)
@@ -35,7 +35,7 @@ def test_registry_maps_modes_and_reports_unready_dependencies() -> None:
     assert rows["dream"] == {
         "cap_id": "dream",
         "title": "Dream",
-        "mode": "manual",
+        "mode": "on",
         "state": "pending",
         "missing_deps": ["app_kb"],
     }

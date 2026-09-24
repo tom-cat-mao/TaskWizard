@@ -19,6 +19,7 @@ from langchain_core.tools import StructuredTool
 
 from phone_agent.v2.events import TASKDOC_ITEM_COMPLETED
 from phone_agent.v2.taskdoc import TaskDoc, TaskItem
+from phone_agent.v2.tool_risk import declare_builtin_risk
 
 
 def _emit_completed_boundaries(session, previous: TaskDoc, committed: TaskDoc) -> None:
@@ -141,4 +142,6 @@ def make_update_task_doc_tool(session, lang: str) -> StructuredTool:
             parts.append("提示：尚无屏幕观测，建议先 read_screen 再规划路线。")
         return "\n".join(parts)
 
-    return StructuredTool.from_function(update_task_doc, parse_docstring=True)
+    return declare_builtin_risk(
+        StructuredTool.from_function(update_task_doc, parse_docstring=True)
+    )

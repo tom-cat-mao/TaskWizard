@@ -5,6 +5,38 @@ mount every optional capability through five declared seams.  The concrete
 context records each registration under the currently applying ``cap_id`` so a
 later release can remove the whole contribution without guessing object names.
 
+Alongside the mount seams the context owns the **declaration plane** (P0 #18):
+``register_tool(..., risk=...)`` records a tool's risk into the
+``tool_risk_registry`` service the safety classifier reads,
+``register_pin_prefix`` claims a pinned message-id prefix in
+``pin_prefix_registry``, ``register_setting`` declares a configuration key whose
+value resolves through the same CLI > env > .env > manifest > default chain as
+the built-in ``V2Config`` fields, ``register_usage_role`` extends the accounting
+roles the usage ledger and the experience schema validate against, and
+``register_redaction`` declares a sensitive literal for the v2 egress redaction
+boundary.  Declarations decide *how something is classified, charged or
+redacted* — never whether it is allowed — and every declaration point fails
+visibly (duplicate tool names, invalid modes, overwriting a harness-owned
+service, undeclared pin prefixes, unprefixed setting env vars, unknown units,
+too-short redaction literals).  ``CapabilitySpec.mode`` is the mount mode and is
+limited to ``off`` / ``shadow`` / ``on``; a domain mode (``wary``, ``auto``,
+``manual``, ...) is translated to ``on`` by ``_capability_mode``.
+
+A capability's manifest entry may carry a ``[plugin.config]`` table; it travels
+on ``CapabilitySpec.manifest_config`` and is readable inside ``apply`` through
+:meth:`CapabilityAssemblyContext.plugin_config`, where it is also the tier that
+replaces the declared defaults of that capability's settings.
+
+Two more assembly-plane facts are declared here.  ``CapabilitySpec.before`` /
+``CapabilitySpec.after`` are **ordering hints** (G3): they say when a
+capability's ``apply`` (and therefore its listeners) runs relative to another
+one, are resolved by a deterministic topological pass at assembly time, and fail
+visibly on a hint naming an unregistered capability or on a cycle.  Unlike
+``deps`` they never gate a mount — a hint at a capability that is ``off`` is
+simply vacuous.  The run's identity travels as the harness-owned ``run_context``
+service (:class:`RunContext`), published by the agent at assembly and completed
+with the goal when the run starts.
+
 This is intentionally a static assembly layer.  Reconciliation is useful while
 building agents and in tests/consoles, but it does not mutate a compiled agent's
 tool table while a run is in progress.
@@ -12,18 +44,25 @@ tool table while a run is in progress.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
+import sys
 from typing import Any, Protocol, runtime_checkable
 
 from phone_agent.v2.events import (
+    CAPABILITY_TOOLS_UNDECLARED,
     MODEL_POST_REQUEST,
     MODEL_PRE_REQUEST,
     MODEL_REQUEST,
     TOOL_EXECUTE,
 )
+from phone_agent.v2.pins import PinPrefixRegistry
+from phone_agent.v2.redaction import REDACTION_REGISTRY, RedactionRegistry
+from phone_agent.v2.settings import SettingRegistry
+from phone_agent.v2.tool_risk import TOOL_RISKS, ToolRisk, declared_risk
+from phone_agent.v2.usage_roles import USAGE_ROLE_REGISTRY, UsageRoleRegistry
 
 CapabilityHook = Callable[..., None]
 PromptProvider = Callable[..., Any]
@@ -37,6 +76,15 @@ _CAPABILITY_ID = re.compile(r"^[a-z][a-z0-9_]*$")
 # A ``provides`` service key follows the same grammar as a capability id.
 _SERVICE_NAME = _CAPABILITY_ID
 _RUN_HOOK_WHEN = frozenset({"start", "end"})
+# The only legal capability mount modes (P0 #18).  Domain modes (``wary``,
+# ``auto``, ``manual``, ...) are translated by ``_capability_mode`` — a
+# non-empty value outside this set used to mean "active" silently, which let a
+# typo mount a capability at full strength.
+CAPABILITY_MODES: frozenset[str] = frozenset({"off", "shadow", "on"})
+# Owner label for harness-published products.  Deliberately outside the cap_id
+# grammar (``^[a-z][a-z0-9_]*$``) so it can never collide with a capability.
+HARNESS_OWNER = "__harness__"
+_CORE_OWNER = "__core__"
 
 # Middleware is now reserved for LangChain bridge middleware only; all policy
 # behavior lives on the event bus.  Capabilities should not register middleware
@@ -56,6 +104,95 @@ _RUN_HOOK_ORDER = {
         "dream": 90,
     },
 }
+# The harness-owned service carrying a run's identity (G2).
+RUN_CONTEXT_SERVICE = "run_context"
+
+
+class RunContext:
+    """Harness-owned identity of the run an agent is executing (G2).
+
+    Published as the ``run_context`` service so a capability or plugin reads the
+    run through the ordinary service plane instead of reaching into private
+    agent factories (``compact``'s memory-state provider, ``deliverable``'s
+    run-id factory, ...).  Each field is filled at the moment it first exists:
+
+    * :attr:`run_id` — fixed when the agent is assembled (`ThinPhoneAgent`
+      mints one or takes the runner's), so an ``apply`` hook can read it;
+    * :attr:`actor_model` — the reference the actor model was built from, filled
+      once that model exists; ``""`` before then and when no ref resolved;
+    * :attr:`goal` — the task text, which exists only once ``run()`` starts.
+
+    Lifecycle, and what a consumer must handle:
+
+    * outside a run-assembling harness the service is **absent** — the CLI
+      maintenance context of ``main_v2.py`` has no run, so
+      ``ctx.service("run_context")`` is ``None`` there;
+    * a run-assembling harness publishes it with the assembly context itself,
+      i.e. before the provider bootstrap pass, so even a plugin mounted in that
+      pass reads the real ``run_id``;
+    * between assembly and the first ``run()`` the service exists but
+      :attr:`started` is ``False``, :attr:`goal` is ``""`` and
+      :attr:`actor_model` may still be ``""`` (bootstrap-pass readers);
+    * ``run()`` records the goal *before* any run hook or listener fires, so
+      everything reached through the run itself sees the real task.
+
+    An empty goal therefore never means "a run with an empty task": it means no
+    run has started on this context.  A consumer that needs the goal without
+    checking :attr:`started` should call :meth:`require_goal`, which turns the
+    misuse into a visible ``RuntimeError`` instead of a silently empty prompt.
+    """
+
+    def __init__(self, run_id: str, *, actor_model: str = "") -> None:
+        self._run_id = str(run_id)
+        self._actor_model = str(actor_model or "")
+        self._goal = ""
+        self._started = False
+
+    @property
+    def run_id(self) -> str:
+        """Stable id of this run (also the trace/thread id)."""
+
+        return self._run_id
+
+    @property
+    def actor_model(self) -> str:
+        """The actor's model reference (``""`` when none resolved yet)."""
+
+        return self._actor_model
+
+    @property
+    def goal(self) -> str:
+        """The task text; ``""`` until a run starts (see :attr:`started`)."""
+
+        return self._goal
+
+    @property
+    def started(self) -> bool:
+        """Whether a run has begun on this context (``goal`` is real)."""
+
+        return self._started
+
+    def require_goal(self) -> str:
+        """Return :attr:`goal`, or raise when no run has started yet."""
+
+        if not self._started:
+            raise RuntimeError(
+                "run_context.goal is not set: no run has started on this context "
+                "(read it from a run hook or a run-time listener, or gate on "
+                "run_context.started)"
+            )
+        return self._goal
+
+    def _set_actor_model(self, actor_model: str) -> None:
+        """Fill the actor's model reference (harness-only, after the build)."""
+
+        self._actor_model = str(actor_model or "")
+
+    def _begin(self, goal: str) -> None:
+        """Record the goal of the run starting now (harness-only)."""
+
+        self._goal = str(goal)
+        self._started = True
 
 
 @runtime_checkable
@@ -64,7 +201,7 @@ class CapabilityContext(Protocol):
 
     def register_middleware(self, middleware: Any) -> None: ...
 
-    def register_tool(self, tool: Any) -> None: ...
+    def register_tool(self, tool: Any, *, risk: ToolRisk | None = None) -> None: ...
 
     def add_prompt_block(self, provider: PromptProvider) -> None: ...
 
@@ -73,6 +210,23 @@ class CapabilityContext(Protocol):
     def add_cli_command(self, name: str, handler: CliHandler) -> None: ...
 
     def register_service(self, name: str, value: Any) -> None: ...
+
+    def register_pin_prefix(self, prefix: str) -> None: ...
+
+    def register_setting(
+        self,
+        key: str,
+        *,
+        env_var: str,
+        default: Any,
+        description: str,
+    ) -> Any: ...
+
+    def register_usage_role(self, role: str, *, unit: str = "tokens") -> None: ...
+
+    def register_redaction(self, literal: str) -> None: ...
+
+    def plugin_config(self) -> Mapping[str, Any]: ...
 
     def on(
         self, event: str, listener: Callable[..., Any], *, prepend: bool = False
@@ -93,9 +247,114 @@ class PromptBlock:
             raise ValueError(f"invalid prompt block placement: {self.placement!r}")
 
 
+class ToolRiskRegistry(Mapping[str, str]):
+    """Assembly-time tool-risk declarations (P0 #18 declaration plane).
+
+    Mapping of tool name -> declared risk (``actuation`` / ``readonly``).  Only
+    *declared* names appear: a consumer that finds no entry must fail closed to
+    ``actuation`` (the safety classifier does), so a silent registration cannot
+    open the observation-only path.
+
+    Entries stack by owner, exactly like the tool mounts they describe: a
+    capability that replaces a same-named core tool supersedes its declaration
+    and reveals the core one again on release.  Registration is assembly-time
+    only — consumers get a read-only mapping; population happens through
+    :meth:`CapabilityAssemblyContext.register_tool`.
+    """
+
+    def __init__(self) -> None:
+        self._declared: dict[str, list[tuple[str, str | None]]] = {}
+
+    def declare(self, name: str, risk: str | None, *, owner: str) -> None:
+        """Record one declaration under ``owner`` (``None`` = no declaration)."""
+
+        clean = str(name).strip()
+        if not clean:
+            raise ValueError("tool risk declaration requires a tool name")
+        if risk is not None and risk not in TOOL_RISKS:
+            raise ValueError(
+                f"invalid tool risk: {risk!r} (expected actuation/readonly)"
+            )
+        entries = self._declared.setdefault(clean, [])
+        if entries and entries[-1][0] == owner:
+            entries[-1] = (owner, risk)
+            return
+        entries.append((owner, risk))
+
+    def withdraw(self, owner: str) -> None:
+        """Drop every entry declared by ``owner`` (release/replacement)."""
+
+        for name in list(self._declared):
+            entries = [
+                entry for entry in self._declared[name] if entry[0] != owner
+            ]
+            if entries:
+                self._declared[name] = entries
+            else:
+                self._declared.pop(name, None)
+
+    def risk_for(self, name: str) -> str | None:
+        """The active declaration for ``name`` (``None`` when undeclared)."""
+
+        entries = self._declared.get(str(name))
+        return entries[-1][1] if entries else None
+
+    def as_dict(self) -> dict[str, str]:
+        """Snapshot of the active declarations (for docs/tests/trace)."""
+
+        return {
+            name: risk
+            for name in self._declared
+            if (risk := self.risk_for(name)) is not None
+        }
+
+    def undeclared(self) -> dict[str, str]:
+        """Registered tools whose active declaration is missing, by owner.
+
+        These are the names that fail closed to ``actuation`` at classification
+        time; assembly reports them so a plugin author sees the omission without
+        reading a run trace.
+        """
+
+        return {
+            name: entries[-1][0]
+            for name, entries in self._declared.items()
+            if entries[-1][1] is None
+        }
+
+    def actuation_names(self) -> tuple[str, ...]:
+        """Every registered tool the classifier must treat as ``actuation``.
+
+        Declared ``actuation`` **plus** every undeclared registration (the
+        fail-closed default); only an explicit ``readonly`` declaration takes a
+        name out.  The ``hard``-mode interrupt table is built from this set, so a
+        tool that stays silent interrupts exactly like one that declares
+        ``actuation``.  Released capabilities withdraw their entries, so a tool
+        that is gone no longer appears.
+        """
+
+        return tuple(
+            name
+            for name, entries in self._declared.items()
+            if str(entries[-1][1] or "actuation").strip().lower() != "readonly"
+        )
+
+    def __getitem__(self, name: str) -> str:
+        risk = self.risk_for(name)
+        if risk is None:
+            raise KeyError(name)
+        return risk
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.as_dict())
+
+    def __len__(self) -> int:
+        return len(self.as_dict())
+
+
 @dataclass(frozen=True)
 class CapabilitySpec:
-    """Stable identity, configured mode, dependencies, and lifecycle hooks."""
+    """Stable identity, configured mode, dependencies, order hints, hooks."""
 
     cap_id: str
     title: str
@@ -104,19 +363,66 @@ class CapabilitySpec:
     apply: CapabilityHook | None = None
     release: CapabilityHook | None = None
     provides: str | None = None
+    # ``[plugin.config]`` of the manifest entry that loaded this capability (the
+    # plugin loader attaches it; an entry without one leaves this empty, so an
+    # in-code spec and its loaded form stay equal).  It is operator metadata,
+    # not identity: excluded from equality/repr and read by the assembly layer
+    # as the plugin's own values (``ctx.plugin_config()``) and as the override
+    # tier beneath the environment for the settings the plugin declares.
+    manifest_config: Mapping[str, Any] = field(
+        default_factory=dict, repr=False, compare=False, hash=False
+    )
+    # Ordering hints (G3): ``after=("compact",)`` runs this capability's apply
+    # after ``compact``'s, ``before=("x",)`` before it — and because listeners
+    # register during apply, that also fixes their relative bus order.  Hints
+    # order only: unlike ``deps`` they never gate the mount, so a hint at a
+    # capability that is off is vacuous, and a hint naming a capability that is
+    # not registered at all is a fail-visible assembly error.  Ties (and every
+    # capability without hints) keep the registry's registration order.
+    before: tuple[str, ...] = ()
+    after: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _CAPABILITY_ID.fullmatch(self.cap_id):
             raise ValueError(f"invalid capability id: {self.cap_id!r}")
         if not str(self.title).strip():
             raise ValueError("capability title must not be empty")
-        if not str(self.mode).strip():
-            raise ValueError("capability mode must not be empty")
+        mode = str(self.mode).strip().lower()
+        if mode not in CAPABILITY_MODES:
+            raise ValueError(
+                f"invalid capability mode: {self.mode!r} (expected one of "
+                f"{', '.join(sorted(CAPABILITY_MODES))}); domain modes such as "
+                "'wary', 'hard', 'auto' or 'manual' are config-side *_mode "
+                "settings translated by _capability_mode — they are not legal "
+                "CapabilitySpec.mode values"
+            )
         for dependency in self.deps:
             if not _CAPABILITY_ID.fullmatch(dependency):
                 raise ValueError(f"invalid dependency id: {dependency!r}")
         if self.provides is not None and not _SERVICE_NAME.fullmatch(self.provides):
             raise ValueError(f"invalid provides service key: {self.provides!r}")
+        if not isinstance(self.manifest_config, Mapping):
+            raise TypeError(
+                "capability manifest_config must be a mapping of declared "
+                f"[plugin.config] values, got {type(self.manifest_config).__name__}"
+            )
+        for hint, label in ((self.before, "before"), (self.after, "after")):
+            for target in hint:
+                if not _CAPABILITY_ID.fullmatch(target):
+                    raise ValueError(
+                        f"invalid {label} ordering hint: {target!r} "
+                        "(expected a capability id)"
+                    )
+                if target == self.cap_id:
+                    raise ValueError(
+                        f"capability {self.cap_id!r} cannot order itself {label} itself"
+                    )
+        contradictory = set(self.before) & set(self.after)
+        if contradictory:
+            raise ValueError(
+                f"capability {self.cap_id!r} declares "
+                f"{', '.join(sorted(contradictory))} both before and after itself"
+            )
         if self.apply is not None and not callable(self.apply):
             raise TypeError("capability apply hook must be callable")
         if self.release is not None and not callable(self.release):
@@ -212,10 +518,28 @@ class MiddlewareReplacement:
 
 
 class CapabilityAssemblyContext:
-    """Capability-owned mount ledger for the five assembly seams."""
+    """Capability-owned mount ledger for the five assembly seams.
+
+    The context also owns the declaration-plane registries the harness and
+    capabilities publish into: ``tool_risk_registry`` (P0 #18 tool risk, read by
+    the safety listener), ``pin_prefix_registry`` (declared pinned message-id
+    prefixes), ``setting_registry`` (declared configuration keys),
+    ``usage_role_registry`` (declared accounting roles) and
+    ``redaction_registry`` (declared egress redaction literals).  All start
+    harness-owned, so a capability can read them but not silently replace them
+    (see :meth:`register_service`).  A run-assembling harness adds
+    ``run_context`` there too (:class:`RunContext`); the CLI maintenance context
+    has no run and publishes none.
+    """
 
     def __init__(self, services: Mapping[str, Any] | None = None) -> None:
         self._services = dict(services or {})
+        # Harness-published services (event_bus/config/session/factories plus
+        # everything the harness set_service'd) are owner-marked so a capability
+        # cannot quietly replace the bus, the session or the config.
+        self._service_owners: dict[str, str] = {
+            name: HARNESS_OWNER for name in self._services
+        }
         self._current_cap_id: str | None = None
         self._sequence = 0
         self._middleware: list[_Mount] = []
@@ -228,8 +552,30 @@ class CapabilityAssemblyContext:
         # Capability-owned services share the harness service namespace but are
         # tracked by owner so release removes them with zero residue and a
         # second mounted owner registering the same key fails visibly.
-        self._service_owners: dict[str, str] = {}
         self._disposers: dict[str, list[Callable[[], None]]] = {}
+        # Tool ownership mirrors the mount ledger: the capability that owns a
+        # tool name, plus the core names already mounted (fail-visible
+        # duplicates inside each of the two planes).
+        self._tool_owners: dict[str, str] = {}
+        self._core_tool_names: set[str] = set()
+        # Per-capability ``[plugin.config]`` values, published by
+        # ``assemble_capabilities`` from the spec and dropped with the mount.
+        self._manifest_configs: dict[str, Mapping[str, Any]] = {}
+        for name, value in (
+            ("tool_risk_registry", ToolRiskRegistry()),
+            ("pin_prefix_registry", PinPrefixRegistry()),
+            # The harness CLI tier for declared settings: an operator override
+            # map (declared key -> value) a CLI entry point may publish before
+            # assembly.  Absent means the tier is empty.
+            (
+                "setting_registry",
+                SettingRegistry(overrides=self._services.get("setting_overrides")),
+            ),
+            ("usage_role_registry", USAGE_ROLE_REGISTRY),
+            ("redaction_registry", REDACTION_REGISTRY),
+        ):
+            self._services.setdefault(name, value)
+            self._service_owners.setdefault(name, HARNESS_OWNER)
 
     @property
     def current_cap_id(self) -> str | None:
@@ -240,8 +586,70 @@ class CapabilityAssemblyContext:
 
         return self._services.get(name, default)
 
+    def _risk_registry(self) -> ToolRiskRegistry:
+        registry = self._services.get("tool_risk_registry")
+        if not isinstance(registry, ToolRiskRegistry):
+            raise RuntimeError("tool_risk_registry service is unavailable")
+        return registry
+
+    def _pin_registry(self) -> PinPrefixRegistry:
+        registry = self._services.get("pin_prefix_registry")
+        if not isinstance(registry, PinPrefixRegistry):
+            raise RuntimeError("pin_prefix_registry service is unavailable")
+        return registry
+
+    def _setting_registry(self) -> SettingRegistry:
+        registry = self._services.get("setting_registry")
+        if not isinstance(registry, SettingRegistry):
+            raise RuntimeError("setting_registry service is unavailable")
+        return registry
+
+    def _usage_role_registry(self) -> UsageRoleRegistry:
+        registry = self._services.get("usage_role_registry")
+        if not isinstance(registry, UsageRoleRegistry):
+            raise RuntimeError("usage_role_registry service is unavailable")
+        return registry
+
+    def _redaction_registry(self) -> RedactionRegistry:
+        registry = self._services.get("redaction_registry")
+        if not isinstance(registry, RedactionRegistry):
+            raise RuntimeError("redaction_registry service is unavailable")
+        return registry
+
+    def _guard_service_write(self, name: str, owner: str) -> None:
+        """Refuse a capability write to a service someone else owns (G6)."""
+
+        existing = self._service_owners.get(name)
+        if existing is None or existing == owner:
+            return
+        if existing == HARNESS_OWNER:
+            raise ValueError(
+                f"service {name!r} is harness-owned and cannot be replaced by "
+                f"capability {owner!r}"
+            )
+        raise ValueError(
+            f"service {name!r} already registered by capability {existing!r}"
+        )
+
     def set_service(self, name: str, value: Any) -> None:
-        self._services[name] = value
+        """Publish a service as the harness (assembly-plane) owner.
+
+        Called outside an apply hook this is the harness publishing (or
+        replacing) its own services.  Called *inside* an apply hook it writes as
+        the applying capability, so a plugin can publish its own services and
+        overwrite its own — but not a harness-owned one (fail-visible).
+        """
+
+        clean = str(name).strip()
+        if not _SERVICE_NAME.fullmatch(clean):
+            raise ValueError(f"invalid service name: {name!r}")
+        owner = self._current_cap_id
+        if owner is not None:
+            self._guard_service_write(clean, owner)
+        else:
+            owner = HARNESS_OWNER
+        self._services[clean] = value
+        self._service_owners[clean] = owner
 
     @contextmanager
     def applying(self, cap_id: str):
@@ -287,8 +695,131 @@ class CapabilityAssemblyContext:
             replace_key=replace_key,
         )
 
-    def register_tool(self, tool: Any) -> None:
-        self._mount(self._tools, tool, 100 + self._capability_order.get(self._owner(), 0))
+    @staticmethod
+    def _tool_name(tool: Any) -> str:
+        name = str(getattr(tool, "name", "") or "").strip()
+        if not name:
+            raise ValueError("registered tool requires a non-empty name")
+        return name
+
+    def _record_tool(self, name: str, owner: str, risk: str | None) -> None:
+        """Declare ``name``'s risk (``None`` = undeclared, fails closed)."""
+
+        self._tool_owners[name] = owner
+        self._risk_registry().declare(name, risk, owner=owner)
+
+    def register_tool(self, tool: Any, *, risk: ToolRisk | None = None) -> None:
+        """Mount one capability-owned tool and record its risk declaration.
+
+        ``risk`` declares how the safety classifier must treat calls to the tool
+        (``actuation`` = routed through the risk classifier, ``readonly`` =
+        observation-only).  Omitting it falls back to the declaration the tool
+        carries in ``metadata["risk"]`` (how the built-ins self-declare) and,
+        failing that, declares nothing — which the classifier reads as
+        ``actuation`` (fail-closed).  The declaration never grants permission and
+        never bypasses a gate.
+
+        Tool names must be unique among capability registrations: a second
+        capability registering the same name raises (fail-visible) instead of
+        silently replacing the first.  A same-named *core* tool is still
+        replaced in place (the finish-verifier contract); the replacing
+        declaration supersedes the core one until release restores it.
+        """
+
+        owner = self._owner()
+        name = self._tool_name(tool)
+        existing = self._tool_owners.get(name)
+        if existing is not None and existing != _CORE_OWNER:
+            where = "this capability" if existing == owner else f"capability {existing!r}"
+            raise ValueError(f"tool {name!r} is already registered by {where}")
+        self._mount(self._tools, tool, 100 + self._capability_order.get(owner, 0))
+        self._record_tool(name, owner, risk if risk is not None else declared_risk(tool))
+
+    def register_pin_prefix(self, prefix: str) -> None:
+        """Declare one pinned message-id prefix owned by the applying capability.
+
+        A pin is a message id that context hygiene must never summarise, fold or
+        remove (see :mod:`phone_agent.v2.pins`); declaring the prefix is how a
+        capability claims one.  The declaration is released with the capability,
+        and minting an id under an undeclared prefix raises (fail-visible).
+        """
+
+        self._pin_registry().declare(str(prefix), owner=self._owner())
+
+    def plugin_config(self) -> Mapping[str, Any]:
+        """The manifest ``[plugin.config]`` table of the applying capability.
+
+        Empty outside an apply hook or when the manifest entry declares none.
+        Values act as the per-plugin override tier for the settings the
+        capability declares through :meth:`register_setting` (below the
+        environment, above the declared default) and are otherwise the plugin's
+        own business: keys it never declares are simply readable here.
+        """
+
+        if self._current_cap_id is None:
+            return {}
+        return self._manifest_configs.get(self._current_cap_id, {})
+
+    def register_setting(
+        self,
+        key: str,
+        *,
+        env_var: str,
+        default: Any,
+        description: str,
+    ) -> Any:
+        """Declare one configuration key owned by the applying capability.
+
+        The declared key resolves through the built-in precedence chain —
+        harness CLI override (``setting_overrides`` service) > shell env /
+        ``.env`` > this plugin's ``[plugin.config]`` value > ``default`` — and
+        the resolved value is returned *and* recorded on
+        ``V2Config.plugin_settings`` (read-only) for the run.  ``env_var`` must
+        carry the ``PHONE_AGENT_`` prefix because only that prefix is loaded
+        from ``.env``; anything else raises at assembly time, as does a second
+        capability declaring the same key.  A declaration never grants anything:
+        it only tells the harness where a plugin's value comes from.
+        """
+
+        owner = self._owner()
+        value = self._setting_registry().declare(
+            key,
+            env_var=env_var,
+            default=default,
+            description=description,
+            owner=owner,
+            plugin_config=self._manifest_configs.get(owner),
+        )
+        declare = getattr(self._services.get("config"), "declare_plugin_setting", None)
+        if callable(declare):
+            declare(str(key).strip(), value)
+        return value
+
+    def register_usage_role(self, role: str, *, unit: str = "tokens") -> None:
+        """Declare one accounting role owned by the applying capability.
+
+        ``unit="tokens"`` roles join the token budget exactly like the harness
+        roles; ``unit="calls"`` roles are counted per invocation and reported
+        separately, never adjudicated by the budget (P0 #13).  The declaration
+        is released with the capability, and recording an undeclared role still
+        raises at ``UsageLedger.record`` time (fail-visible).
+        """
+
+        self._usage_role_registry().declare(role, unit=unit, owner=self._owner())
+
+    def register_redaction(self, literal: str) -> None:
+        """Declare one sensitive literal for the v2 egress redaction boundary.
+
+        The literal (not a regex) is replaced with ``<redacted>`` in every
+        string that goes through the shared ``redact_text`` used by trace,
+        diagnostic evidence, Web run events and the streaming preview.  It must
+        be one line and at least four characters long — a shorter one would
+        redact unrelated text — and it is released with the capability.
+        Declarations change redaction only: the safety classifier and
+        prompt-side sanitization keep the built-in patterns.
+        """
+
+        self._redaction_registry().declare(literal, owner=self._owner())
 
     def add_prompt_block(self, provider: PromptProvider) -> None:
         if not callable(provider):
@@ -327,19 +858,16 @@ class CapabilityAssemblyContext:
         The service is read back through :meth:`service` like any harness
         factory.  Ownership is recorded under the applying ``cap_id`` so
         :meth:`release_capability` removes it with zero residue.  Two mounted
-        capabilities registering the same key is a fail-visible conflict.
+        capabilities registering the same key is a fail-visible conflict, and a
+        harness-owned key (``event_bus`` / ``session`` / ``config`` / any
+        ``set_service`` product) cannot be replaced at all (G6).
         """
 
         owner = self._owner()
         clean = str(name).strip()
         if not _SERVICE_NAME.fullmatch(clean):
             raise ValueError(f"invalid service name: {name!r}")
-        existing_owner = self._service_owners.get(clean)
-        if existing_owner is not None and existing_owner != owner:
-            raise ValueError(
-                f"service {clean!r} already registered by capability "
-                f"{existing_owner!r}"
-            )
+        self._guard_service_write(clean, owner)
         self._services[clean] = value
         self._service_owners[clean] = owner
 
@@ -372,12 +900,29 @@ class CapabilityAssemblyContext:
     ) -> None:
         self._sequence += 1
         self._middleware.append(
-            _Mount("__core__", middleware, self._sequence, order, replace_key)
+            _Mount(_CORE_OWNER, middleware, self._sequence, order, replace_key)
         )
 
-    def register_core_tool(self, tool: Any, *, order: int) -> None:
+    def register_core_tool(
+        self, tool: Any, *, order: int, risk: ToolRisk | None = None
+    ) -> None:
+        """Mount one harness tool and record its risk declaration.
+
+        Same declaration semantics as :meth:`register_tool`, and the same
+        fail-visible duplicate check *within* the core plane; a capability may
+        still replace a core tool by name.  ``risk`` defaults to the declaration
+        the tool carries (the built-ins stamp it at build time).
+        """
+
+        name = self._tool_name(tool)
+        if name in self._core_tool_names:
+            raise ValueError(f"core tool {name!r} is already registered")
         self._sequence += 1
-        self._tools.append(_Mount("__core__", tool, self._sequence, order))
+        self._tools.append(_Mount(_CORE_OWNER, tool, self._sequence, order))
+        self._core_tool_names.add(name)
+        self._record_tool(
+            name, _CORE_OWNER, risk if risk is not None else declared_risk(tool)
+        )
 
     def add_core_run_hook(self, when: str, fn: RunHook, *, order: int) -> None:
         if when not in _RUN_HOOK_WHEN:
@@ -484,6 +1029,24 @@ class CapabilityAssemblyContext:
         ]:
             self._service_owners.pop(name, None)
             self._services.pop(name, None)
+        self._tool_owners = {
+            name: owner
+            for name, owner in self._tool_owners.items()
+            if owner != cap_id
+        }
+        # Declarations stack per owner, so withdrawal reveals whatever the
+        # replaced core tool declared (or leaves the name undeclared).
+        self._risk_registry().withdraw(cap_id)
+        self._pin_registry().withdraw(cap_id)
+        self._usage_role_registry().withdraw(cap_id)
+        self._redaction_registry().withdraw(cap_id)
+        withdrawn = self._setting_registry().withdraw(cap_id)
+        config = self._services.get("config")
+        withdraw_setting = getattr(config, "withdraw_plugin_setting", None)
+        if callable(withdraw_setting):
+            for key in withdrawn:
+                withdraw_setting(key)
+        self._manifest_configs.pop(cap_id, None)
         self._mounted.pop(cap_id, None)
         if disposer_error is not None:
             raise disposer_error
@@ -613,7 +1176,12 @@ def _apply_safety(ctx: CapabilityAssemblyContext) -> None:
     session = ctx.service("session")
     config = ctx.service("config")
     mode = getattr(config, "safety_mode", "wary")
-    listener = build_capability_safety_listener(session, config)
+    # The declaration registry is live: capabilities that mount tools later in
+    # this same assembly pass (deliverable, obs_archive, ...) are classified
+    # through their own declarations without any re-ordering.
+    listener = build_capability_safety_listener(
+        session, config, risks=ctx.service("tool_risk_registry")
+    )
     if listener is not None:
         ctx.on(TOOL_EXECUTE, listener)
         if mode in {"wary", "reviewer"}:
@@ -880,13 +1448,133 @@ def _owned_release(cap_id: str) -> CapabilityHook:
     return release
 
 
+def _report_undeclared_tools(ctx: CapabilityAssemblyContext) -> None:
+    """Announce tools whose active registration declares no risk (fail-visible).
+
+    The classification itself is already fail-closed (undeclared == ``actuation``
+    in the safety classifier); this only removes the *silence* so a plugin author
+    learns the names at assembly time.  Three best-effort channels, none of which
+    may fail the assembly: stderr, the session's ``resolution_trace_recorder``
+    (when the harness published one) and the ``capability/tools_undeclared``
+    event on the bus (when one exists).
+    """
+
+    registry = ctx.service("tool_risk_registry")
+    if not isinstance(registry, ToolRiskRegistry):
+        return
+    undeclared = registry.undeclared()
+    if not undeclared:
+        return
+    names = sorted(undeclared)
+    try:
+        described = ", ".join(f"{name} [{undeclared[name]}]" for name in names)
+        print(
+            "[capability] undeclared tool risk (fail-closed as 'actuation'): "
+            f"{described}; declare it with ctx.register_tool(tool, risk=...)",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:  # noqa: BLE001, S110 - the notice must never fail assembly
+        pass
+    try:
+        record = getattr(ctx.service("session"), "resolution_trace_recorder", None)
+        if callable(record):
+            record(CAPABILITY_TOOLS_UNDECLARED, tools=names, owners=undeclared)
+    except Exception:  # noqa: BLE001, S110 - trace is observe-only
+        pass
+    try:
+        emit = getattr(ctx.service("event_bus"), "emit", None)
+        if callable(emit):
+            emit(CAPABILITY_TOOLS_UNDECLARED, {"tools": names, "owners": undeclared})
+    except Exception:  # noqa: BLE001, S110 - observers must never fail assembly
+        pass
+
+
+def _mount_order(
+    specs: Sequence[CapabilitySpec], active: Collection[str]
+) -> list[CapabilitySpec]:
+    """Order the capabilities that will mount this pass (G3).
+
+    Edges come from three declarations: ``deps`` (gating — and, since a
+    dependency is mounted first, ordering), ``after`` and ``before``.  All edges
+    are resolved together by one topological pass whose tie-break is
+    registration order, so a capability without hints keeps exactly the position
+    it had before hints existed.
+
+    Fail-visible, and only for the capabilities that actually mount (``active``):
+    a hint naming a capability that is not registered raises, and a cycle among
+    the mounting capabilities raises.  A hint at a registered capability that is
+    not mounting (``off``/``pending``) is vacuous, and a capability that is off
+    is not validated at all — turning a capability off must be able to un-break
+    an assembly that its hints would fail.
+    """
+
+    registered = {spec.cap_id: spec for spec in specs}
+    position = {spec.cap_id: index for index, spec in enumerate(specs)}
+    edges: dict[str, set[str]] = {cap_id: set() for cap_id in active}
+    indegree: dict[str, int] = dict.fromkeys(active, 0)
+
+    def add_edge(before_id: str, after_id: str) -> None:
+        if before_id == after_id or after_id in edges[before_id]:
+            return
+        edges[before_id].add(after_id)
+        indegree[after_id] += 1
+
+    def require_registered(owner: str, target: str, label: str) -> None:
+        if target not in registered:
+            raise ValueError(
+                f"capability {owner!r} declares {label}=({target!r},) but no "
+                "capability with that id is registered"
+            )
+
+    for spec in specs:
+        if spec.cap_id not in active:
+            continue
+        for dependency in spec.deps:
+            if dependency in active:
+                add_edge(dependency, spec.cap_id)
+        for target in spec.after:
+            require_registered(spec.cap_id, target, "after")
+            if target in active:
+                add_edge(target, spec.cap_id)
+        for target in spec.before:
+            require_registered(spec.cap_id, target, "before")
+            if target in active:
+                add_edge(spec.cap_id, target)
+
+    ready = [
+        spec.cap_id
+        for spec in specs
+        if spec.cap_id in active and indegree[spec.cap_id] == 0
+    ]
+    ordered: list[CapabilitySpec] = []
+    while ready:
+        cap_id = ready.pop(0)
+        ordered.append(registered[cap_id])
+        for successor in edges[cap_id]:
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                ready.append(successor)
+        ready.sort(key=position.__getitem__)
+
+    if len(ordered) != len(active):
+        remaining = sorted(
+            set(active) - {spec.cap_id for spec in ordered}, key=position.__getitem__
+        )
+        raise ValueError(
+            "capability ordering is unsatisfiable: deps/ordering hints form a "
+            "cycle among " + ", ".join(remaining)
+        )
+    return ordered
+
+
 def assemble_capabilities(
     registry: CapabilityRegistry, ctx: CapabilityAssemblyContext
 ) -> CapabilityAssemblyContext:
     """Reconcile ``ctx`` to active/shadow specs using a cap-id/mode diff.
 
     Removed and changed-mode capabilities release first; changed/new specs then
-    apply in registry order.  ``pending`` and ``off`` specs never apply.
+    apply in mount order.  ``pending`` and ``off`` specs never apply.
     """
 
     if not isinstance(registry, CapabilityRegistry):
@@ -901,22 +1589,7 @@ def assemble_capabilities(
         for cap_id, row in rows.items()
         if row["state"] in {"active", "shadow"}
     }
-    ordered_specs: list[CapabilitySpec] = []
-    pending = list(registry.specs())
-    ordered_ids: set[str] = set()
-    while pending:
-        ready = [
-            spec
-            for spec in pending
-            if all(dep not in desired or dep in ordered_ids for dep in spec.deps)
-        ]
-        if not ready:
-            ordered_specs.extend(pending)
-            break
-        for spec in ready:
-            ordered_specs.append(spec)
-            ordered_ids.add(spec.cap_id)
-            pending.remove(spec)
+    ordered_specs = _mount_order(registry.specs(), set(desired))
     ctx._capability_order = {
         spec.cap_id: index for index, spec in enumerate(ordered_specs)
     }
@@ -949,6 +1622,10 @@ def assemble_capabilities(
         if item is None or spec.cap_id in ctx._mounted:
             continue
         mode, active_spec = item
+        # Publish the manifest values before the apply hook runs: the plugin
+        # reads them through ctx.plugin_config() and they are the override tier
+        # for the settings it declares.  Dropped by release_capability.
+        ctx._manifest_configs[spec.cap_id] = dict(active_spec.manifest_config)
         try:
             with ctx.applying(spec.cap_id):
                 if active_spec.apply is not None:
@@ -969,7 +1646,21 @@ def assemble_capabilities(
                 pass
             raise
         ctx._mounted[spec.cap_id] = (mode, active_spec)
+    _report_undeclared_tools(ctx)
     return ctx
+
+
+def _capability_mode(raw: Any, *, default: str) -> str:
+    """Map a capability's configured mode onto the three legal mount modes.
+
+    ``off`` and ``shadow`` pass through; every other non-empty value (``wary``,
+    ``hard``, ``auto``, ``manual``, ...) means "mount at full strength", which is
+    what the registry's state derivation did before the modes were validated —
+    so translating here keeps every built-in status row identical.
+    """
+
+    mode = str(raw if raw is not None else "").strip().lower() or default
+    return mode if mode in CAPABILITY_MODES else "on"
 
 
 def build_capability_registry(config: Any) -> CapabilityRegistry:
@@ -994,7 +1685,7 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
         CapabilitySpec(
             "safety",
             "Safety",
-            getattr(config, "safety_mode", "wary"),
+            _capability_mode(getattr(config, "safety_mode", "wary"), default="wary"),
             apply=_owned_apply("safety", _apply_safety),
             release=_owned_release("safety"),
         ),
@@ -1015,15 +1706,23 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
         CapabilitySpec(
             "boundary_compact",
             "Boundary-aware compact",
-            getattr(config, "boundary_compact_mode", "shadow"),
+            _capability_mode(
+                getattr(config, "boundary_compact_mode", "shadow"), default="shadow"
+            ),
             deps=("compact",),
+            # The handler mounts *on top of* the compact instance (it folds
+            # through it and sits inside its ``model/pre_request`` listener), so
+            # compact's apply must have run first.  ``deps`` already enforces
+            # that as a side effect of gating; the ordering hint declares it as
+            # an ordering fact in its own right, resolved by ``_mount_order``.
+            after=("compact",),
             apply=_owned_apply("boundary_compact", _apply_boundary_compact),
             release=_owned_release("boundary_compact"),
         ),
         CapabilitySpec(
             "finish_verify",
             "Finish verifier",
-            getattr(config, "finish_verify", "auto"),
+            _capability_mode(getattr(config, "finish_verify", "auto"), default="auto"),
             apply=_owned_apply("finish_verify", _apply_finish_verify),
             release=_owned_release("finish_verify"),
         ),
@@ -1044,7 +1743,7 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
         CapabilitySpec(
             "dream",
             "Memory maintenance",
-            getattr(config, "dream_mode", "manual"),
+            _capability_mode(getattr(config, "dream_mode", "manual"), default="manual"),
             deps=("app_kb",),
             apply=_owned_apply("dream", _apply_dream),
             release=_owned_release("dream"),
@@ -1059,7 +1758,7 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
         CapabilitySpec(
             "recall",
             "Memory recall",
-            getattr(config, "memory_rag", "shadow"),
+            _capability_mode(getattr(config, "memory_rag", "shadow"), default="shadow"),
             deps=("experience",),
             apply=_owned_apply("recall", _apply_recall),
             release=_owned_release("recall"),
@@ -1067,7 +1766,7 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
         CapabilitySpec(
             "obs_archive",
             "Observation archive",
-            getattr(config, "obs_archive", "off"),
+            _capability_mode(getattr(config, "obs_archive", "off"), default="off"),
             apply=_owned_apply("obs_archive", _apply_obs_archive),
             release=_owned_release("obs_archive"),
         ),
@@ -1077,13 +1776,19 @@ def build_capability_registry(config: Any) -> CapabilityRegistry:
 
 
 __all__ = [
+    "CAPABILITY_MODES",
+    "HARNESS_OWNER",
     "PLUGIN_API_VERSION",
+    "RUN_CONTEXT_SERVICE",
     "CapabilityAssemblyContext",
     "CapabilityContext",
     "CapabilityRegistry",
     "CapabilitySpec",
     "MiddlewareReplacement",
     "PromptBlock",
+    "RunContext",
+    "ToolRisk",
+    "ToolRiskRegistry",
     "assemble_capabilities",
     "build_capability_registry",
 ]

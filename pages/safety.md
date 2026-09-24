@@ -1,6 +1,6 @@
 # 安全模式
 
-`PHONE_AGENT_SAFETY_MODE` 控制执行类动作（tap / long_press / type_text / launch_app）的门控。
+`PHONE_AGENT_SAFETY_MODE` 控制 `actuation` 类执行动作的门控（内建即 tap / long_press / type_text / launch_app）。
 
 ## 四档 {#safety-modes}
 
@@ -19,7 +19,13 @@
 
 ## 风险判定 {#safety-classification}
 
-安全门只覆盖四个执行工具：`tap` / `long_press` / `type_text` / `launch_app`。`scroll`、`swipe`、`back`、`home`、`wait` 与读屏类工具不参与判定。每个调用被判定为一个层级：`none`、`recall`（软候选）、`reviewer`（交由复核模型精排）、`hard`。`launch_app` 与 `type_text` 走各自的专属分支，其余工具的判定基于目标文本：
+安全门判定的工具来自**装配声明面**：工具在装配期声明 `actuation`（进分类器）或 `readonly`（不判定），内建
+只有四个执行工具 `tap` / `long_press` / `type_text` / `launch_app` 声明 `actuation`，其余（`scroll`、
+`swipe`、`back`、`home`、`wait`、读屏类）声明 `readonly`。**未声明的工具一律按 `actuation` 判定
+（fail-closed）**——插件工具不声明就进分类器；声明只影响分类，不放行。`hard` 档的中断表取同一条规则：
+**除声明 `readonly` 外的全部已注册工具**，且在各次判定时实时读注册表——安全能力先于插件工具装配，快照会
+漏掉后注册的工具。每个调用判定为一个层级：`none`、`recall`（软候选）、`reviewer`（交由复核模型精排）、
+`hard`。`launch_app` 与 `type_text` 走各自的专属分支，其余 `actuation` 工具的判定基于目标文本：
 
 | 条件 | 层级 |
 |---|---|

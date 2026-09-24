@@ -48,6 +48,7 @@ from phone_agent.v2.session import (
     classify_locate_failure,
     normalize_locate_failure_code,
 )
+from phone_agent.v2.tool_risk import declare_builtin_risks
 from phone_agent.v2.tools._obs import auto_observation, mark_tool_fail, mark_tool_ok
 
 
@@ -893,14 +894,16 @@ def build_actuation_tools(session, config) -> list[StructuredTool]:
             f"{suffix}",
         )
 
-    return [
-        StructuredTool.from_function(tap, parse_docstring=True),
-        StructuredTool.from_function(long_press, parse_docstring=True),
-        StructuredTool.from_function(type_text, parse_docstring=True),
-        StructuredTool.from_function(scroll, parse_docstring=True),
-        StructuredTool.from_function(swipe, parse_docstring=True),
-        StructuredTool.from_function(back, parse_docstring=True),
-        StructuredTool.from_function(home, parse_docstring=True),
-        StructuredTool.from_function(wait, parse_docstring=True),
-        StructuredTool.from_function(launch_app, parse_docstring=True),
-    ]
+    return declare_builtin_risks(
+        [
+            StructuredTool.from_function(tap, parse_docstring=True),
+            StructuredTool.from_function(long_press, parse_docstring=True),
+            StructuredTool.from_function(type_text, parse_docstring=True),
+            StructuredTool.from_function(scroll, parse_docstring=True),
+            StructuredTool.from_function(swipe, parse_docstring=True),
+            StructuredTool.from_function(back, parse_docstring=True),
+            StructuredTool.from_function(home, parse_docstring=True),
+            StructuredTool.from_function(wait, parse_docstring=True),
+            StructuredTool.from_function(launch_app, parse_docstring=True),
+        ]
+    )

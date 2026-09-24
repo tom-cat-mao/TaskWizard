@@ -35,6 +35,8 @@ from typing import Any
 
 from langchain_core.tools import StructuredTool
 
+from phone_agent.v2.tool_risk import declare_builtin_risks
+
 
 @dataclass(frozen=True)
 class _SkippedVerifier:
@@ -259,11 +261,13 @@ def build_control_tools(session, config) -> list[StructuredTool]:
         session.takeover_reason = reason
         return f"已请求人工接管: {reason}"
 
-    return [
-        StructuredTool.from_function(finish, parse_docstring=True),
-        StructuredTool.from_function(ask_user, parse_docstring=True),
-        StructuredTool.from_function(take_over, parse_docstring=True),
-    ]
+    return declare_builtin_risks(
+        [
+            StructuredTool.from_function(finish, parse_docstring=True),
+            StructuredTool.from_function(ask_user, parse_docstring=True),
+            StructuredTool.from_function(take_over, parse_docstring=True),
+        ]
+    )
 
 
 def make_finish_tool(session, config) -> StructuredTool:
